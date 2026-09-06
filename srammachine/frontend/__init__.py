@@ -1,0 +1,1 @@
+"""Model frontend data structures."""
