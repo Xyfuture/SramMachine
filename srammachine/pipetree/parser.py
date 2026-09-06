@@ -4,6 +4,7 @@ V1 assumes a token-preserving linear operator flow. It does not infer residual
 branches, expert routing, cross-request dependencies or physical memory layout.
 SRAM is assumed large enough to retain each operator's one-time prefetch.
 """
+from copy import deepcopy
 from dataclasses import replace
 from typing import Iterator, Mapping, Tuple
 
@@ -11,6 +12,7 @@ from srammachine.commands import (
     CommandGraph, CommandTrace, DramReadCmd, DramWriteCmd, WeightLoadCmd,
     GemmCmd, VectorCmd, NoCCmd, InterChipCmd,
 )
+from srammachine.commands.base import integer
 from srammachine.frontend.modules import BMMOp, VectorOp, CommOp, Operator
 from .mapping import OperatorMapping
 from .tree import GroupNode, Node, OpInstance, OpNode, PipeTree
@@ -24,6 +26,55 @@ class TreeParser:
     """
 
     def parse(
+        self, tree: PipeTree, operators: Mapping[str, Operator],
+        mappings: Mapping[str, OperatorMapping], *, layer_count: int = 4,
+    ) -> CommandGraph:
+        """Generate four consecutive layers by default, as in the design diagram.
+
+        This repeats one layer template, not four different model layer types.
+        Each layer has its own prefetch and command IDs but shares hardware
+        resource IDs. Pass layer_count=1 to inspect the original single layer.
+        """
+        integer("layer_count", layer_count, 1)
+        single = self._parse_one_layer(tree, operators, mappings)
+        if layer_count == 1:
+            return single
+
+        # 原设计流程图要求复制单层 CommandGraph，模拟连续四层。
+        # 保留原 op_id 以查询模型算子，使用 layer_index 区分不同层。
+        instances = tuple(self.iter_instances(tree))
+        first = [item for item in instances if item.op_id == tree.operator_order[0]]
+        last = [item for item in instances if item.op_id == tree.operator_order[-1]]
+        boundary_edges = []
+        i = j = 0
+        while i < len(last) and j < len(first):
+            source, target = last[i], first[j]
+            if max(source.token_start, target.token_start) < min(source.token_stop, target.token_stop):
+                boundary_edges.append((f"i{source.index}.core", f"i{target.index}.core"))
+            if source.token_stop <= target.token_stop:
+                i += 1
+            if target.token_stop <= source.token_stop:
+                j += 1
+
+        commands, edges, traces = [], [], {}
+        for layer in range(layer_count):
+            prefix = f"layer{layer}."
+            for cmd in single.commands:
+                copied_id = prefix + cmd.cmd_id
+                # Copies may carry nested vector parameters: do not share them.
+                commands.append(replace(deepcopy(cmd), cmd_id=copied_id))
+                traces[copied_id] = replace(single.traces[cmd.cmd_id], layer_index=layer)
+            edges.extend((prefix + source, prefix + target) for source, target in single.edges)
+            if layer:
+                # 仅连接前层输出到后层对应 token 的计算，不能把所有图根节点
+                # 都串起来；后层 DRAM 预取和 WeightLoad 仍允许提前执行。
+                # KV 写回也不构成整层屏障，竞争由共享硬件资源处理。
+                previous = f"layer{layer - 1}."
+                edges.extend((previous + source, prefix + target)
+                             for source, target in boundary_edges)
+        return CommandGraph(commands, edges, traces)
+
+    def _parse_one_layer(
         self, tree: PipeTree, operators: Mapping[str, Operator],
         mappings: Mapping[str, OperatorMapping],
     ) -> CommandGraph:

@@ -16,8 +16,10 @@ class CommandTrace:
     token_start: int
     token_stop: int
     node_path: Tuple[int, ...]
+    layer_index: int = 0
 
     def __post_init__(self) -> None:
+        integer("layer_index", self.layer_index)
         if self.instance_index is not None:
             integer("instance_index", self.instance_index)
         integer("token_start", self.token_start)
