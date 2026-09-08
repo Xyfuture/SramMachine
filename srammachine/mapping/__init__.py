@@ -1,5 +1,7 @@
 """Public DeepSeek decode hardware-mapping API."""
 
+from srammachine.inference import MoEParallelStrategy
+
 from .model import (
     DeepSeekV3Config,
     DeepSeekV32Config,
@@ -10,7 +12,6 @@ from .mapper import (
     HardwareMapper,
     HardwareMappingRequest,
     HardwareMappingResult,
-    MoEParallelStrategy,
     OperatorHardwareMapping,
 )
 

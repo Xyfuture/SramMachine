@@ -1,6 +1,11 @@
 """Desim-based execution of hardware command graphs."""
 
 from .executor import GraphExecutor
+from .perfetto import (
+    DEFAULT_TRACE_OUTPUT_DIR,
+    SimulationArtifacts,
+    export_perfetto_trace,
+)
 from .records import CommandExecution, CommandState, ExecutionResult
 from .results import (
     CommandCategory,
@@ -39,5 +44,8 @@ __all__ = [
     "CommandResult",
     "CommandCategory",
     "build_simulation_result",
+    "DEFAULT_TRACE_OUTPUT_DIR",
+    "SimulationArtifacts",
+    "export_perfetto_trace",
     "VECTOR_FLOPS_PER_ELEMENT",
 ]

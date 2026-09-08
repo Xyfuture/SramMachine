@@ -77,11 +77,13 @@ class CommOp(Operator):
     group contains PU IDs for intra_chip and chip IDs for inter_chip.
     size_bytes is each participant's input size, not aggregate link traffic.
     For p2p, group is (sender, receiver) and size_bytes is the send size.
-    For broadcast, size_bytes describes the root's payload.
+    For broadcast, size_bytes describes the root's payload. For reduce,
+    size_bytes describes each participant's partial result and root receives
+    the reduced result.
     For nonuniform alltoall, transfer_bytes[i][j] is the byte count sent from
     group[i] to group[j], replacing size_bytes. Diagonal entries are allowed
     and describe locally retained data rather than network traffic.
-    reduce_kind applies only to allreduce and reduce_scatter.
+    reduce_kind applies to reduce, allreduce and reduce_scatter.
     """
 
     kind: str
@@ -95,7 +97,7 @@ class CommOp(Operator):
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.kind not in (
-            "p2p", "broadcast", "allreduce", "allgather",
+            "p2p", "broadcast", "reduce", "allreduce", "allgather",
             "reduce_scatter", "alltoall",
         ):
             raise ValueError("unsupported communication kind")
@@ -113,11 +115,13 @@ class CommOp(Operator):
             raise ValueError("group must not contain duplicate participants")
         if self.kind == "p2p" and len(self.group) != 2:
             raise ValueError("p2p requires exactly (sender, receiver)")
-        if self.kind == "broadcast":
+        if self.kind in ("broadcast", "reduce"):
             if self.root is None or type(self.root) not in (str, int) or self.root not in self.group:
-                raise ValueError("broadcast root must be a member of group")
+                raise ValueError(f"{self.kind} root must be a member of group")
         elif self.root is not None:
-            raise ValueError("root is only used by broadcast")
+            raise ValueError("root is only used by broadcast or reduce")
+        if self.kind == "reduce" and self.scope != "intra_chip":
+            raise ValueError("reduce is only supported for intra_chip NoC")
         if self.reduce_kind not in ("sum", "max", "min"):
             raise ValueError("reduce_kind must be sum, max or min")
         if (self.size_bytes is None) == (self.transfer_bytes is None):

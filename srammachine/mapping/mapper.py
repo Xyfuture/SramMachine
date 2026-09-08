@@ -1,17 +1,26 @@
 """Hardware mapping for one representative DeepSeek decode layer."""
 
 from dataclasses import dataclass, field
-from enum import Enum
 from types import MappingProxyType
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
 from srammachine.frontend.modules import BMMOp, CommOp, Operator, VectorOp
 from srammachine.hardware import DEFAULT_HARDWARE_CONFIG, HardwareConfig
-from srammachine.pipetree import GroupNode, OpNode, OperatorMapping, PipeTree
+from srammachine.inference import InferenceConfig, MoEParallelStrategy
+from srammachine.pipetree import (
+    OperatorMapping, RootNode, build_root_node,
+)
 
 from .model import (
     DeepSeekV3Config, DeepSeekV32Config, ModelConfig, load_model_config,
 )
+
+
+# Fixed execution precisions for the current hardware path. They are not
+# properties of an inference workload, so InferenceConfig does not store them.
+_WEIGHT_DTYPE_BYTES = 1
+_ACTIVATION_DTYPE_BYTES = 2
+_KV_CACHE_DTYPE_BYTES = 2
 
 
 def _positive_integer(name: str, value: int) -> None:
@@ -41,36 +50,18 @@ def _freeze_dimensions(value: Mapping[str, int]) -> Mapping[str, int]:
     return MappingProxyType(copied)
 
 
-class MoEParallelStrategy(Enum):
-    TP = "tp"
-    EP = "ep"
-
-
 @dataclass(frozen=True)
 class HardwareMappingRequest:
     """A decode-only mapping request for one representative model layer."""
 
     model_name: str
-    global_batch_size: int
-    history_length: int
-    moe_parallel_strategy: MoEParallelStrategy
-    query_length: int = 1
-    activation_dtype_bytes: int = 2
-    weight_dtype_bytes: int = 1
-    kv_dtype_bytes: int = 2
+    inference_config: InferenceConfig
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_name, str) or not self.model_name.strip():
             raise ValueError("model_name must be a nonempty string")
-        for name in (
-            "global_batch_size", "history_length", "query_length",
-            "activation_dtype_bytes", "weight_dtype_bytes", "kv_dtype_bytes",
-        ):
-            _positive_integer(name, getattr(self, name))
-        if self.query_length != 1:
-            raise ValueError("only decoding with query_length=1 is supported")
-        if not isinstance(self.moe_parallel_strategy, MoEParallelStrategy):
-            raise TypeError("moe_parallel_strategy must be a MoEParallelStrategy")
+        if not isinstance(self.inference_config, InferenceConfig):
+            raise TypeError("inference_config must be an InferenceConfig")
 
 
 @dataclass(frozen=True)
@@ -127,7 +118,7 @@ class HardwareMappingResult:
     local_batch_size: int
     expert_ownership: Tuple[Tuple[int, ...], ...]
     expert_token_loads: Tuple[int, ...]
-    pipe_tree: PipeTree
+    root_node: RootNode
     operators: Mapping[str, Operator]
     operator_mappings: Mapping[str, OperatorMapping]
     hardware_mappings: Mapping[str, OperatorHardwareMapping]
@@ -155,14 +146,14 @@ class HardwareMappingResult:
             raise ValueError("expert_token_loads must cover every routed expert")
         if any(type(load) is not int or load <= 0 for load in loads):
             raise ValueError("every routed expert must have a positive token load")
-        if not isinstance(self.pipe_tree, PipeTree):
-            raise TypeError("pipe_tree must be a PipeTree")
+        if not isinstance(self.root_node, RootNode):
+            raise TypeError("root_node must be a RootNode")
         operators = dict(self.operators)
         mappings = dict(self.operator_mappings)
         hardware = dict(self.hardware_mappings)
-        expected = set(self.pipe_tree.operator_order)
+        expected = set(self.root_node.operator_order)
         if set(operators) != expected or set(mappings) != expected or set(hardware) != expected:
-            raise ValueError("result mappings must exactly match pipe_tree operators")
+            raise ValueError("result mappings must exactly match RootNode operators")
         if any(not isinstance(value, Operator) for value in operators.values()):
             raise TypeError("operators must contain Operator values")
         if any(not isinstance(value, OperatorMapping) for value in mappings.values()):
@@ -209,6 +200,19 @@ class _LayerBuilder:
     def chip_group(self) -> Tuple[int, ...]:
         return tuple(range(self.hardware_config.chip_count))
 
+    @property
+    def representative_pu_row(self) -> Tuple[str, ...]:
+        columns = self.hardware_config.chip.logic_die.pu_mesh_columns
+        return tuple(f"chip0.die0.pu{column}" for column in range(columns))
+
+    @property
+    def representative_pu_column(self) -> Tuple[str, ...]:
+        rows = self.hardware_config.chip.logic_die.pu_mesh_rows
+        columns = self.hardware_config.chip.logic_die.pu_mesh_columns
+        return tuple(
+            f"chip0.die0.pu{row * columns}" for row in range(rows)
+        )
+
     def _record(
         self, operator: Operator, mapping: OperatorMapping,
         hardware_mapping: OperatorHardwareMapping,
@@ -233,10 +237,7 @@ class _LayerBuilder:
         dimensions = dict(die_dimensions)
         rows = self.hardware_config.chip.logic_die.pu_mesh_rows
         columns = self.hardware_config.chip.logic_die.pu_mesh_columns
-        if dimensions["B"] >= rows:
-            dimensions["B"] = _ceil_div(dimensions["B"], rows)
-        else:
-            dimensions["M"] = _ceil_div(dimensions["M"], rows)
+        dimensions["K"] = _ceil_div(dimensions["K"], rows)
         dimensions["N"] = _ceil_div(dimensions["N"], columns)
         return dimensions
 
@@ -262,16 +263,28 @@ class _LayerBuilder:
             _positive_integer("weight_batches", weight_batches)
             weight_bytes = (
                 weight_batches * die_dimensions["K"] * die_dimensions["N"]
-                * self.request.weight_dtype_bytes
-            )
-            row_weight_batches = (
-                _ceil_div(weight_batches, self.hardware_config.chip.logic_die.pu_mesh_rows)
-                if weight_batches > 1 else 1
+                * _WEIGHT_DTYPE_BYTES
             )
             load_bytes = (
-                row_weight_batches * die_dimensions["K"] * pu_dimensions["N"]
-                * self.request.weight_dtype_bytes
+                weight_batches * pu_dimensions["K"] * pu_dimensions["N"]
+                * _WEIGHT_DTYPE_BYTES
             )
+        input_bytes = (
+            pu_dimensions["B"] * pu_dimensions["M"] * pu_dimensions["K"]
+            * _ACTIVATION_DTYPE_BYTES
+        )
+        output_bytes = (
+            pu_dimensions["B"] * pu_dimensions["M"] * pu_dimensions["N"]
+            * _ACTIVATION_DTYPE_BYTES
+        )
+        self.add_comm(
+            f"{op_id}.input_broadcast", f"{op_kind}_input_broadcast",
+            scope="intra_chip", kind="broadcast",
+            group=self.representative_pu_row,
+            root=self.PU,
+            size_bytes=input_bytes,
+            parallel_strategy=parallel_strategy,
+        )
         operator = BMMOp(op_id, **pu_dimensions)
         mapping = OperatorMapping(
             "M", self.PU,
@@ -297,6 +310,15 @@ class _LayerBuilder:
             tokens_per_expert=tokens_per_expert,
             weight_bytes=weight_bytes,
         ))
+        self.add_comm(
+            f"{op_id}.output_reduce", f"{op_kind}_output_reduce",
+            scope="intra_chip", kind="reduce",
+            group=self.representative_pu_column,
+            root=self.PU,
+            size_bytes=output_bytes,
+            reduce_kind="sum",
+            parallel_strategy=parallel_strategy,
+        )
 
     def add_vector(
         self, op_id: str, op_kind: str, *,
@@ -337,6 +359,7 @@ class _LayerBuilder:
         group: Sequence[Any], parallel_strategy: str,
         size_bytes: Optional[int] = None,
         transfer_bytes: Optional[Sequence[Sequence[int]]] = None,
+        root: Optional[Any] = None,
         reduce_kind: str = "sum",
     ) -> None:
         matrix = None
@@ -344,7 +367,7 @@ class _LayerBuilder:
             matrix = tuple(tuple(row) for row in transfer_bytes)
         operator = CommOp(
             op_id, kind, scope, tuple(group), size_bytes=size_bytes,
-            reduce_kind=reduce_kind, transfer_bytes=matrix,
+            root=root, reduce_kind=reduce_kind, transfer_bytes=matrix,
         )
         resource = self.NOC if scope == "intra_chip" else self.FABRIC
         if size_bytes is not None:
@@ -371,13 +394,13 @@ class _LayerBuilder:
         )
 
     def build(self) -> HardwareMappingResult:
-        tree = PipeTree(
+        root_node = build_root_node(
             batch_size=_ceil_div(
-                self.request.global_batch_size,
+                self.request.inference_config.global_batch_size,
                 self.hardware_config.chip_count,
             ),
-            operator_order=tuple(self.order),
-            root=GroupNode(tuple(OpNode(op_id) for op_id in self.order)),
+            operator_order=self.order,
+            operators=self.operators,
         )
         return HardwareMappingResult(
             request=self.request,
@@ -385,10 +408,10 @@ class _LayerBuilder:
             chip_count=self.hardware_config.chip_count,
             logic_die_count=self.hardware_config.chip.logic_die_count,
             representative_chip_id=0,
-            local_batch_size=tree.batch_size,
+            local_batch_size=root_node.batch_size,
             expert_ownership=self.expert_ownership,
             expert_token_loads=self.expert_token_loads,
-            pipe_tree=tree,
+            root_node=root_node,
             operators=self.operators,
             operator_mappings=self.mappings,
             hardware_mappings=self.hardware_mappings,
@@ -410,7 +433,10 @@ class HardwareMapper:
         self._validate(request, model)
         builder = _LayerBuilder(request, self.hardware_config, model)
         self._build_attention(builder)
-        if request.moe_parallel_strategy is MoEParallelStrategy.TP:
+        if (
+            request.inference_config.moe_parallel_strategy
+            is MoEParallelStrategy.TP
+        ):
             self._build_moe_tp(builder)
         else:
             self._build_moe_ep(builder)
@@ -423,9 +449,12 @@ class HardwareMapper:
             raise ValueError("decode mapping supports only 16 or 32 chips")
         if dies != 4:
             raise ValueError("decode mapping requires exactly four logic dies per chip")
-        if request.history_length > model.max_position_embeddings:
-            raise ValueError("history_length exceeds the model context limit")
-        if request.global_batch_size * model.top_k < model.num_experts:
+        inference = request.inference_config
+        if inference.input_sequence_length > model.max_position_embeddings:
+            raise ValueError(
+                "input_sequence_length exceeds the model context limit"
+            )
+        if inference.global_batch_size * model.top_k < model.num_experts:
             raise ValueError(
                 "batch is too small to activate every routed expert under "
                 "the balanced-routing assumption"
@@ -440,7 +469,7 @@ class HardwareMapper:
             _exact_div(model.indexer_num_heads, dies, "indexer heads")
         tp_degree = (
             chips * dies
-            if request.moe_parallel_strategy is MoEParallelStrategy.TP
+            if inference.moe_parallel_strategy is MoEParallelStrategy.TP
             else dies
         )
         _exact_div(model.moe_intermediate_size, tp_degree, "MoE intermediate size")
@@ -455,14 +484,14 @@ class HardwareMapper:
         model = builder.model_config
         chips = self.hardware_config.chip_count
         dies = self.hardware_config.chip.logic_die_count
-        global_batch = request.global_batch_size
+        global_batch = request.inference_config.global_batch_size
         local_batch = _ceil_div(global_batch, chips)
         local_heads = model.num_attention_heads // dies
         latent_width = (
             model.q_lora_rank + model.kv_lora_rank + model.qk_rope_head_dim
         )
         local_latent = latent_width // dies
-        dtype = request.activation_dtype_bytes
+        dtype = _ACTIVATION_DTYPE_BYTES
         strategy = "attention_dp_die_tp4"
 
         builder.add_vector(
@@ -487,7 +516,7 @@ class HardwareMapper:
             weight_batches=1,
             dram_write_bytes_per_token=(
                 model.kv_lora_rank + model.qk_rope_head_dim
-            ) * request.kv_dtype_bytes,
+            ) * _KV_CACHE_DTYPE_BYTES,
         )
         builder.add_comm(
             "attn.latent_allgather", "latent_allgather",
@@ -556,9 +585,9 @@ class HardwareMapper:
             self._build_dsa(builder, local_batch, strategy)
 
         attention_history = (
-            min(request.history_length, model.dsa_len)
+            min(request.inference_config.input_sequence_length, model.dsa_len)
             if isinstance(model, DeepSeekV32Config)
-            else request.history_length
+            else request.inference_config.input_sequence_length
         )
         global_head_batch = global_batch * model.num_attention_heads
         chip_head_batch = local_batch * model.num_attention_heads
@@ -591,7 +620,7 @@ class HardwareMapper:
             parallel_strategy=strategy,
             dram_read_bytes_per_token=attention_history * (
                 model.kv_lora_rank + model.qk_rope_head_dim
-            ) * request.kv_dtype_bytes,
+            ) * _KV_CACHE_DTYPE_BYTES,
         )
         builder.add_bmm(
             "attn.qk_rope", "qk_rope",
@@ -694,8 +723,8 @@ class HardwareMapper:
         request = builder.request
         dies = self.hardware_config.chip.logic_die_count
         local_heads = model.indexer_num_heads // dies
-        global_batch = request.global_batch_size
-        history = request.history_length
+        global_batch = request.inference_config.global_batch_size
+        history = request.inference_config.input_sequence_length
         die_width = (
             local_heads * model.indexer_head_dim
             + model.indexer_head_dim + local_heads
@@ -718,7 +747,7 @@ class HardwareMapper:
             parallel_strategy=strategy,
             weight_batches=1,
             dram_write_bytes_per_token=(
-                model.indexer_head_dim * request.kv_dtype_bytes
+                model.indexer_head_dim * _KV_CACHE_DTYPE_BYTES
             ),
         )
         builder.add_bmm(
@@ -736,7 +765,7 @@ class HardwareMapper:
             ),
             parallel_strategy=strategy,
             dram_read_bytes_per_token=(
-                history * model.indexer_head_dim * request.kv_dtype_bytes
+                history * model.indexer_head_dim * _KV_CACHE_DTYPE_BYTES
             ),
         )
         builder.add_vector(
@@ -765,7 +794,7 @@ class HardwareMapper:
             "attn.dsa_score_reduce", "indexer_score_reduce",
             scope="intra_chip", kind="allreduce", group=builder.die_group,
             size_bytes=(
-                local_batch * history * request.activation_dtype_bytes
+                local_batch * history * _ACTIVATION_DTYPE_BYTES
             ),
             parallel_strategy=strategy,
         )
@@ -866,8 +895,9 @@ class HardwareMapper:
         model = builder.model_config
         chips = self.hardware_config.chip_count
         dies = self.hardware_config.chip.logic_die_count
-        local_batch = _ceil_div(request.global_batch_size, chips)
-        dtype = request.activation_dtype_bytes
+        global_batch = request.inference_config.global_batch_size
+        local_batch = _ceil_div(global_batch, chips)
+        dtype = _ACTIVATION_DTYPE_BYTES
         strategy = "moe_tp"
         builder.add_comm(
             "moe.tp_input_allgather", "dp_to_tp_allgather",
@@ -876,7 +906,7 @@ class HardwareMapper:
             parallel_strategy=strategy,
         )
         loads = self._balanced_expert_loads(
-            request.global_batch_size, model.top_k, model.num_experts,
+            global_batch, model.top_k, model.num_experts,
         )
         builder.expert_token_loads = loads
         builder.expert_ownership = tuple(
@@ -895,7 +925,7 @@ class HardwareMapper:
             "moe.tp_die_reduce", "die_partial_reduce",
             scope="intra_chip", kind="allreduce", group=builder.die_group,
             size_bytes=(
-                request.global_batch_size * model.hidden_size * dtype
+                global_batch * model.hidden_size * dtype
             ),
             parallel_strategy=strategy,
         )
@@ -904,14 +934,14 @@ class HardwareMapper:
             scope="inter_chip", kind="reduce_scatter",
             group=builder.chip_group,
             size_bytes=(
-                request.global_batch_size * model.hidden_size * dtype
+                global_batch * model.hidden_size * dtype
             ),
             parallel_strategy=strategy,
         )
         builder.add_vector(
             "moe.tp_residual", "residual",
             global_dimensions={
-                "m": request.global_batch_size, "n": model.hidden_size,
+                "m": global_batch, "n": model.hidden_size,
             },
             chip_dimensions={"m": local_batch, "n": model.hidden_size},
             die_dimensions={"m": local_batch, "n": model.hidden_size},
@@ -976,14 +1006,15 @@ class HardwareMapper:
         model = builder.model_config
         chips = self.hardware_config.chip_count
         dies = self.hardware_config.chip.logic_die_count
-        local_batch = _ceil_div(request.global_batch_size, chips)
-        dtype = request.activation_dtype_bytes
+        global_batch = request.inference_config.global_batch_size
+        local_batch = _ceil_div(global_batch, chips)
+        dtype = _ACTIVATION_DTYPE_BYTES
         strategy = "moe_ep_die_tp4"
         loads = self._balanced_expert_loads(
-            request.global_batch_size, model.top_k, model.num_experts,
+            global_batch, model.top_k, model.num_experts,
         )
         batch_base, batch_remainder = divmod(
-            request.global_batch_size, chips,
+            global_batch, chips,
         )
         row_totals = tuple(
             (batch_base + (chip < batch_remainder)) * model.top_k
@@ -1047,7 +1078,7 @@ class HardwareMapper:
         builder.add_vector(
             "moe.ep_residual", "residual",
             global_dimensions={
-                "m": request.global_batch_size, "n": model.hidden_size,
+                "m": global_batch, "n": model.hidden_size,
             },
             chip_dimensions={"m": local_batch, "n": model.hidden_size},
             die_dimensions={"m": local_batch, "n": model.hidden_size},

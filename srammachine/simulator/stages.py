@@ -38,7 +38,7 @@ def _communication_volume_ratio(command) -> Tuple[int, int]:
         return max(sent + received, default=0), 1
 
     size_bytes = command.size_bytes
-    if command.kind in ("p2p", "broadcast"):
+    if command.kind in ("p2p", "broadcast", "reduce"):
         return size_bytes, 1
     if command.kind == "allreduce":
         return 2 * (participant_count - 1) * size_bytes, participant_count
