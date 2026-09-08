@@ -2,28 +2,35 @@
 
 V1 assumes a token-preserving linear operator flow. It does not infer residual
 branches, expert routing, cross-request dependencies or physical memory layout.
-SRAM is assumed large enough to retain each operator's one-time prefetch.
+One representative stack models the identical SRAM pressure of every stack.
 """
+from collections import deque
 from copy import deepcopy
 from dataclasses import replace
 from typing import Iterator, Mapping, Tuple
 
 from srammachine.commands import (
     CommandGraph, CommandTrace, DramReadCmd, DramWriteCmd, WeightLoadCmd,
-    GemmCmd, VectorCmd, NoCCmd, InterChipCmd,
+    WeightPrefetchCmd, GemmCmd, VectorCmd, NoCCmd, InterChipCmd,
 )
 from srammachine.commands.base import integer
 from srammachine.frontend.modules import BMMOp, VectorOp, CommOp, Operator
+from srammachine.hardware import DEFAULT_HARDWARE_CONFIG, HardwareConfig
 from .mapping import OperatorMapping
 from .tree import GroupNode, Node, OpInstance, OpNode, PipeTree
 
 
 class TreeParser:
-    """Stateless tree expansion and command lowering.
+    """Hardware-bound tree expansion and command lowering.
 
     parse requires full-batch operators and per-operator mapping policies.
     iter_instances remains available for inspecting only the tree expansion.
     """
+
+    def __init__(self, hardware_config: HardwareConfig = DEFAULT_HARDWARE_CONFIG):
+        if not isinstance(hardware_config, HardwareConfig):
+            raise TypeError("hardware_config must be a HardwareConfig")
+        self.hardware_config = hardware_config
 
     def parse(
         self, tree: PipeTree, operators: Mapping[str, Operator],
@@ -38,7 +45,7 @@ class TreeParser:
         integer("layer_count", layer_count, 1)
         single = self._parse_one_layer(tree, operators, mappings)
         if layer_count == 1:
-            return single
+            return self._apply_sram_prefetch_constraints(single)
 
         # 原设计流程图要求复制单层 CommandGraph，模拟连续四层。
         # 保留原 op_id 以查询模型算子，使用 layer_index 区分不同层。
@@ -72,7 +79,84 @@ class TreeParser:
                 previous = f"layer{layer - 1}."
                 edges.extend((previous + source, prefix + target)
                              for source, target in boundary_edges)
-        return CommandGraph(commands, edges, traces)
+        graph = CommandGraph(commands, edges, traces)
+        return self._apply_sram_prefetch_constraints(graph)
+
+    def _apply_sram_prefetch_constraints(
+        self, graph: CommandGraph,
+    ) -> CommandGraph:
+        """Prioritize prefetches and add whole-weight SRAM backpressure edges."""
+        prefetches = [
+            cmd for cmd in graph.commands if isinstance(cmd, WeightPrefetchCmd)
+        ]
+        if not prefetches:
+            return graph
+
+        sram_ids = {cmd.sram_resource_id for cmd in prefetches}
+        if len(sram_ids) != 1:
+            raise ValueError(
+                "all weight prefetches must use one representative "
+                "sram_resource_id"
+            )
+
+        capacity = (
+            self.hardware_config.chip.logic_die.memory.sram_capacity_bytes
+        )
+        release_commands = {}
+        for prefetch in prefetches:
+            prefetch_trace = graph.traces[prefetch.cmd_id]
+            same_weight = [
+                cmd for cmd in graph.commands
+                if cmd.op_id == prefetch.op_id
+                and graph.traces[cmd.cmd_id].layer_index
+                == prefetch_trace.layer_index
+            ]
+            loads = [
+                cmd.cmd_id for cmd in same_weight
+                if isinstance(cmd, WeightLoadCmd)
+            ]
+            consumers = loads or [
+                cmd.cmd_id for cmd in same_weight
+                if cmd.cmd_id.endswith(".core")
+            ]
+            if not consumers:
+                raise ValueError(
+                    f"weight prefetch has no consumer: {prefetch.cmd_id}"
+                )
+            release_commands[prefetch.cmd_id] = tuple(consumers)
+
+        resident = deque()
+        resident_bytes = 0
+        capacity_edges = []
+        for prefetch in prefetches:
+            if prefetch.size_bytes > capacity:
+                raise ValueError(
+                    f"weight prefetch {prefetch.cmd_id} requires "
+                    f"{prefetch.size_bytes} bytes but representative SRAM "
+                    f"capacity is {capacity} bytes"
+                )
+            while resident_bytes + prefetch.size_bytes > capacity:
+                evicted = resident.popleft()
+                resident_bytes -= evicted.size_bytes
+                capacity_edges.extend(
+                    (consumer, prefetch.cmd_id)
+                    for consumer in release_commands[evicted.cmd_id]
+                )
+            resident.append(prefetch)
+            resident_bytes += prefetch.size_bytes
+
+        # Global insertion order is also ready-command priority metadata. Keep
+        # every prefetch ahead of demand reads/writes while preserving the
+        # layer-major/operator-order in which the parser created them.
+        prefetch_ids = {cmd.cmd_id for cmd in prefetches}
+        ordered_commands = prefetches + [
+            cmd for cmd in graph.commands if cmd.cmd_id not in prefetch_ids
+        ]
+        return CommandGraph(
+            ordered_commands,
+            tuple(graph.edges) + tuple(capacity_edges),
+            graph.traces,
+        )
 
     def _parse_one_layer(
         self, tree: PipeTree, operators: Mapping[str, Operator],
@@ -120,9 +204,9 @@ class TreeParser:
         for op_index, op_id in enumerate(tree.operator_order):
             mapping = mappings[op_id]
             if mapping.dram_read_once_bytes:
-                prefetched[op_id] = emit(DramReadCmd(
+                prefetched[op_id] = emit(WeightPrefetchCmd(
                     f"op{op_index}.prefetch", op_id, mapping.dram_resource_id,
-                    mapping.dram_read_once_bytes,
+                    mapping.dram_read_once_bytes, mapping.sram_resource_id,
                 ), by_op[op_id][0], once=True)
 
         core_ids = {}

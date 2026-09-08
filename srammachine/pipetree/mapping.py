@@ -38,6 +38,8 @@ class OperatorMapping:
         if (self.dram_read_once_bytes or self.dram_read_bytes_per_token
                 or self.dram_write_bytes_per_token) and self.dram_resource_id is None:
             raise ValueError("DRAM traffic requires dram_resource_id")
+        if self.dram_read_once_bytes and self.sram_resource_id is None:
+            raise ValueError("weight prefetch requires sram_resource_id")
         if (self.weight_load_fixed_bytes or self.weight_load_bytes_per_token
                 ) and self.sram_resource_id is None:
             raise ValueError("weight loading requires sram_resource_id")

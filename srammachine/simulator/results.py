@@ -1,0 +1,349 @@
+"""High-level, trace-ready statistics for one completed simulation."""
+
+from dataclasses import dataclass, field
+from enum import Enum
+from types import MappingProxyType
+from typing import Any, Mapping, Optional, Tuple
+
+from srammachine.commands import (
+    Command,
+    CommandGraph,
+    CommCmd,
+    DramCmd,
+    GemmCmd,
+    InterChipCmd,
+    NoCCmd,
+    VectorCmd,
+    WeightLoadCmd,
+    WeightPrefetchCmd,
+)
+from srammachine.commands.base import integer, nonempty
+from srammachine.hardware import DEFAULT_HARDWARE_CONFIG, HardwareConfig
+
+from .records import CommandState, ExecutionResult
+
+
+class CommandCategory(Enum):
+    COMPUTE = "compute"
+    PREFETCH = "prefetch"
+    MEMORY = "memory"
+    COMMUNICATION = "communication"
+
+
+def _freeze_value(value: Any) -> Any:
+    """Copy JSON-shaped command metadata into immutable containers."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        frozen = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("command parameter mappings require string keys")
+            frozen[key] = _freeze_value(item)
+        return MappingProxyType(frozen)
+    if isinstance(value, (tuple, list)):
+        return tuple(_freeze_value(item) for item in value)
+    raise TypeError(
+        "command parameters must contain only JSON-compatible values"
+    )
+
+
+def _freeze_parameters(parameters: Mapping[str, Any]) -> Mapping[str, Any]:
+    frozen = _freeze_value(parameters)
+    if not isinstance(frozen, Mapping):
+        raise TypeError("parameters must be a mapping")
+    return frozen
+
+
+def _command_category(command: Command) -> CommandCategory:
+    if isinstance(command, WeightPrefetchCmd):
+        return CommandCategory.PREFETCH
+    if isinstance(command, (GemmCmd, VectorCmd)):
+        return CommandCategory.COMPUTE
+    if isinstance(command, (DramCmd, WeightLoadCmd)):
+        return CommandCategory.MEMORY
+    if isinstance(command, (NoCCmd, InterChipCmd)):
+        return CommandCategory.COMMUNICATION
+    raise TypeError(f"unsupported command type: {type(command).__name__}")
+
+
+def _command_parameters(command: Command) -> Mapping[str, Any]:
+    if isinstance(command, WeightPrefetchCmd):
+        parameters = {
+            "size_bytes": command.size_bytes,
+            "sram_resource_id": command.sram_resource_id,
+        }
+    elif isinstance(command, DramCmd):
+        parameters = {"size_bytes": command.size_bytes}
+    elif isinstance(command, WeightLoadCmd):
+        parameters = {"size_bytes": command.size_bytes}
+    elif isinstance(command, GemmCmd):
+        parameters = {
+            "B": command.B,
+            "M": command.M,
+            "K": command.K,
+            "N": command.N,
+        }
+    elif isinstance(command, VectorCmd):
+        parameters = {
+            "kind": command.kind,
+            "m": command.m,
+            "n": command.n,
+            "params": command.params,
+        }
+    elif isinstance(command, CommCmd):
+        parameters = {
+            "kind": command.kind,
+            "scope": command.scope,
+            "group": command.group,
+            "size_bytes": command.size_bytes,
+            "root": command.root,
+            "reduce_kind": command.reduce_kind,
+            "transfer_bytes": command.transfer_bytes,
+        }
+    else:
+        raise TypeError(f"unsupported command type: {type(command).__name__}")
+    return _freeze_parameters(parameters)
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    """One concrete hardware action, ready for a future trace exporter."""
+
+    cmd_id: str
+    op_id: str
+    resource_id: str
+    command_type: str
+    category: CommandCategory
+    layer_index: int
+    instance_index: Optional[int]
+    token_start: int
+    token_stop: int
+    node_path: Tuple[int, ...]
+    start_time_ns: int
+    end_time_ns: int
+    parameters: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        for name in ("cmd_id", "op_id", "resource_id", "command_type"):
+            nonempty(name, getattr(self, name))
+        if not isinstance(self.category, CommandCategory):
+            raise TypeError("category must be a CommandCategory")
+        integer("layer_index", self.layer_index)
+        if self.instance_index is not None:
+            integer("instance_index", self.instance_index)
+        integer("token_start", self.token_start)
+        integer("token_stop", self.token_stop)
+        if self.token_stop <= self.token_start:
+            raise ValueError("token range must be nonempty")
+        path = tuple(self.node_path)
+        for index in path:
+            integer("node_path index", index)
+        integer("start_time_ns", self.start_time_ns)
+        integer("end_time_ns", self.end_time_ns)
+        if self.end_time_ns < self.start_time_ns:
+            raise ValueError("end_time_ns must not precede start_time_ns")
+        if not isinstance(self.parameters, Mapping):
+            raise TypeError("parameters must be a mapping")
+        object.__setattr__(self, "node_path", path)
+        object.__setattr__(
+            self, "parameters", _freeze_parameters(self.parameters),
+        )
+
+    @property
+    def duration_ns(self) -> int:
+        return self.end_time_ns - self.start_time_ns
+
+
+@dataclass(frozen=True)
+class LayerResult:
+    """Diagnostic active span of every command assigned to one layer."""
+
+    layer_index: int
+    command_ids: Tuple[str, ...]
+    start_time_ns: int
+    end_time_ns: int
+
+    def __post_init__(self) -> None:
+        integer("layer_index", self.layer_index)
+        command_ids = tuple(self.command_ids)
+        if not command_ids:
+            raise ValueError("a layer result must contain at least one command")
+        for cmd_id in command_ids:
+            nonempty("command ID", cmd_id)
+        if len(set(command_ids)) != len(command_ids):
+            raise ValueError("layer command IDs must be unique")
+        integer("start_time_ns", self.start_time_ns)
+        integer("end_time_ns", self.end_time_ns)
+        if self.end_time_ns < self.start_time_ns:
+            raise ValueError("end_time_ns must not precede start_time_ns")
+        object.__setattr__(self, "command_ids", command_ids)
+
+    @property
+    def active_span_ns(self) -> int:
+        return self.end_time_ns - self.start_time_ns
+
+
+@dataclass(frozen=True)
+class SimulationResult:
+    """In-memory aggregate and command-level results for one graph run."""
+
+    execution_result: ExecutionResult
+    hardware_config: HardwareConfig
+    command_results: Tuple[CommandResult, ...]
+    layer_results: Tuple[LayerResult, ...]
+    _command_lookup: Mapping[str, CommandResult] = field(
+        init=False, repr=False, compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.execution_result, ExecutionResult):
+            raise TypeError("execution_result must be an ExecutionResult")
+        if not isinstance(self.hardware_config, HardwareConfig):
+            raise TypeError("hardware_config must be a HardwareConfig")
+        command_results = tuple(self.command_results)
+        layer_results = tuple(self.layer_results)
+        if any(not isinstance(item, CommandResult) for item in command_results):
+            raise TypeError("command_results must contain CommandResult values")
+        if any(not isinstance(item, LayerResult) for item in layer_results):
+            raise TypeError("layer_results must contain LayerResult values")
+
+        lookup = {item.cmd_id: item for item in command_results}
+        if len(lookup) != len(command_results):
+            raise ValueError("command result IDs must be unique")
+        execution_ids = set(self.execution_result.executions)
+        if set(lookup) != execution_ids:
+            raise ValueError(
+                "command_results and execution_result must contain the same IDs"
+            )
+        expected_layers = tuple(range(len(layer_results)))
+        actual_layers = tuple(item.layer_index for item in layer_results)
+        if actual_layers != expected_layers:
+            raise ValueError("layer results must be consecutive from layer 0")
+        grouped_ids = tuple(
+            cmd_id for layer in layer_results for cmd_id in layer.command_ids
+        )
+        if len(grouped_ids) != len(set(grouped_ids)) or set(grouped_ids) != set(lookup):
+            raise ValueError("layer results must partition all command results")
+
+        object.__setattr__(self, "command_results", command_results)
+        object.__setattr__(self, "layer_results", layer_results)
+        object.__setattr__(self, "_command_lookup", MappingProxyType(lookup))
+
+    @property
+    def total_time_ns(self) -> int:
+        return self.execution_result.total_time_ns
+
+    @property
+    def layer_count(self) -> int:
+        return len(self.layer_results)
+
+    @property
+    def average_layer_time_ns(self) -> float:
+        if not self.layer_results:
+            return 0.0
+        return self.total_time_ns / self.layer_count
+
+    def command_result(self, cmd_id: str) -> CommandResult:
+        return self._command_lookup[cmd_id]
+
+    def commands_for_layer(self, layer_index: int) -> Tuple[CommandResult, ...]:
+        integer("layer_index", layer_index)
+        if layer_index >= self.layer_count:
+            return ()
+        return tuple(
+            self._command_lookup[cmd_id]
+            for cmd_id in self.layer_results[layer_index].command_ids
+        )
+
+    def commands_for_op(
+        self, op_id: str, *, layer_index: Optional[int] = None,
+    ) -> Tuple[CommandResult, ...]:
+        nonempty("op_id", op_id)
+        if layer_index is not None:
+            integer("layer_index", layer_index)
+        return tuple(
+            item for item in self.command_results
+            if item.op_id == op_id
+            and (layer_index is None or item.layer_index == layer_index)
+        )
+
+    def commands_by_category(
+        self, category: CommandCategory,
+    ) -> Tuple[CommandResult, ...]:
+        if not isinstance(category, CommandCategory):
+            raise TypeError("category must be a CommandCategory")
+        return tuple(
+            item for item in self.command_results if item.category is category
+        )
+
+
+def build_simulation_result(
+    graph: CommandGraph,
+    execution_result: ExecutionResult,
+    hardware_config: HardwareConfig = DEFAULT_HARDWARE_CONFIG,
+) -> SimulationResult:
+    """Combine a completed low-level run with graph and trace metadata."""
+    if not isinstance(graph, CommandGraph):
+        raise TypeError("graph must be a CommandGraph")
+    if not isinstance(execution_result, ExecutionResult):
+        raise TypeError("execution_result must be an ExecutionResult")
+    if not isinstance(hardware_config, HardwareConfig):
+        raise TypeError("hardware_config must be a HardwareConfig")
+
+    graph_ids = tuple(command.cmd_id for command in graph.commands)
+    if set(graph_ids) != set(execution_result.executions):
+        raise ValueError("execution result does not match the command graph")
+    if any(
+        execution_result.states[cmd_id] is not CommandState.COMPLETED
+        for cmd_id in graph_ids
+    ):
+        raise ValueError("execution result contains incomplete commands")
+    if graph_ids and set(graph.traces) != set(graph_ids):
+        raise ValueError("every command requires CommandTrace metadata")
+
+    layer_indices = sorted({
+        trace.layer_index for trace in graph.traces.values()
+    })
+    if layer_indices != list(range(len(layer_indices))):
+        raise ValueError("CommandTrace layer indices must be consecutive from 0")
+
+    command_results = []
+    for command in graph.commands:
+        trace = graph.traces[command.cmd_id]
+        execution = execution_result.executions[command.cmd_id]
+        command_results.append(CommandResult(
+            cmd_id=command.cmd_id,
+            op_id=command.op_id,
+            resource_id=command.resource_id,
+            command_type=type(command).__name__,
+            category=_command_category(command),
+            layer_index=trace.layer_index,
+            instance_index=trace.instance_index,
+            token_start=trace.token_start,
+            token_stop=trace.token_stop,
+            node_path=trace.node_path,
+            start_time_ns=execution.start_time_ns,
+            end_time_ns=execution.end_time_ns,
+            parameters=_command_parameters(command),
+        ))
+
+    layer_results = []
+    for layer_index in layer_indices:
+        items = tuple(
+            item for item in command_results
+            if item.layer_index == layer_index
+        )
+        layer_results.append(LayerResult(
+            layer_index=layer_index,
+            command_ids=tuple(item.cmd_id for item in items),
+            start_time_ns=min(item.start_time_ns for item in items),
+            end_time_ns=max(item.end_time_ns for item in items),
+        ))
+
+    return SimulationResult(
+        execution_result=execution_result,
+        hardware_config=hardware_config,
+        command_results=tuple(command_results),
+        layer_results=tuple(layer_results),
+    )

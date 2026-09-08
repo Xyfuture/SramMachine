@@ -325,9 +325,9 @@ class ChipConfig:
 
 @dataclass(frozen=True)
 class InterChipFabricConfig:
-    """Per-chip interface to a switched inter-chip fabric."""
+    """Per-chip interface to a full-mesh switched inter-chip fabric."""
 
-    topology: str = "nvl72_switch_fabric"
+    topology: str = "full_mesh_switch_fabric"
     per_chip_directional_bandwidth_bytes_per_second: int = 800 * _GB
     full_duplex: bool = True
 
@@ -353,14 +353,15 @@ class InterChipFabricConfig:
 class HardwareConfig:
     """Top-level system hardware configuration."""
 
-    chip_count: int = 72
+    chip_count: int = 16
     chip: ChipConfig = field(default_factory=ChipConfig)
     inter_chip_fabric: InterChipFabricConfig = field(
         default_factory=InterChipFabricConfig
     )
 
     def __post_init__(self) -> None:
-        _positive_integer("chip_count", self.chip_count)
+        if type(self.chip_count) is not int or self.chip_count not in (16, 32):
+            raise ValueError("chip_count must be either 16 or 32")
         if not isinstance(self.chip, ChipConfig):
             raise ValueError("chip must be a ChipConfig")
         if not isinstance(self.inter_chip_fabric, InterChipFabricConfig):
@@ -390,4 +391,3 @@ class HardwareConfig:
 
 
 DEFAULT_HARDWARE_CONFIG = HardwareConfig()
-
