@@ -107,7 +107,7 @@ def _trace_payload(result: SimulationResult) -> Mapping[str, Any]:
         }
         args.update(_json_value(item.parameters))
         event = {
-            "name": f"{item.op_id} [{item.command_type}]",
+            "name": _event_name(item),
             "cat": item.category.value,
             "pid": _TRACE_PROCESS_ID,
             "tid": thread_ids[item.resource_id],
@@ -124,6 +124,66 @@ def _trace_payload(result: SimulationResult) -> Mapping[str, Any]:
         "traceEvents": events,
         "displayTimeUnit": "ns",
     }
+
+
+def _event_name(item) -> str:
+    base = f"{item.op_id} [{item.command_type}]"
+    parameters = item.parameters
+    if "gemm_b" in parameters:
+        return (
+            f"{base} B={parameters['gemm_b']} M={parameters['gemm_m']} "
+            f"K={parameters['gemm_k']} N={parameters['gemm_n']}"
+        )
+    if "vector_kind" in parameters:
+        return (
+            f"{base} {parameters['vector_kind']} "
+            f"m={parameters['vector_m']} n={parameters['vector_n']}"
+        )
+    if "weight_size_bytes" in parameters:
+        shape = parameters.get("weight_shape") or {}
+        shape_text = _shape_text(shape, ("B", "K", "N"))
+        suffix = f"weight={_format_bytes(parameters['weight_size_bytes'])}"
+        if shape_text:
+            suffix += f" {shape_text}"
+        return f"{base} {suffix}"
+    if "communication_kind" in parameters:
+        size = parameters.get("communication_size_bytes")
+        critical = parameters.get("communication_critical_path_bytes")
+        suffix = (
+            f"{parameters['communication_scope']} "
+            f"{parameters['communication_kind']}"
+        )
+        if size is not None:
+            suffix += f" size={_format_bytes(size)}"
+        suffix += f" critical={_format_bytes(critical)}"
+        return f"{base} {suffix}"
+    if "size_bytes" in parameters:
+        return f"{base} size={_format_bytes(parameters['size_bytes'])}"
+    return base
+
+
+def _shape_text(shape, order) -> str:
+    parts = []
+    for key in order:
+        if key in shape:
+            parts.append(f"{key}={shape[key]}")
+    return " ".join(parts)
+
+
+def _format_bytes(value) -> str:
+    if value is None:
+        return "0B"
+    size = float(value)
+    unit = "B"
+    if abs(size) >= 1024 * 1024:
+        size /= 1024 * 1024
+        unit = "MB"
+    elif abs(size) >= 1024:
+        size /= 1024
+        unit = "KB"
+    if size.is_integer():
+        return f"{int(size)}{unit}"
+    return f"{size:.2f}{unit}"
 
 
 def export_perfetto_trace(

@@ -71,39 +71,87 @@ def _command_parameters(command: Command) -> Mapping[str, Any]:
     if isinstance(command, WeightPrefetchCmd):
         parameters = {
             "size_bytes": command.size_bytes,
+            "weight_size_bytes": command.size_bytes,
+            "weight_shape": command.weight_shape,
             "sram_resource_id": command.sram_resource_id,
         }
     elif isinstance(command, DramCmd):
         parameters = {"size_bytes": command.size_bytes}
     elif isinstance(command, WeightLoadCmd):
-        parameters = {"size_bytes": command.size_bytes}
+        parameters = {
+            "size_bytes": command.size_bytes,
+            "weight_size_bytes": command.size_bytes,
+            "weight_shape": command.weight_shape,
+        }
     elif isinstance(command, GemmCmd):
         parameters = {
             "B": command.B,
             "M": command.M,
             "K": command.K,
             "N": command.N,
+            "gemm_b": command.B,
+            "gemm_m": command.M,
+            "gemm_k": command.K,
+            "gemm_n": command.N,
         }
     elif isinstance(command, VectorCmd):
         parameters = {
             "kind": command.kind,
             "m": command.m,
             "n": command.n,
+            "vector_kind": command.kind,
+            "vector_m": command.m,
+            "vector_n": command.n,
             "params": command.params,
         }
     elif isinstance(command, CommCmd):
+        critical_num, critical_den = _communication_volume_ratio(command)
         parameters = {
             "kind": command.kind,
+            "communication_kind": command.kind,
             "scope": command.scope,
+            "communication_scope": command.scope,
             "group": command.group,
             "size_bytes": command.size_bytes,
+            "communication_size_bytes": command.size_bytes,
             "root": command.root,
             "reduce_kind": command.reduce_kind,
             "transfer_bytes": command.transfer_bytes,
+            "communication_transfer_bytes": command.transfer_bytes,
+            "communication_critical_path_bytes_numerator": critical_num,
+            "communication_critical_path_bytes_denominator": critical_den,
+            "communication_critical_path_bytes": critical_num / critical_den,
         }
     else:
         raise TypeError(f"unsupported command type: {type(command).__name__}")
     return _freeze_parameters(parameters)
+
+
+def _communication_volume_ratio(command: CommCmd) -> Tuple[int, int]:
+    participant_count = len(command.group)
+    if command.transfer_bytes is not None:
+        matrix = command.transfer_bytes
+        sent = [
+            sum(size for column, size in enumerate(row) if column != row_index)
+            for row_index, row in enumerate(matrix)
+        ]
+        received = [
+            sum(matrix[row][column] for row in range(participant_count)
+                if row != column)
+            for column in range(participant_count)
+        ]
+        return max(sent + received, default=0), 1
+
+    size_bytes = command.size_bytes or 0
+    if command.kind in ("p2p", "broadcast", "reduce"):
+        return size_bytes, 1
+    if command.kind == "allreduce":
+        return 2 * (participant_count - 1) * size_bytes, participant_count
+    if command.kind == "allgather":
+        return (participant_count - 1) * size_bytes, 1
+    if command.kind in ("reduce_scatter", "alltoall"):
+        return (participant_count - 1) * size_bytes, participant_count
+    raise ValueError(f"unsupported communication kind: {command.kind}")
 
 
 @dataclass(frozen=True)
@@ -240,9 +288,47 @@ class SimulationResult:
 
     @property
     def average_layer_time_ns(self) -> float:
+        return self.pipeline_layer_time_ns
+
+    @property
+    def pipeline_layer_time_ns(self) -> float:
+        """Steady-state layer throughput using the third layer milestone."""
         if not self.layer_results:
             return 0.0
-        return self.total_time_ns / self.layer_count
+        if self.layer_count >= 3:
+            return (
+                self._layer_core_start_time_ns(2)
+                - self._layer_core_start_time_ns(1)
+            )
+        if self.layer_count == 2:
+            return (
+                self._layer_core_start_time_ns(1)
+                - self._layer_core_start_time_ns(0)
+            )
+        return self._layer_core_span_ns(0)
+
+    def _layer_core_start_time_ns(self, layer_index: int) -> int:
+        commands = self._core_commands_for_layer(layer_index)
+        if not commands:
+            raise ValueError(f"layer {layer_index} has no core commands")
+        return min(item.start_time_ns for item in commands)
+
+    def _layer_core_span_ns(self, layer_index: int) -> int:
+        commands = self._core_commands_for_layer(layer_index)
+        if not commands:
+            return self.layer_results[layer_index].active_span_ns
+        return (
+            max(item.end_time_ns for item in commands)
+            - min(item.start_time_ns for item in commands)
+        )
+
+    def _core_commands_for_layer(
+        self, layer_index: int,
+    ) -> Tuple[CommandResult, ...]:
+        return tuple(
+            item for item in self.commands_for_layer(layer_index)
+            if item.cmd_id.endswith(".core")
+        )
 
     def command_result(self, cmd_id: str) -> CommandResult:
         return self._command_lookup[cmd_id]

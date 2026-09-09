@@ -10,8 +10,9 @@ from dataclasses import replace
 from typing import Iterator, Mapping, Tuple
 
 from srammachine.commands import (
-    CommandGraph, CommandTrace, DramReadCmd, DramWriteCmd, WeightLoadCmd,
-    WeightPrefetchCmd, GemmCmd, VectorCmd, NoCCmd, InterChipCmd,
+    CommandGraph, CommandTrace, DramCmd, DramReadCmd, DramWriteCmd,
+    WeightLoadCmd, WeightPrefetchCmd, GemmCmd, VectorCmd, NoCCmd,
+    InterChipCmd,
 )
 from srammachine.commands.base import integer
 from srammachine.frontend.modules import BMMOp, VectorOp, CommOp, Operator
@@ -45,7 +46,7 @@ class TreeParser:
         integer("layer_count", layer_count, 1)
         single = self._parse_one_layer(tree, operators, mappings)
         if layer_count == 1:
-            return self._apply_sram_prefetch_constraints(single)
+            return self._apply_weight_constraints(single)
 
         # 原设计流程图要求复制单层 CommandGraph，模拟连续四层。
         # 保留原 op_id 以查询模型算子，使用 layer_index 区分不同层。
@@ -80,17 +81,59 @@ class TreeParser:
                 edges.extend((previous + source, prefix + target)
                              for source, target in boundary_edges)
         graph = CommandGraph(commands, edges, traces)
-        return self._apply_sram_prefetch_constraints(graph)
+        return self._apply_weight_constraints(graph)
+
+    def _apply_weight_constraints(self, graph: CommandGraph) -> CommandGraph:
+        consumer_ranks = self._dram_consumer_ranks(graph)
+        graph = self._apply_sram_prefetch_constraints(graph, consumer_ranks)
+        graph = self._apply_sa_weight_load_constraints(graph)
+        return self._apply_dram_scheduling_priorities(graph, consumer_ranks)
+
+    @staticmethod
+    def _dram_consumer_ranks(graph: CommandGraph) -> Mapping[str, int]:
+        """Rank DRAM traffic by its earliest core consumer in this PipeTree."""
+        topological_order = graph.topological_order()
+        topological_rank = {
+            cmd_id: rank for rank, cmd_id in enumerate(topological_order)
+        }
+        background_rank = len(topological_order)
+        result = {}
+        for command in graph.commands:
+            if not isinstance(command, DramCmd):
+                continue
+            pending = list(graph.successors(command.cmd_id))
+            visited = set()
+            consumers = []
+            while pending:
+                cmd_id = pending.pop()
+                if cmd_id in visited:
+                    continue
+                visited.add(cmd_id)
+                if cmd_id.endswith(".core"):
+                    consumers.append(topological_rank[cmd_id])
+                    continue
+                pending.extend(graph.successors(cmd_id))
+            result[command.cmd_id] = (
+                min(consumers) if consumers
+                else background_rank + topological_rank[command.cmd_id]
+            )
+        return result
 
     def _apply_sram_prefetch_constraints(
-        self, graph: CommandGraph,
+        self, graph: CommandGraph, consumer_ranks: Mapping[str, int],
     ) -> CommandGraph:
-        """Prioritize prefetches and add whole-weight SRAM backpressure edges."""
+        """Order prefetches by demand and add SRAM-capacity backpressure."""
+        graph_rank = {
+            command.cmd_id: rank for rank, command in enumerate(graph.commands)
+        }
         prefetches = [
             cmd for cmd in graph.commands if isinstance(cmd, WeightPrefetchCmd)
         ]
         if not prefetches:
             return graph
+        prefetches.sort(key=lambda command: (
+            consumer_ranks[command.cmd_id], graph_rank[command.cmd_id],
+        ))
 
         sram_ids = {cmd.sram_resource_id for cmd in prefetches}
         if len(sram_ids) != 1:
@@ -145,17 +188,82 @@ class TreeParser:
             resident.append(prefetch)
             resident_bytes += prefetch.size_bytes
 
-        # Global insertion order is also ready-command priority metadata. Keep
-        # every prefetch ahead of demand reads/writes while preserving the
-        # layer-major/operator-order in which the parser created them.
-        prefetch_ids = {cmd.cmd_id for cmd in prefetches}
-        ordered_commands = prefetches + [
-            cmd for cmd in graph.commands if cmd.cmd_id not in prefetch_ids
+        # Preserve the consumer order even when an early prefetch is blocked by
+        # SRAM capacity. Demand reads remain free to use the idle DRAM resource.
+        prefetch_chains = {}
+        for prefetch in prefetches:
+            prefetch_chains.setdefault(prefetch.resource_id, []).append(
+                prefetch.cmd_id
+            )
+        order_edges = [
+            (previous, current)
+            for chain in prefetch_chains.values()
+            for previous, current in zip(chain, chain[1:])
         ]
         return CommandGraph(
-            ordered_commands,
-            tuple(graph.edges) + tuple(capacity_edges),
+            graph.commands,
+            tuple(graph.edges) + tuple(capacity_edges) + tuple(order_edges),
             graph.traces,
+            graph.scheduling_priorities,
+        )
+
+    @staticmethod
+    def _apply_sa_weight_load_constraints(
+        graph: CommandGraph,
+    ) -> CommandGraph:
+        """Allow only the current and next weight load on each mapped PU.
+
+        ``WeightLoadCmd`` represents one complete SRAM-to-array transfer in
+        the current coarse command model.  With one look-ahead slot, load
+        ``i + 2`` cannot start until the GEMM consuming load ``i`` completes.
+        Loads targeting different PU resources have independent windows.
+        """
+        loads_by_pu = {}
+        for command in graph.commands:
+            if not isinstance(command, WeightLoadCmd):
+                continue
+            consumers = [
+                graph.command(successor)
+                for successor in graph.successors(command.cmd_id)
+                if isinstance(graph.command(successor), GemmCmd)
+            ]
+            if len(consumers) != 1:
+                raise ValueError(
+                    f"weight load {command.cmd_id} must directly feed "
+                    "exactly one GemmCmd"
+                )
+            core = consumers[0]
+            loads_by_pu.setdefault(core.resource_id, []).append(
+                (command.cmd_id, core.cmd_id)
+            )
+
+        buffer_edges = []
+        for pairs in loads_by_pu.values():
+            for index in range(2, len(pairs)):
+                load_id, _ = pairs[index]
+                _, released_by_core = pairs[index - 2]
+                buffer_edges.append((released_by_core, load_id))
+
+        if not buffer_edges:
+            return graph
+        return CommandGraph(
+            graph.commands,
+            tuple(graph.edges) + tuple(buffer_edges),
+            graph.traces,
+            graph.scheduling_priorities,
+        )
+
+    @staticmethod
+    def _apply_dram_scheduling_priorities(
+        graph: CommandGraph, consumer_ranks: Mapping[str, int],
+    ) -> CommandGraph:
+        priorities = dict(graph.scheduling_priorities)
+        priorities.update(consumer_ranks)
+        return CommandGraph(
+            graph.commands,
+            graph.edges,
+            graph.traces,
+            priorities,
         )
 
     def _parse_one_layer(
@@ -202,11 +310,13 @@ class TreeParser:
 
         # Independent one-time prefetches are deliberately emitted first.
         for op_index, op_id in enumerate(tree.operator_order):
+            op = checked[op_id]
             mapping = mappings[op_id]
             if mapping.dram_read_once_bytes:
                 prefetched[op_id] = emit(WeightPrefetchCmd(
                     f"op{op_index}.prefetch", op_id, mapping.dram_resource_id,
                     mapping.dram_read_once_bytes, mapping.sram_resource_id,
+                    self._weight_shape(op, mapping.dram_read_once_bytes),
                 ), by_op[op_id][0], once=True)
 
         core_ids = {}
@@ -227,6 +337,7 @@ class TreeParser:
             if load_bytes:
                 load = emit(WeightLoadCmd(
                     prefix + ".load", op_id, mapping.sram_resource_id, load_bytes,
+                    self._weight_shape(op, load_bytes),
                 ), instance)
                 edges.extend((source, load) for source in readiness)
                 readiness = [load]
@@ -258,6 +369,17 @@ class TreeParser:
                     j += 1
 
         return CommandGraph(commands, edges, traces)
+
+    @staticmethod
+    def _weight_shape(op, size_bytes):
+        if not isinstance(op, BMMOp):
+            return {"size_bytes": size_bytes}
+        matrix_elements = op.K * op.N
+        weight_batches, remainder = divmod(size_bytes, matrix_elements)
+        shape = {"K": op.K, "N": op.N, "size_bytes": size_bytes}
+        if remainder == 0 and weight_batches:
+            shape["B"] = weight_batches
+        return shape
 
     @staticmethod
     def _core_command(cmd_id, op, mapping, batch, full_batch):

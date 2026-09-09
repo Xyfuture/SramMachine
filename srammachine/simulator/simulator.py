@@ -54,10 +54,10 @@ class Simulator:
         annealing inner loop. Browser launch remains an explicit caller action.
         """
         result = self.run(graph)
-        average_ns = result.average_layer_time_ns
+        layer_time_ns = result.average_layer_time_ns
         print(
-            f"Average layer time: {average_ns:.3f} ns "
-            f"({average_ns / 1_000_000:.6f} ms)"
+            f"Pipeline layer time: {layer_time_ns:.3f} ns "
+            f"({layer_time_ns / 1_000_000:.6f} ms)"
         )
         trace_path = export_perfetto_trace(
             result,

@@ -85,14 +85,17 @@ class GraphExecutor(SimModule):
         command = self.graph.command(cmd_id)
         self._states[cmd_id] = CommandState.READY
         heap = self._ready_by_resource.setdefault(command.resource_id, [])
-        heapq.heappush(heap, self._rank[cmd_id])
+        heapq.heappush(heap, (
+            self.graph.scheduling_priorities[cmd_id], self._rank[cmd_id],
+        ))
 
     def _dispatch_idle_resources(self) -> None:
         for resource_id, stage in self._stages.items():
             ready = self._ready_by_resource.get(resource_id)
             if resource_id in self._busy_resources or not ready:
                 continue
-            command = self.graph.commands[heapq.heappop(ready)]
+            _, rank = heapq.heappop(ready)
+            command = self.graph.commands[rank]
             if self._states[command.cmd_id] is not CommandState.READY:
                 raise RuntimeError(f"invalid ready state: {command.cmd_id}")
             self._states[command.cmd_id] = CommandState.RUNNING

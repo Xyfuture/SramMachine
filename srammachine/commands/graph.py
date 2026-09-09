@@ -1,7 +1,7 @@
-"""Dependency DAG with stable command and per-resource insertion order.
+"""Dependency DAG with stable order and optional scheduling priorities.
 
-Resource order is priority metadata for ready commands, not dependency edges.
-An unready command must not prevent ready work from entering a resource FIFO.
+Scheduling priority affects only ready commands sharing one resource; it never
+adds a dependency or makes an unready command block ready work.
 """
 from dataclasses import dataclass
 import heapq
@@ -36,6 +36,7 @@ class CommandGraph:
         self, commands: Iterable[Command],
         edges: Iterable[Tuple[str, str]] = (),
         traces: Optional[Mapping[str, CommandTrace]] = None,
+        scheduling_priorities: Optional[Mapping[str, int]] = None,
     ) -> None:
         self.commands = tuple(commands)
         lookup = {}
@@ -65,6 +66,15 @@ class CommandGraph:
         if any(not isinstance(t, CommandTrace) for t in trace_map.values()):
             raise TypeError("traces must contain CommandTrace values")
         self.traces = MappingProxyType(trace_map)
+        priority_map = dict(scheduling_priorities or {})
+        if not set(priority_map).issubset(lookup):
+            raise ValueError("scheduling priority references missing command")
+        for cmd_id, priority in priority_map.items():
+            integer(f"scheduling priority for {cmd_id}", priority)
+        self.scheduling_priorities = MappingProxyType({
+            cmd_id: priority_map.get(cmd_id, rank)
+            for cmd_id, rank in self._rank.items()
+        })
         resources = {}
         for cmd in self.commands:
             resources.setdefault(cmd.resource_id, []).append(cmd.cmd_id)
