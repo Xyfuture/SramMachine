@@ -11,7 +11,7 @@ from typing import Iterator, Mapping, Tuple
 
 from srammachine.commands import (
     CommandGraph, CommandTrace, DramCmd, DramReadCmd, DramWriteCmd,
-    WeightLoadCmd, WeightPrefetchCmd, GemmCmd, VectorCmd, NoCCmd,
+    SramReadCmd, WeightLoadCmd, WeightPrefetchCmd, GemmCmd, VectorCmd, NoCCmd,
     InterChipCmd,
 )
 from srammachine.commands.base import integer
@@ -211,14 +211,14 @@ class TreeParser:
     def _apply_sa_weight_load_constraints(
         graph: CommandGraph,
     ) -> CommandGraph:
-        """Allow only the current and next weight load on each mapped PU.
+        """Allow a static weight load only one actual GEMM ahead per PU.
 
-        ``WeightLoadCmd`` represents one complete SRAM-to-array transfer in
-        the current coarse command model.  With one look-ahead slot, load
-        ``i + 2`` cannot start until the GEMM consuming load ``i`` completes.
-        Loads targeting different PU resources have independent windows.
+        The window is defined by the complete GEMM stream, including dynamic
+        right-operand operations such as QK and SV.  Once every direct input
+        of GEMM ``i`` has completed, GEMM ``i`` is ready on its PU and the
+        static weight for GEMM ``i + 1`` may load concurrently on SRAM.
         """
-        loads_by_pu = {}
+        load_by_core = {}
         for command in graph.commands:
             if not isinstance(command, WeightLoadCmd):
                 continue
@@ -233,16 +233,31 @@ class TreeParser:
                     "exactly one GemmCmd"
                 )
             core = consumers[0]
-            loads_by_pu.setdefault(core.resource_id, []).append(
-                (command.cmd_id, core.cmd_id)
-            )
+            if core.cmd_id in load_by_core:
+                raise ValueError(
+                    f"GEMM {core.cmd_id} has more than one WeightLoadCmd"
+                )
+            load_by_core[core.cmd_id] = command.cmd_id
+
+        gemms_by_pu = {}
+        for command in graph.commands:
+            if isinstance(command, GemmCmd):
+                gemms_by_pu.setdefault(command.resource_id, []).append(
+                    command.cmd_id
+                )
 
         buffer_edges = []
-        for pairs in loads_by_pu.values():
-            for index in range(2, len(pairs)):
-                load_id, _ = pairs[index]
-                _, released_by_core = pairs[index - 2]
-                buffer_edges.append((released_by_core, load_id))
+        for cores in gemms_by_pu.values():
+            for index in range(1, len(cores)):
+                load_id = load_by_core.get(cores[index])
+                if load_id is None:
+                    continue
+                previous_core = cores[index - 1]
+                buffer_edges.extend(
+                    (source, load_id)
+                    for source in graph.predecessors(previous_core)
+                    if source != load_id
+                )
 
         if not buffer_edges:
             return graph
@@ -316,24 +331,30 @@ class TreeParser:
                 prefetched[op_id] = emit(WeightPrefetchCmd(
                     f"op{op_index}.prefetch", op_id, mapping.dram_resource_id,
                     mapping.dram_read_once_bytes, mapping.sram_resource_id,
-                    self._weight_shape(op, mapping.dram_read_once_bytes),
+                    self._prefetch_weight_shape(
+                        op, mapping, mapping.dram_read_once_bytes,
+                    ),
                 ), by_op[op_id][0], once=True)
 
         core_ids = {}
+        demand_sram_reads = {}
         for instance in instances:
             op_id, batch = instance.op_id, instance.batch_size
             op, mapping = checked[op_id], mappings[op_id]
             prefix = f"i{instance.index}"
+            mapped_batch = self._mapped_batch_size(
+                batch, mapping.batch_partition_degree,
+            )
             readiness = []
             if op_id in prefetched:
                 readiness.append(prefetched[op_id])
             if mapping.dram_read_bytes_per_token:
                 readiness.append(emit(DramReadCmd(
                     prefix + ".read", op_id, mapping.dram_resource_id,
-                    batch * mapping.dram_read_bytes_per_token,
+                    mapped_batch * mapping.dram_read_bytes_per_token,
                 ), instance))
             load_bytes = (mapping.weight_load_fixed_bytes
-                          + batch * mapping.weight_load_bytes_per_token)
+                          + mapped_batch * mapping.weight_load_bytes_per_token)
             if load_bytes:
                 load = emit(WeightLoadCmd(
                     prefix + ".load", op_id, mapping.sram_resource_id, load_bytes,
@@ -341,6 +362,15 @@ class TreeParser:
                 ), instance)
                 edges.extend((source, load) for source in readiness)
                 readiness = [load]
+            if mapping.sram_read_bytes_per_mapped_token:
+                sram_read = emit(SramReadCmd(
+                    prefix + ".sram_read", op_id, mapping.sram_resource_id,
+                    mapped_batch * mapping.sram_read_bytes_per_mapped_token,
+                    mapping.sram_read_data_kind,
+                ), instance)
+                edges.extend((source, sram_read) for source in readiness)
+                readiness = [sram_read]
+                demand_sram_reads[instance.index] = sram_read
 
             core = self._core_command(
                 prefix + ".core", op, mapping, batch, tree.batch_size,
@@ -350,7 +380,7 @@ class TreeParser:
             if mapping.dram_write_bytes_per_token:
                 write = emit(DramWriteCmd(
                     prefix + ".write", op_id, mapping.dram_resource_id,
-                    batch * mapping.dram_write_bytes_per_token,
+                    mapped_batch * mapping.dram_write_bytes_per_token,
                 ), instance)
                 edges.append((core.cmd_id, write))
 
@@ -368,7 +398,36 @@ class TreeParser:
                 if target.token_stop <= source.token_stop:
                     j += 1
 
+        # A dynamic right operand is a demand read, not a look-ahead weight
+        # load.  Open it at the same BMM-block boundary as the explicit input
+        # broadcast so the two resources can run in parallel.  The GEMM waits
+        # for both through their independent edges.
+        order_index = {
+            op_id: index for index, op_id in enumerate(tree.operator_order)
+        }
+        for instance_index, sram_read in demand_sram_reads.items():
+            instance = instances[instance_index]
+            position = order_index[instance.op_id]
+            broadcast_id = f"{instance.op_id}.input_broadcast"
+            if position == 0 or tree.operator_order[position - 1] != broadcast_id:
+                raise ValueError(
+                    f"dynamic SRAM BMM is missing its input broadcast: "
+                    f"{instance.op_id}"
+                )
+            if position < 2:
+                continue
+            sources = by_op[tree.operator_order[position - 2]]
+            for source in sources:
+                if max(source.token_start, instance.token_start) < min(
+                    source.token_stop, instance.token_stop,
+                ):
+                    edges.append((core_ids[source.index], sram_read))
+
         return CommandGraph(commands, edges, traces)
+
+    @staticmethod
+    def _mapped_batch_size(batch: int, partition_degree: int) -> int:
+        return (batch + partition_degree - 1) // partition_degree
 
     @staticmethod
     def _weight_shape(op, size_bytes):
@@ -381,14 +440,29 @@ class TreeParser:
             shape["B"] = weight_batches
         return shape
 
+    @classmethod
+    def _prefetch_weight_shape(cls, op, mapping, size_bytes):
+        if mapping.weight_shape is None:
+            return cls._weight_shape(op, size_bytes)
+        return dict(mapping.weight_shape, size_bytes=size_bytes)
+
     @staticmethod
     def _core_command(cmd_id, op, mapping, batch, full_batch):
         def scale(value):
-            quotient, remainder = divmod(value * batch, full_batch)
+            mapped_batch = TreeParser._mapped_batch_size(
+                batch, mapping.batch_partition_degree,
+            )
+            mapped_full_batch = TreeParser._mapped_batch_size(
+                full_batch, mapping.batch_partition_degree,
+            )
+            quotient, remainder = divmod(
+                value * mapped_batch, mapped_full_batch,
+            )
             if remainder:
                 raise ValueError(
                     f"{op.op_id}: {mapping.batch_axis} value {value} cannot be "
-                    f"scaled exactly from batch {full_batch} to {batch}"
+                    f"scaled exactly from mapped batch {mapped_full_batch} "
+                    f"to {mapped_batch}"
                 )
             return quotient
 

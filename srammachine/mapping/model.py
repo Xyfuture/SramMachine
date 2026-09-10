@@ -40,6 +40,15 @@ def _exact(data: Mapping[str, Any], name: str, expected: Any) -> Any:
     return value
 
 
+def _boolean(data: Mapping[str, Any], name: str) -> bool:
+    if name not in data:
+        raise KeyError(f"model card missing required field: {name}")
+    value = data[name]
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a boolean")
+    return value
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     """Common validated configuration consumed by the hardware mapper."""
@@ -60,6 +69,7 @@ class ModelConfig:
     v_head_dim: int
     rms_norm_eps: float
     rope_theta: float
+    use_qk_norm: bool
     dsa: bool = False
     dsa_len: int | None = None
     indexer_num_heads: int | None = None
@@ -75,7 +85,6 @@ class ModelConfig:
         _exact(data, "ffn_type", "moe")
         _exact(data, "hidden_act", "silu")
         _exact(data, "attention_bias", False)
-        _exact(data, "use_qk_norm", False)
         _exact(data, "dsa", False)
         _exact(data, "num_nextn_predict_layers", 1)
         heads = _positive_int(data, "num_attention_heads")
@@ -103,6 +112,7 @@ class ModelConfig:
             v_head_dim=_positive_int(data, "v_head_dim"),
             rms_norm_eps=_positive_number(data, "rms_norm_eps"),
             rope_theta=_positive_number(data, "rope_theta"),
+            use_qk_norm=_boolean(data, "use_qk_norm"),
         )
 
 
@@ -127,7 +137,6 @@ class DeepSeekV32Config(DeepSeekV3Config):
         _exact(data, "ffn_type", "moe")
         _exact(data, "hidden_act", "silu")
         _exact(data, "attention_bias", False)
-        _exact(data, "use_qk_norm", False)
         _exact(data, "dsa", True)
         _exact(data, "topk_sharing", False)
         _exact(data, "num_nextn_predict_layers", 1)
@@ -156,6 +165,7 @@ class DeepSeekV32Config(DeepSeekV3Config):
             v_head_dim=_positive_int(data, "v_head_dim"),
             rms_norm_eps=_positive_number(data, "rms_norm_eps"),
             rope_theta=_positive_number(data, "rope_theta"),
+            use_qk_norm=_boolean(data, "use_qk_norm"),
             dsa=True,
             dsa_len=_positive_int(data, "dsa_len"),
             indexer_num_heads=_positive_int(data, "indexer_num_heads"),

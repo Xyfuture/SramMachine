@@ -146,6 +146,11 @@ def _event_name(item) -> str:
         if shape_text:
             suffix += f" {shape_text}"
         return f"{base} {suffix}"
+    if parameters.get("operand_role") == "right_operand":
+        return (
+            f"{base} {parameters['data_kind']} "
+            f"size={_format_bytes(parameters['size_bytes'])}"
+        )
     if "communication_kind" in parameters:
         size = parameters.get("communication_size_bytes")
         critical = parameters.get("communication_critical_path_bytes")
@@ -177,10 +182,10 @@ def _format_bytes(value) -> str:
     unit = "B"
     if abs(size) >= 1024 * 1024:
         size /= 1024 * 1024
-        unit = "MB"
+        unit = "MiB"
     elif abs(size) >= 1024:
         size /= 1024
-        unit = "KB"
+        unit = "KiB"
     if size.is_integer():
         return f"{int(size)}{unit}"
     return f"{size:.2f}{unit}"

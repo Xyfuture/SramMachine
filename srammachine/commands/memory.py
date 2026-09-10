@@ -39,6 +39,23 @@ class DramWriteCmd(DramCmd):
 
 
 @dataclass(frozen=True)
+class SramReadCmd(Command):
+    """Demand-read a dynamic right operand from SRAM into an array."""
+
+    size_bytes: int
+    data_kind: str
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        integer("size_bytes", self.size_bytes)
+        nonempty("data_kind", self.data_kind)
+        if self.data_kind not in (
+            "kv_nope", "kv_rope", "kv_fused", "kv_value", "dsa_key",
+        ):
+            raise ValueError("unsupported SRAM read data_kind")
+
+
+@dataclass(frozen=True)
 class WeightLoadCmd(Command):
     """Supply bytes from SRAM to the array independently of DRAM access."""
     size_bytes: int

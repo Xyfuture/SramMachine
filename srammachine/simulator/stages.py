@@ -8,7 +8,7 @@ from Desim import FIFO, SimModule, SimSession, SimTime
 
 from srammachine.commands import (
     Command, DramCmd, GemmCmd, InterChipCmd, NoCCmd, VectorCmd,
-    WeightLoadCmd,
+    SramReadCmd, WeightLoadCmd,
 )
 from srammachine.hardware import HardwareConfig
 from .records import CommandExecution
@@ -127,9 +127,9 @@ class DramResourceStage(HardwareResourceStage):
 
 
 class SramResourceStage(HardwareResourceStage):
-    accepted_command_types = (WeightLoadCmd,)
+    accepted_command_types = (WeightLoadCmd, SramReadCmd)
 
-    def latency_ns(self, command: WeightLoadCmd) -> int:
+    def latency_ns(self, command: WeightLoadCmd | SramReadCmd) -> int:
         self._validate_command(command)
         logic_die = self.hardware_config.chip.logic_die
         bandwidth = min(
@@ -203,7 +203,7 @@ class InterChipFabricStage(HardwareResourceStage):
 def stage_class_for_command(command: Command):
     if isinstance(command, DramCmd):
         return DramResourceStage
-    if isinstance(command, WeightLoadCmd):
+    if isinstance(command, (WeightLoadCmd, SramReadCmd)):
         return SramResourceStage
     if isinstance(command, GemmCmd):
         return ProcessingUnitStage

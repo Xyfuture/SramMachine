@@ -13,6 +13,7 @@ from srammachine.commands import (
     GemmCmd,
     InterChipCmd,
     NoCCmd,
+    SramReadCmd,
     VectorCmd,
     WeightLoadCmd,
     WeightPrefetchCmd,
@@ -60,7 +61,7 @@ def _command_category(command: Command) -> CommandCategory:
         return CommandCategory.PREFETCH
     if isinstance(command, (GemmCmd, VectorCmd)):
         return CommandCategory.COMPUTE
-    if isinstance(command, (DramCmd, WeightLoadCmd)):
+    if isinstance(command, (DramCmd, WeightLoadCmd, SramReadCmd)):
         return CommandCategory.MEMORY
     if isinstance(command, (NoCCmd, InterChipCmd)):
         return CommandCategory.COMMUNICATION
@@ -82,6 +83,12 @@ def _command_parameters(command: Command) -> Mapping[str, Any]:
             "size_bytes": command.size_bytes,
             "weight_size_bytes": command.size_bytes,
             "weight_shape": command.weight_shape,
+        }
+    elif isinstance(command, SramReadCmd):
+        parameters = {
+            "size_bytes": command.size_bytes,
+            "data_kind": command.data_kind,
+            "operand_role": "right_operand",
         }
     elif isinstance(command, GemmCmd):
         parameters = {
