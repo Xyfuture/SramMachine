@@ -384,6 +384,7 @@ class _LayerBuilder:
         root: Optional[Any] = None,
         reduce_kind: str = "sum",
         batch_partition_degree: int = 1,
+        dram_write_bytes_per_token: int = 0,
     ) -> None:
         matrix = None
         if transfer_bytes is not None:
@@ -406,6 +407,8 @@ class _LayerBuilder:
             operator,
             OperatorMapping(
                 "size_bytes", resource,
+                self.DRAM if dram_write_bytes_per_token else None,
+                dram_write_bytes_per_token=dram_write_bytes_per_token,
                 batch_partition_degree=batch_partition_degree,
             ),
             OperatorHardwareMapping(
@@ -459,7 +462,6 @@ class HardwareMapper:
         self._validate(request, model)
         builder = _LayerBuilder(request, self.hardware_config, model)
         self._build_attention(builder)
-        self._build_moe_input_layout(builder)
         if (
             request.inference_config.moe_parallel_strategy
             is MoEParallelStrategy.TP
@@ -486,6 +488,14 @@ class HardwareMapper:
                 "batch is too small to activate every routed expert under "
                 "the balanced-routing assumption"
             )
+        _exact_div(model.num_attention_heads, dies, "attention heads")
+        _exact_div(
+            model.q_lora_rank + model.kv_lora_rank + model.qk_rope_head_dim,
+            dies,
+            "MLA latent width",
+        )
+        if isinstance(model, DeepSeekV32Config):
+            _exact_div(model.indexer_num_heads, dies, "indexer heads")
         tp_degree = (
             chips * dies
             if inference.moe_parallel_strategy is MoEParallelStrategy.TP
@@ -505,21 +515,21 @@ class HardwareMapper:
         dies = self.hardware_config.chip.logic_die_count
         global_batch = request.inference_config.global_batch_size
         chip_batch = _ceil_div(global_batch, chips)
-        die_batch = _ceil_div(chip_batch, dies)
+        local_heads = model.num_attention_heads // dies
         pu_rows = self.hardware_config.chip.logic_die.pu_mesh_rows
         pu_columns = self.hardware_config.chip.logic_die.pu_mesh_columns
         latent_width = (
             model.q_lora_rank + model.kv_lora_rank + model.qk_rope_head_dim
         )
-        strategy = "attention_chip_die_dp_pu_tp"
+        local_latent = latent_width // dies
+        strategy = "attention_chip_dp_die_head_tp_pu_tp"
 
         builder.add_vector(
             "attn.input_norm", "rmsnorm",
             global_dimensions={"m": global_batch, "n": model.hidden_size},
             chip_dimensions={"m": chip_batch, "n": model.hidden_size},
-            die_dimensions={"m": die_batch, "n": model.hidden_size},
+            die_dimensions={"m": chip_batch, "n": model.hidden_size},
             parallel_strategy=strategy,
-            batch_partition_degree=dies,
         )
         builder.add_bmm(
             "attn.latent_down", "mla_latent_down_projection",
@@ -530,14 +540,19 @@ class HardwareMapper:
                 1, chip_batch, model.hidden_size, latent_width,
             ),
             die_dimensions=self._dims(
-                1, die_batch, model.hidden_size, latent_width,
+                1, chip_batch, model.hidden_size, local_latent,
             ),
             parallel_strategy=strategy,
             weight_batches=1,
+        )
+        builder.add_comm(
+            "attn.latent_allgather", "latent_allgather",
+            scope="intra_chip", kind="allgather", group=builder.die_group,
+            size_bytes=chip_batch * local_latent * _ACTIVATION_DTYPE_BYTES,
+            parallel_strategy=strategy,
             dram_write_bytes_per_token=(
                 model.kv_lora_rank + model.qk_rope_head_dim
             ) * _KV_CACHE_DTYPE_BYTES,
-            batch_partition_degree=dies,
         )
         if model.use_qk_norm:
             for suffix, width in (
@@ -548,9 +563,8 @@ class HardwareMapper:
                     f"attn.{suffix}", "rmsnorm",
                     global_dimensions={"m": global_batch, "n": width},
                     chip_dimensions={"m": chip_batch, "n": width},
-                    die_dimensions={"m": die_batch, "n": width},
+                    die_dimensions={"m": chip_batch, "n": width},
                     parallel_strategy=strategy,
-                    batch_partition_degree=dies,
                 )
         builder.add_vector(
             "attn.k_rope", "rope",
@@ -561,10 +575,9 @@ class HardwareMapper:
                 "m": chip_batch, "n": model.qk_rope_head_dim,
             },
             die_dimensions={
-                "m": die_batch, "n": model.qk_rope_head_dim,
+                "m": chip_batch, "n": model.qk_rope_head_dim,
             },
             parallel_strategy=strategy,
-            batch_partition_degree=dies,
         )
         builder.add_bmm(
             "attn.q_rope_projection", "q_rope_projection",
@@ -577,12 +590,11 @@ class HardwareMapper:
                 model.num_attention_heads * model.qk_rope_head_dim,
             ),
             die_dimensions=self._dims(
-                1, die_batch, model.q_lora_rank,
-                model.num_attention_heads * model.qk_rope_head_dim,
+                1, chip_batch, model.q_lora_rank,
+                local_heads * model.qk_rope_head_dim,
             ),
             parallel_strategy=strategy,
             weight_batches=1,
-            batch_partition_degree=dies,
         )
         builder.add_vector(
             "attn.q_rope", "rope",
@@ -595,14 +607,13 @@ class HardwareMapper:
                 "n": model.qk_rope_head_dim,
             },
             die_dimensions={
-                "m": die_batch * model.num_attention_heads,
+                "m": chip_batch * local_heads,
                 "n": model.qk_rope_head_dim,
             },
             parallel_strategy=strategy,
-            batch_partition_degree=dies,
         )
         if isinstance(model, DeepSeekV32Config):
-            self._build_dsa(builder, chip_batch, die_batch, strategy)
+            self._build_dsa(builder, chip_batch, strategy)
 
         attention_history = (
             min(request.inference_config.input_sequence_length, model.dsa_len)
@@ -611,7 +622,7 @@ class HardwareMapper:
         )
         global_head_batch = global_batch * model.num_attention_heads
         chip_head_batch = chip_batch * model.num_attention_heads
-        die_head_batch = die_batch * model.num_attention_heads
+        die_head_batch = chip_batch * local_heads
         builder.add_bmm(
             "attn.qk_nope_absorb", "qk_nope_absorb_q",
             global_dimensions=self._dims(
@@ -624,9 +635,8 @@ class HardwareMapper:
                 die_head_batch, 1, model.q_lora_rank, model.kv_lora_rank,
             ),
             parallel_strategy=strategy,
-            weight_batches=model.num_attention_heads,
+            weight_batches=local_heads,
             batch_axis="B",
-            batch_partition_degree=dies,
         )
         # The NoPE and RoPE score terms are one concatenated dot product:
         # [Q_nope_absorbed, Q_rope] @ [KV_latent, K_rope].  Keeping this as
@@ -649,7 +659,6 @@ class HardwareMapper:
                 attention_history * fused_qk_width * _KV_CACHE_DTYPE_BYTES
             ),
             batch_axis="B",
-            batch_partition_degree=dies,
             sram_read_bytes_per_mapped_token=(
                 (
                     _ceil_div(model.kv_lora_rank, pu_rows)
@@ -672,7 +681,6 @@ class HardwareMapper:
                 "m": die_head_batch, "n": attention_history,
             },
             parallel_strategy=strategy,
-            batch_partition_degree=dies,
         )
         builder.add_bmm(
             "attn.sv_latent", "sv_latent",
@@ -687,7 +695,6 @@ class HardwareMapper:
             ),
             parallel_strategy=strategy,
             batch_axis="B",
-            batch_partition_degree=dies,
             sram_read_bytes_per_mapped_token=(
                 _ceil_div(attention_history, pu_rows)
                 * _ceil_div(model.kv_lora_rank, pu_columns)
@@ -707,18 +714,22 @@ class HardwareMapper:
                 die_head_batch, 1, model.kv_lora_rank, model.hidden_size,
             ),
             parallel_strategy=strategy,
-            weight_batches=model.num_attention_heads,
+            weight_batches=local_heads,
             batch_axis="B",
-            batch_partition_degree=dies,
         )
         builder.add_vector(
             "attn.local_head_reduce", "head_reduce",
             global_dimensions={"m": global_batch, "n": model.hidden_size},
             chip_dimensions={"m": chip_batch, "n": model.hidden_size},
-            die_dimensions={"m": die_batch, "n": model.hidden_size},
+            die_dimensions={"m": chip_batch, "n": model.hidden_size},
             parallel_strategy=strategy,
-            flops_per_element=max(model.num_attention_heads - 1, 1),
-            batch_partition_degree=dies,
+            flops_per_element=max(local_heads - 1, 1),
+        )
+        builder.add_comm(
+            "attn.die_output_reduce", "die_output_reduce",
+            scope="intra_chip", kind="allreduce", group=builder.die_group,
+            size_bytes=chip_batch * model.hidden_size * _ACTIVATION_DTYPE_BYTES,
+            parallel_strategy=strategy,
         )
         for op_id, kind, coefficient in (
             ("attn.residual", "residual", 1),
@@ -733,16 +744,14 @@ class HardwareMapper:
                     "m": chip_batch, "n": model.hidden_size,
                 },
                 die_dimensions={
-                    "m": die_batch, "n": model.hidden_size,
+                    "m": chip_batch, "n": model.hidden_size,
                 },
                 parallel_strategy=strategy,
                 flops_per_element=coefficient,
-                batch_partition_degree=dies,
             )
 
     def _build_dsa(
-        self, builder: _LayerBuilder, chip_batch: int, die_batch: int,
-        strategy: str,
+        self, builder: _LayerBuilder, chip_batch: int, strategy: str,
     ) -> None:
         model = builder.model_config
         request = builder.request
@@ -751,9 +760,14 @@ class HardwareMapper:
         pu_columns = self.hardware_config.chip.logic_die.pu_mesh_columns
         global_batch = request.inference_config.global_batch_size
         history = request.inference_config.input_sequence_length
+        local_heads = model.indexer_num_heads // dies
         chip_width = (
             model.indexer_num_heads * model.indexer_head_dim
             + model.indexer_head_dim + model.indexer_num_heads
+        )
+        die_width = (
+            local_heads * model.indexer_head_dim
+            + model.indexer_head_dim + local_heads
         )
         builder.add_bmm(
             "attn.dsa_qkw", "indexer_qkw_projection",
@@ -764,14 +778,13 @@ class HardwareMapper:
                 1, chip_batch, model.hidden_size, chip_width,
             ),
             die_dimensions=self._dims(
-                1, die_batch, model.hidden_size, chip_width,
+                1, chip_batch, model.hidden_size, die_width,
             ),
             parallel_strategy=strategy,
             weight_batches=1,
             dram_write_bytes_per_token=(
                 model.indexer_head_dim * _KV_CACHE_DTYPE_BYTES
             ),
-            batch_partition_degree=dies,
         )
         builder.add_bmm(
             "attn.dsa_qk_score", "indexer_qk_score",
@@ -784,7 +797,7 @@ class HardwareMapper:
                 model.indexer_head_dim, history,
             ),
             die_dimensions=self._dims(
-                die_batch, model.indexer_num_heads,
+                chip_batch, local_heads,
                 model.indexer_head_dim, history,
             ),
             parallel_strategy=strategy,
@@ -792,7 +805,6 @@ class HardwareMapper:
                 history * model.indexer_head_dim * _KV_CACHE_DTYPE_BYTES
             ),
             batch_axis="B",
-            batch_partition_degree=dies,
             sram_read_bytes_per_mapped_token=(
                 _ceil_div(model.indexer_head_dim, pu_rows)
                 * _ceil_div(history, pu_columns)
@@ -809,37 +821,24 @@ class HardwareMapper:
                 "m": chip_batch * model.indexer_num_heads, "n": history,
             },
             die_dimensions={
-                "m": die_batch * model.indexer_num_heads, "n": history,
+                "m": chip_batch * local_heads, "n": history,
             },
             parallel_strategy=strategy,
             flops_per_element=1,
-            batch_partition_degree=dies,
         )
         builder.add_vector(
             "attn.dsa_head_reduce", "indexer_weighted_head_reduce",
             global_dimensions={"m": global_batch, "n": history},
             chip_dimensions={"m": chip_batch, "n": history},
-            die_dimensions={"m": die_batch, "n": history},
+            die_dimensions={"m": chip_batch, "n": history},
             parallel_strategy=strategy,
-            flops_per_element=max(2 * model.indexer_num_heads - 1, 1),
-            batch_partition_degree=dies,
+            flops_per_element=max(2 * local_heads - 1, 1),
         )
-
-    def _build_moe_input_layout(self, builder: _LayerBuilder) -> None:
-        """Gather die-DP attention outputs before the unchanged MoE mapping."""
-        model = builder.model_config
-        chips = self.hardware_config.chip_count
-        dies = self.hardware_config.chip.logic_die_count
-        chip_batch = _ceil_div(
-            builder.request.inference_config.global_batch_size, chips,
-        )
-        die_batch = _ceil_div(chip_batch, dies)
         builder.add_comm(
-            "moe.input_die_allgather", "attention_dp_to_moe_layout",
-            scope="intra_chip", kind="allgather", group=builder.die_group,
-            size_bytes=die_batch * model.hidden_size * _ACTIVATION_DTYPE_BYTES,
-            parallel_strategy="attention_die_dp_to_moe",
-            batch_partition_degree=dies,
+            "attn.dsa_score_reduce", "indexer_score_reduce",
+            scope="intra_chip", kind="allreduce", group=builder.die_group,
+            size_bytes=chip_batch * history * _ACTIVATION_DTYPE_BYTES,
+            parallel_strategy=strategy,
         )
 
     @staticmethod
