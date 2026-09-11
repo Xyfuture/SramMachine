@@ -213,6 +213,15 @@ class _LayerBuilder:
             f"chip0.die0.pu{row * columns}" for row in range(rows)
         )
 
+    @property
+    def die_collective_parallel_link_count(self) -> int:
+        """Physical NoC links striping one adjacent-die logical edge."""
+        chip = self.hardware_config.chip
+        return min(
+            chip.horizontal_logic_die_boundary_link_count,
+            chip.vertical_logic_die_boundary_link_count,
+        )
+
     def _record(
         self, operator: Operator, mapping: OperatorMapping,
         hardware_mapping: OperatorHardwareMapping,
@@ -383,6 +392,7 @@ class _LayerBuilder:
         transfer_bytes: Optional[Sequence[Sequence[int]]] = None,
         root: Optional[Any] = None,
         reduce_kind: str = "sum",
+        parallel_link_count: int = 1,
         batch_partition_degree: int = 1,
         dram_write_bytes_per_token: int = 0,
     ) -> None:
@@ -392,6 +402,7 @@ class _LayerBuilder:
         operator = CommOp(
             op_id, kind, scope, tuple(group), size_bytes=size_bytes,
             root=root, reduce_kind=reduce_kind, transfer_bytes=matrix,
+            parallel_link_count=parallel_link_count,
         )
         resource = self.NOC if scope == "intra_chip" else self.FABRIC
         if size_bytes is not None:
@@ -549,6 +560,7 @@ class HardwareMapper:
             "attn.latent_allgather", "latent_allgather",
             scope="intra_chip", kind="allgather", group=builder.die_group,
             size_bytes=chip_batch * local_latent * _ACTIVATION_DTYPE_BYTES,
+            parallel_link_count=builder.die_collective_parallel_link_count,
             parallel_strategy=strategy,
             dram_write_bytes_per_token=(
                 model.kv_lora_rank + model.qk_rope_head_dim
@@ -729,6 +741,7 @@ class HardwareMapper:
             "attn.die_output_reduce", "die_output_reduce",
             scope="intra_chip", kind="allreduce", group=builder.die_group,
             size_bytes=chip_batch * model.hidden_size * _ACTIVATION_DTYPE_BYTES,
+            parallel_link_count=builder.die_collective_parallel_link_count,
             parallel_strategy=strategy,
         )
         for op_id, kind, coefficient in (
@@ -838,6 +851,7 @@ class HardwareMapper:
             "attn.dsa_score_reduce", "indexer_score_reduce",
             scope="intra_chip", kind="allreduce", group=builder.die_group,
             size_bytes=chip_batch * history * _ACTIVATION_DTYPE_BYTES,
+            parallel_link_count=builder.die_collective_parallel_link_count,
             parallel_strategy=strategy,
         )
 
@@ -969,6 +983,7 @@ class HardwareMapper:
             size_bytes=(
                 global_batch * model.hidden_size * dtype
             ),
+            parallel_link_count=builder.die_collective_parallel_link_count,
             parallel_strategy=strategy,
         )
         builder.add_comm(
@@ -1106,6 +1121,7 @@ class HardwareMapper:
             size_bytes=(
                 representative_assignments * model.hidden_size * dtype
             ),
+            parallel_link_count=builder.die_collective_parallel_link_count,
             parallel_strategy=strategy,
         )
         combine = tuple(

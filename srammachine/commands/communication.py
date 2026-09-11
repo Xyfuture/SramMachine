@@ -13,6 +13,7 @@ class CommCmd(Command):
     root: Optional[ParticipantId] = None
     reduce_kind: str = "sum"
     transfer_bytes: Optional[Tuple[Tuple[int, ...], ...]] = None
+    parallel_link_count: int = 1
     scope: ClassVar[str] = ""
 
     def __post_init__(self) -> None:
@@ -23,6 +24,7 @@ class CommCmd(Command):
         checked = CommOp(
             self.op_id, self.kind, self.scope, self.group, self.size_bytes,
             self.root, self.reduce_kind, self.transfer_bytes,
+            self.parallel_link_count,
         )
         object.__setattr__(self, "group", checked.group)
         object.__setattr__(self, "transfer_bytes", checked.transfer_bytes)

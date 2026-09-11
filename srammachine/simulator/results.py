@@ -68,7 +68,9 @@ def _command_category(command: Command) -> CommandCategory:
     raise TypeError(f"unsupported command type: {type(command).__name__}")
 
 
-def _command_parameters(command: Command) -> Mapping[str, Any]:
+def _command_parameters(
+    command: Command, hardware_config: HardwareConfig,
+) -> Mapping[str, Any]:
     if isinstance(command, WeightPrefetchCmd):
         parameters = {
             "size_bytes": command.size_bytes,
@@ -129,6 +131,17 @@ def _command_parameters(command: Command) -> Mapping[str, Any]:
             "communication_critical_path_bytes_denominator": critical_den,
             "communication_critical_path_bytes": critical_num / critical_den,
         }
+        if isinstance(command, NoCCmd):
+            link_bandwidth = (
+                hardware_config.chip.noc.link_bandwidth_bytes_per_second
+            )
+            parameters.update({
+                "noc_parallel_link_count": command.parallel_link_count,
+                "noc_link_bandwidth_bytes_per_second": link_bandwidth,
+                "noc_effective_bandwidth_bytes_per_second": (
+                    link_bandwidth * command.parallel_link_count
+                ),
+            })
     else:
         raise TypeError(f"unsupported command type: {type(command).__name__}")
     return _freeze_parameters(parameters)
@@ -418,7 +431,7 @@ def build_simulation_result(
             node_path=trace.node_path,
             start_time_ns=execution.start_time_ns,
             end_time_ns=execution.end_time_ns,
-            parameters=_command_parameters(command),
+            parameters=_command_parameters(command, hardware_config),
         ))
 
     layer_results = []

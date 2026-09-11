@@ -480,6 +480,7 @@ class TreeParser:
             **common, kind=op.kind, group=op.group,
             size_bytes=None if op.size_bytes is None else scale(op.size_bytes),
             root=op.root, reduce_kind=op.reduce_kind, transfer_bytes=matrix,
+            parallel_link_count=op.parallel_link_count,
         )
 
     def iter_instances(self, tree: PipeTree) -> Iterator[OpInstance]:

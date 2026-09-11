@@ -84,6 +84,9 @@ class CommOp(Operator):
     group[i] to group[j], replacing size_bytes. Diagonal entries are allowed
     and describe locally retained data rather than network traffic.
     reduce_kind applies to reduce, allreduce and reduce_scatter.
+    parallel_link_count is the number of physical NoC links striping one
+    logical participant-to-participant transfer.  It defaults to one for a
+    PU row/column path; current die-level collectives use four boundary links.
     """
 
     kind: str
@@ -93,6 +96,7 @@ class CommOp(Operator):
     root: Optional[ParticipantId] = None
     reduce_kind: str = "sum"
     transfer_bytes: Optional[Tuple[Tuple[int, ...], ...]] = None
+    parallel_link_count: int = 1
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -103,6 +107,11 @@ class CommOp(Operator):
             raise ValueError("unsupported communication kind")
         if self.scope not in ("intra_chip", "inter_chip"):
             raise ValueError("scope must be intra_chip or inter_chip")
+        _integer("parallel_link_count", self.parallel_link_count, 1)
+        if self.scope == "inter_chip" and self.parallel_link_count != 1:
+            raise ValueError(
+                "parallel_link_count is only configurable for intra_chip NoC"
+            )
         if not isinstance(self.group, (tuple, list)) or not self.group:
             raise ValueError("group must be a nonempty sequence of participant IDs")
         self.group = tuple(self.group)
