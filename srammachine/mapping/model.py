@@ -10,6 +10,8 @@ _MODEL_CARD_DIR = Path(__file__).resolve().parent.parent / "model_cards"
 _SUPPORTED_MODELS = {
     "deepseek-v3": "deepseek-v3.json",
     "deepseek-v3.2": "deepseek-v3.2.json",
+    "kimi-k2.5": "kimi-k2.5.json",
+    "glm-5.1": "glm-5.1.json",
 }
 
 
@@ -74,6 +76,7 @@ class ModelConfig:
     dsa_len: int | None = None
     indexer_num_heads: int | None = None
     indexer_head_dim: int | None = None
+    lightning_index_dim: int | None = None
 
     @classmethod
     def from_dict(
@@ -172,8 +175,130 @@ class DeepSeekV32Config(DeepSeekV3Config):
             indexer_head_dim=_positive_int(data, "indexer_head_dim"),
         )
 
+
+@dataclass(frozen=True)
+class KimiK25Config(ModelConfig):
+    """Kimi K2.5 MLA/MoE representative-layer parameters."""
+
+    @classmethod
+    def from_dict(
+        cls, data: Mapping[str, Any], *, model_name: str = "kimi-k2.5",
+    ) -> "KimiK25Config":
+        if not isinstance(data, Mapping):
+            raise TypeError("model card must be a mapping")
+        _exact(data, "attn_type", "mla")
+        _exact(data, "ffn_type", "moe")
+        _exact(data, "hidden_act", "silu")
+        _exact(data, "attention_bias", False)
+        _exact(data, "dsa", False)
+        _exact(data, "topk_sharing", False)
+        _exact(data, "indexshare", False)
+        _exact(data, "num_nextn_predict_layers", 0)
+        heads = _positive_int(data, "num_attention_heads")
+        hidden = _positive_int(data, "hidden_size")
+        experts = _positive_int(data, "n_routed_experts")
+        top_k = _positive_int(data, "num_experts_per_tok")
+        if heads != 64:
+            raise ValueError("Kimi K2.5 requires 64 attention heads")
+        if experts != 384:
+            raise ValueError("Kimi K2.5 requires 384 routed experts")
+        if top_k != 8:
+            raise ValueError("Kimi K2.5 requires top-8 expert routing")
+        if hidden % heads:
+            raise ValueError("hidden_size must be divisible by num_attention_heads")
+        return cls(
+            model_name=model_name,
+            hidden_size=hidden,
+            intermediate_size=_positive_int(data, "intermediate_size"),
+            moe_intermediate_size=_positive_int(data, "moe_intermediate_size"),
+            num_attention_heads=heads,
+            num_experts=experts,
+            top_k=top_k,
+            num_hidden_layers=_positive_int(data, "num_hidden_layers"),
+            max_position_embeddings=_positive_int(data, "max_position_embeddings"),
+            q_lora_rank=_positive_int(data, "q_lora_rank"),
+            kv_lora_rank=_positive_int(data, "kv_lora_rank"),
+            qk_nope_head_dim=_positive_int(data, "qk_nope_head_dim"),
+            qk_rope_head_dim=_positive_int(data, "qk_rope_head_dim"),
+            v_head_dim=_positive_int(data, "v_head_dim"),
+            rms_norm_eps=_positive_number(data, "rms_norm_eps"),
+            rope_theta=_positive_number(data, "rope_theta"),
+            use_qk_norm=_boolean(data, "use_qk_norm"),
+        )
+
+
+@dataclass(frozen=True)
+class GLM51Config(ModelConfig):
+    """GLM 5.1 MLA/DSA/MoE representative-layer parameters."""
+
+    dsa: bool = True
+
+    @classmethod
+    def from_dict(
+        cls, data: Mapping[str, Any], *, model_name: str = "glm-5.1",
+    ) -> "GLM51Config":
+        if not isinstance(data, Mapping):
+            raise TypeError("model card must be a mapping")
+        _exact(data, "attn_type", "mla")
+        _exact(data, "ffn_type", "moe")
+        _exact(data, "hidden_act", "silu")
+        _exact(data, "attention_bias", False)
+        _exact(data, "dsa", True)
+        _exact(data, "topk_sharing", False)
+        _exact(data, "indexshare", False)
+        _exact(data, "num_nextn_predict_layers", 1)
+        heads = _positive_int(data, "num_attention_heads")
+        hidden = _positive_int(data, "hidden_size")
+        experts = _positive_int(data, "n_routed_experts")
+        top_k = _positive_int(data, "num_experts_per_tok")
+        indexer_heads = _positive_int(data, "indexer_num_heads")
+        indexer_head_dim = _positive_int(data, "indexer_head_dim")
+        dsa_len = _positive_int(data, "dsa_len")
+        lightning_index_dim = _positive_int(data, "lightning_index_dim")
+        if heads != 64:
+            raise ValueError("GLM 5.1 requires 64 attention heads")
+        if experts != 256:
+            raise ValueError("GLM 5.1 requires 256 routed experts")
+        if top_k != 8:
+            raise ValueError("GLM 5.1 requires top-8 expert routing")
+        if (indexer_heads, indexer_head_dim, dsa_len) != (32, 128, 2048):
+            raise ValueError(
+                "GLM 5.1 requires a 32x128 indexer with top-2048"
+            )
+        if lightning_index_dim != indexer_head_dim:
+            raise ValueError(
+                "lightning_index_dim must equal indexer_head_dim"
+            )
+        if hidden % heads:
+            raise ValueError("hidden_size must be divisible by num_attention_heads")
+        return cls(
+            model_name=model_name,
+            hidden_size=hidden,
+            intermediate_size=_positive_int(data, "intermediate_size"),
+            moe_intermediate_size=_positive_int(data, "moe_intermediate_size"),
+            num_attention_heads=heads,
+            num_experts=experts,
+            top_k=top_k,
+            num_hidden_layers=_positive_int(data, "num_hidden_layers"),
+            max_position_embeddings=_positive_int(data, "max_position_embeddings"),
+            q_lora_rank=_positive_int(data, "q_lora_rank"),
+            kv_lora_rank=_positive_int(data, "kv_lora_rank"),
+            qk_nope_head_dim=_positive_int(data, "qk_nope_head_dim"),
+            qk_rope_head_dim=_positive_int(data, "qk_rope_head_dim"),
+            v_head_dim=_positive_int(data, "v_head_dim"),
+            rms_norm_eps=_positive_number(data, "rms_norm_eps"),
+            rope_theta=_positive_number(data, "rope_theta"),
+            use_qk_norm=_boolean(data, "use_qk_norm"),
+            dsa=True,
+            dsa_len=dsa_len,
+            indexer_num_heads=indexer_heads,
+            indexer_head_dim=indexer_head_dim,
+            lightning_index_dim=lightning_index_dim,
+        )
+
+
 def load_model_config(model_name: str) -> ModelConfig:
-    """Load one of the two explicitly supported model cards."""
+    """Load one of the explicitly supported model cards."""
     if not isinstance(model_name, str) or not model_name.strip():
         raise ValueError("model_name must be a nonempty string")
     try:
@@ -184,10 +309,15 @@ def load_model_config(model_name: str) -> ModelConfig:
         data = json.load(stream)
     if model_name == "deepseek-v3":
         return DeepSeekV3Config.from_dict(data)
-    return DeepSeekV32Config.from_dict(data)
+    if model_name == "deepseek-v3.2":
+        return DeepSeekV32Config.from_dict(data)
+    if model_name == "kimi-k2.5":
+        return KimiK25Config.from_dict(data)
+    return GLM51Config.from_dict(data)
 
 
 __all__ = [
     "ModelConfig", "DeepSeekV3Config", "DeepSeekV32Config",
+    "KimiK25Config", "GLM51Config",
     "load_model_config",
 ]

@@ -65,9 +65,9 @@ def build_root_node(
     operator_order: Sequence[str],
     operators: Mapping[str, Operator],
 ) -> RootNode:
-    """Build the split=1 RootNode shared by supported DeepSeek models.
+    """Build the split=1 RootNode shared by supported MLA/MoE models.
 
-    Model-specific operations, including the V3.2 DSA path and TP/EP MoE
+    Model-specific operations, including DSA paths and TP/EP MoE
     collectives, come from ``operator_order``. This function only adds stable
     semantic grouping and never invents, removes, or reorders an operation.
     """

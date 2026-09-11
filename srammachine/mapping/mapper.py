@@ -1,4 +1,4 @@
-"""Hardware mapping for one representative DeepSeek decode layer."""
+"""Hardware mapping for one representative MLA/MoE decode layer."""
 
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -11,9 +11,7 @@ from srammachine.pipetree import (
     OperatorMapping, RootNode, build_root_node,
 )
 
-from .model import (
-    DeepSeekV3Config, DeepSeekV32Config, ModelConfig, load_model_config,
-)
+from .model import ModelConfig, load_model_config
 
 
 # Fixed execution precisions for the current hardware path. They are not
@@ -126,8 +124,8 @@ class HardwareMappingResult:
     def __post_init__(self) -> None:
         if not isinstance(self.request, HardwareMappingRequest):
             raise TypeError("request must be a HardwareMappingRequest")
-        if not isinstance(self.model_config, (DeepSeekV3Config, DeepSeekV32Config)):
-            raise TypeError("model_config must be a supported DeepSeek config")
+        if not isinstance(self.model_config, ModelConfig):
+            raise TypeError("model_config must be a supported model config")
         _positive_integer("chip_count", self.chip_count)
         _positive_integer("logic_die_count", self.logic_die_count)
         _positive_integer("local_batch_size", self.local_batch_size)
@@ -459,7 +457,7 @@ class _LayerBuilder:
 
 
 class HardwareMapper:
-    """Map supported DeepSeek decode layers onto the configured hierarchy."""
+    """Map supported MLA/MoE decode layers onto the configured hierarchy."""
 
     def __init__(self, hardware_config: HardwareConfig = DEFAULT_HARDWARE_CONFIG):
         if not isinstance(hardware_config, HardwareConfig):
@@ -494,9 +492,15 @@ class HardwareMapper:
             raise ValueError(
                 "input_sequence_length exceeds the model context limit"
             )
-        if inference.global_batch_size * model.top_k < model.num_experts:
+        assignments = inference.global_batch_size * model.top_k
+        if assignments < model.num_experts:
             raise ValueError(
                 "batch is too small to activate every routed expert under "
+                "the balanced-routing assumption"
+            )
+        if assignments % model.num_experts:
+            raise ValueError(
+                "token assignments must be divisible by routed experts under "
                 "the balanced-routing assumption"
             )
         _exact_div(model.num_attention_heads, dies, "attention heads")
@@ -505,7 +509,13 @@ class HardwareMapper:
             dies,
             "MLA latent width",
         )
-        if isinstance(model, DeepSeekV32Config):
+        if model.dsa:
+            if model.indexer_num_heads is None:
+                raise ValueError("DSA model requires indexer_num_heads")
+            if model.indexer_head_dim is None:
+                raise ValueError("DSA model requires indexer_head_dim")
+            if model.dsa_len is None:
+                raise ValueError("DSA model requires dsa_len")
             _exact_div(model.indexer_num_heads, dies, "indexer heads")
         tp_degree = (
             chips * dies
@@ -624,12 +634,12 @@ class HardwareMapper:
             },
             parallel_strategy=strategy,
         )
-        if isinstance(model, DeepSeekV32Config):
+        if model.dsa:
             self._build_dsa(builder, chip_batch, strategy)
 
         attention_history = (
             min(request.inference_config.input_sequence_length, model.dsa_len)
-            if isinstance(model, DeepSeekV32Config)
+            if model.dsa
             else request.inference_config.input_sequence_length
         )
         global_head_batch = global_batch * model.num_attention_heads
@@ -767,6 +777,8 @@ class HardwareMapper:
         self, builder: _LayerBuilder, chip_batch: int, strategy: str,
     ) -> None:
         model = builder.model_config
+        if model.indexer_num_heads is None or model.indexer_head_dim is None:
+            raise ValueError("DSA model requires complete indexer dimensions")
         request = builder.request
         dies = self.hardware_config.chip.logic_die_count
         pu_rows = self.hardware_config.chip.logic_die.pu_mesh_rows
@@ -860,9 +872,11 @@ class HardwareMapper:
         global_batch: int, top_k: int, num_experts: int,
     ) -> Tuple[int, ...]:
         base, remainder = divmod(global_batch * top_k, num_experts)
-        return tuple(
-            base + (expert < remainder) for expert in range(num_experts)
-        )
+        if remainder:
+            raise ValueError(
+                "token assignments must be divisible by routed experts"
+            )
+        return (base,) * num_experts
 
     @staticmethod
     def _groups_for_experts(
