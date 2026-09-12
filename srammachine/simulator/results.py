@@ -288,6 +288,9 @@ class SimulationResult:
     hardware_config: HardwareConfig
     command_results: Tuple[CommandResult, ...]
     layer_results: Tuple[LayerResult, ...]
+    model_layer_count: Optional[int] = None
+    global_batch_size: Optional[int] = None
+    accepted_tokens_per_step: int = 1
     _command_lookup: Mapping[str, CommandResult] = field(
         init=False, repr=False, compare=False,
     )
@@ -303,6 +306,14 @@ class SimulationResult:
             raise TypeError("command_results must contain CommandResult values")
         if any(not isinstance(item, LayerResult) for item in layer_results):
             raise TypeError("layer_results must contain LayerResult values")
+        if (self.model_layer_count is None) != (self.global_batch_size is None):
+            raise ValueError(
+                "model_layer_count and global_batch_size must be provided together"
+            )
+        if self.model_layer_count is not None:
+            integer("model_layer_count", self.model_layer_count, 1)
+            integer("global_batch_size", self.global_batch_size, 1)
+        integer("accepted_tokens_per_step", self.accepted_tokens_per_step, 1)
 
         lookup = {item.cmd_id: item for item in command_results}
         if len(lookup) != len(command_results):
@@ -354,6 +365,28 @@ class SimulationResult:
                 - self._layer_core_start_time_ns(0)
             )
         return self._layer_core_span_ns(0)
+
+    @property
+    def latency_ns(self) -> Optional[float]:
+        """Estimated full-model latency from steady-state representative layers."""
+        if self.model_layer_count is None:
+            return None
+        return self.pipeline_layer_time_ns * self.model_layer_count
+
+    @property
+    def throughput_tokens_per_second(self) -> Optional[float]:
+        """Accepted output-token throughput for the configured global batch."""
+        latency_ns = self.latency_ns
+        if latency_ns is None:
+            return None
+        if latency_ns == 0:
+            return 0.0
+        return (
+            1_000_000_000
+            * self.global_batch_size
+            * self.accepted_tokens_per_step
+            / latency_ns
+        )
 
     def _layer_core_start_time_ns(self, layer_index: int) -> int:
         commands = self._core_commands_for_layer(layer_index)
@@ -416,6 +449,10 @@ def build_simulation_result(
     graph: CommandGraph,
     execution_result: ExecutionResult,
     hardware_config: HardwareConfig = DEFAULT_HARDWARE_CONFIG,
+    *,
+    model_layer_count: Optional[int] = None,
+    global_batch_size: Optional[int] = None,
+    accepted_tokens_per_step: int = 1,
 ) -> SimulationResult:
     """Combine a completed low-level run with graph and trace metadata."""
     if not isinstance(graph, CommandGraph):
@@ -480,4 +517,7 @@ def build_simulation_result(
         hardware_config=hardware_config,
         command_results=tuple(command_results),
         layer_results=tuple(layer_results),
+        model_layer_count=model_layer_count,
+        global_batch_size=global_batch_size,
+        accepted_tokens_per_step=accepted_tokens_per_step,
     )

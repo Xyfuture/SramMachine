@@ -669,11 +669,19 @@ class HardwareMapper:
         if dies != 4:
             raise ValueError("decode mapping requires exactly four logic dies per chip")
         inference = request.inference_config
+        # MTP1 is an explicit simulator-side what-if mode.  It is deliberately
+        # allowed even when the source model card reports no native next-token
+        # prediction layer (currently Kimi K2.5): the mapper force-applies the
+        # same ideal two-token workload transformation requested by the user.
         if inference.input_sequence_length > model.max_position_embeddings:
             raise ValueError(
                 "input_sequence_length exceeds the model context limit"
             )
-        assignments = inference.global_batch_size * model.top_k
+        assignments = (
+            inference.global_batch_size
+            * inference.accepted_tokens_per_step
+            * model.top_k
+        )
         if assignments < model.num_experts:
             raise ValueError(
                 "batch is too small to activate every routed expert under "
@@ -716,8 +724,13 @@ class HardwareMapper:
         kv_dtype_bytes = request.inference_config.kv_cache_bytes_per_element
         chips = self.hardware_config.chip_count
         dies = self.hardware_config.chip.logic_die_count
-        global_batch = request.inference_config.global_batch_size
-        chip_batch = _ceil_div(global_batch, chips)
+        base_global_batch = request.inference_config.global_batch_size
+        token_multiplier = request.inference_config.accepted_tokens_per_step
+        # MTP1 evaluates two query tokens with the same cached context.  Scale
+        # all Attention arithmetic and activation communication by two, while
+        # the per-request DRAM/SRAM cache traffic below remains unchanged.
+        global_batch = base_global_batch * token_multiplier
+        chip_batch = _ceil_div(base_global_batch, chips) * token_multiplier
         local_heads = model.num_attention_heads // dies
         pu_rows = self.hardware_config.chip.logic_die.pu_mesh_rows
         pu_columns = self.hardware_config.chip.logic_die.pu_mesh_columns
@@ -964,7 +977,10 @@ class HardwareMapper:
         dies = self.hardware_config.chip.logic_die_count
         pu_rows = self.hardware_config.chip.logic_die.pu_mesh_rows
         pu_columns = self.hardware_config.chip.logic_die.pu_mesh_columns
-        global_batch = request.inference_config.global_batch_size
+        global_batch = (
+            request.inference_config.global_batch_size
+            * request.inference_config.accepted_tokens_per_step
+        )
         history = request.inference_config.input_sequence_length
         local_heads = model.indexer_num_heads // dies
         chip_width = (
@@ -1395,8 +1411,12 @@ class HardwareMapper:
         model = builder.model_config
         chips = self.hardware_config.chip_count
         dies = self.hardware_config.chip.logic_die_count
-        global_batch = request.inference_config.global_batch_size
-        local_batch = _ceil_div(global_batch, chips)
+        base_global_batch = request.inference_config.global_batch_size
+        token_multiplier = request.inference_config.accepted_tokens_per_step
+        # MTP1 sends both accepted query tokens through MoE, so expert loads,
+        # activation collectives and arithmetic all see twice the base batch.
+        global_batch = base_global_batch * token_multiplier
+        local_batch = _ceil_div(base_global_batch, chips) * token_multiplier
         dtype = _ACTIVATION_DTYPE_BYTES
         strategy = "moe_tp"
         builder.add_comm(
@@ -1512,18 +1532,21 @@ class HardwareMapper:
         model = builder.model_config
         chips = self.hardware_config.chip_count
         dies = self.hardware_config.chip.logic_die_count
-        global_batch = request.inference_config.global_batch_size
-        local_batch = _ceil_div(global_batch, chips)
+        base_global_batch = request.inference_config.global_batch_size
+        token_multiplier = request.inference_config.accepted_tokens_per_step
+        global_batch = base_global_batch * token_multiplier
+        local_batch = _ceil_div(base_global_batch, chips) * token_multiplier
         dtype = _ACTIVATION_DTYPE_BYTES
         strategy = "moe_ep_die_tp4"
         loads = self._balanced_expert_loads(
             global_batch, model.top_k, model.num_experts,
         )
         batch_base, batch_remainder = divmod(
-            global_batch, chips,
+            base_global_batch, chips,
         )
         row_totals = tuple(
-            (batch_base + (chip < batch_remainder)) * model.top_k
+            (batch_base + (chip < batch_remainder))
+            * token_multiplier * model.top_k
             for chip in range(chips)
         )
         experts_per_chip = _ceil_div(model.num_experts, chips)

@@ -63,6 +63,7 @@ class ModelConfig:
     num_experts: int
     top_k: int
     num_hidden_layers: int
+    num_nextn_predict_layers: int
     max_position_embeddings: int
     q_lora_rank: int
     kv_lora_rank: int
@@ -107,6 +108,9 @@ class ModelConfig:
             num_experts=experts,
             top_k=top_k,
             num_hidden_layers=_positive_int(data, "num_hidden_layers"),
+            num_nextn_predict_layers=_positive_int(
+                data, "num_nextn_predict_layers",
+            ),
             max_position_embeddings=_positive_int(data, "max_position_embeddings"),
             q_lora_rank=_positive_int(data, "q_lora_rank"),
             kv_lora_rank=_positive_int(data, "kv_lora_rank"),
@@ -160,6 +164,9 @@ class DeepSeekV32Config(DeepSeekV3Config):
             num_experts=experts,
             top_k=top_k,
             num_hidden_layers=_positive_int(data, "num_hidden_layers"),
+            num_nextn_predict_layers=_positive_int(
+                data, "num_nextn_predict_layers",
+            ),
             max_position_embeddings=_positive_int(data, "max_position_embeddings"),
             q_lora_rank=_positive_int(data, "q_lora_rank"),
             kv_lora_rank=_positive_int(data, "kv_lora_rank"),
@@ -215,6 +222,7 @@ class KimiK25Config(ModelConfig):
             num_experts=experts,
             top_k=top_k,
             num_hidden_layers=_positive_int(data, "num_hidden_layers"),
+            num_nextn_predict_layers=data["num_nextn_predict_layers"],
             max_position_embeddings=_positive_int(data, "max_position_embeddings"),
             q_lora_rank=_positive_int(data, "q_lora_rank"),
             kv_lora_rank=_positive_int(data, "kv_lora_rank"),
@@ -280,6 +288,9 @@ class GLM51Config(ModelConfig):
             num_experts=experts,
             top_k=top_k,
             num_hidden_layers=_positive_int(data, "num_hidden_layers"),
+            num_nextn_predict_layers=_positive_int(
+                data, "num_nextn_predict_layers",
+            ),
             max_position_embeddings=_positive_int(data, "max_position_embeddings"),
             q_lora_rank=_positive_int(data, "q_lora_rank"),
             kv_lora_rank=_positive_int(data, "kv_lora_rank"),
