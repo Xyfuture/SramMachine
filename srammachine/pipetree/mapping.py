@@ -40,6 +40,10 @@ class OperatorMapping:
     weight_load_logical_bytes_per_token: Optional[int] = None
     sram_read_logical_bytes_per_mapped_token: Optional[int] = None
     shared_die_factor: int = 1
+    # Optional number of indivisible logical work units along batch_axis.
+    # TreeParser distributes these units across microbatches with quotient /
+    # remainder partitioning, so adjacent instances differ by at most one.
+    batch_scaling_unit_count: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.batch_axis not in ("B", "M", "m", "size_bytes"):
@@ -91,6 +95,12 @@ class OperatorMapping:
                 "shared_die_factor greater than one requires a logical size"
             )
         integer("batch_partition_degree", self.batch_partition_degree, 1)
+        if self.batch_scaling_unit_count is not None:
+            integer("batch_scaling_unit_count", self.batch_scaling_unit_count, 1)
+            if self.batch_partition_degree != 1:
+                raise ValueError(
+                    "nonuniform batch scaling requires batch_partition_degree=1"
+                )
         if (self.dram_read_once_bytes or self.dram_read_bytes_per_token
                 or self.dram_write_bytes_per_token) and self.dram_resource_id is None:
             raise ValueError("DRAM traffic requires dram_resource_id")

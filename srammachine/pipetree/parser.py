@@ -414,7 +414,7 @@ class TreeParser:
                 demand_sram_reads[instance.index] = sram_read
 
             core = self._core_command(
-                prefix + ".core", op, mapping, batch, tree.batch_size,
+                prefix + ".core", op, mapping, instance, tree.batch_size,
             )
             core_ids[instance.index] = emit(core, instance)
             edges.extend((source, core.cmd_id) for source in readiness)
@@ -495,10 +495,37 @@ class TreeParser:
         return dict(mapping.weight_shape, size_bytes=size_bytes)
 
     @staticmethod
-    def _core_command(cmd_id, op, mapping, batch, full_batch):
+    def _core_command(cmd_id, op, mapping, instance, full_batch):
         def scale(value):
+            unit_count = mapping.batch_scaling_unit_count
+            if unit_count is not None:
+                factor, remainder = divmod(value, unit_count)
+                if remainder:
+                    raise ValueError(
+                        f"{op.op_id}: {mapping.batch_axis} value {value} is "
+                        f"not an integer multiple of batch scaling units "
+                        f"{unit_count}"
+                    )
+
+                # Prefix-ceiling partitioning puts any remainder in earlier
+                # microbatches.  It is additive over nested SplitTree ranges,
+                # preserves the exact total, and differs by at most one unit
+                # between equally sized sibling microbatches.
+                def prefix_units(position):
+                    return (unit_count * position + full_batch - 1) // full_batch
+
+                local_units = (
+                    prefix_units(instance.token_stop)
+                    - prefix_units(instance.token_start)
+                )
+                if local_units <= 0:
+                    raise ValueError(
+                        f"{op.op_id}: microbatch contains no expert work unit"
+                    )
+                return factor * local_units
+
             mapped_batch = TreeParser._mapped_batch_size(
-                batch, mapping.batch_partition_degree,
+                instance.batch_size, mapping.batch_partition_degree,
             )
             mapped_full_batch = TreeParser._mapped_batch_size(
                 full_batch, mapping.batch_partition_degree,

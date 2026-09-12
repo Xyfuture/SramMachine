@@ -311,6 +311,7 @@ class _LayerBuilder:
         output_kind: str = "reduce",
         output_group: Optional[Sequence[Any]] = None,
         output_suffix: str = "output_reduce",
+        batch_scaling_unit_count: Optional[int] = None,
     ) -> None:
         for dimensions in (global_dimensions, chip_dimensions, die_dimensions):
             if set(dimensions) != {"B", "M", "K", "N"}:
@@ -369,6 +370,7 @@ class _LayerBuilder:
             parallel_strategy=parallel_strategy,
             batch_partition_degree=batch_partition_degree,
             noc_direction=input_noc_direction,
+            batch_scaling_unit_count=batch_scaling_unit_count,
         )
         operator = BMMOp(op_id, **pu_dimensions)
         mapping = OperatorMapping(
@@ -406,6 +408,7 @@ class _LayerBuilder:
             ),
             sram_read_data_kind=sram_read_data_kind,
             shared_die_factor=shared_die_factor,
+            batch_scaling_unit_count=batch_scaling_unit_count,
         )
         self._record(operator, mapping, OperatorHardwareMapping(
             op_id=op_id,
@@ -431,6 +434,7 @@ class _LayerBuilder:
             reduce_kind="sum",
             parallel_strategy=parallel_strategy,
             batch_partition_degree=batch_partition_degree,
+            batch_scaling_unit_count=batch_scaling_unit_count,
         )
 
     def add_vector(
@@ -443,6 +447,7 @@ class _LayerBuilder:
         expert_ids: Sequence[int] = (),
         tokens_per_expert: Optional[int] = None,
         batch_partition_degree: int = 1,
+        batch_scaling_unit_count: Optional[int] = None,
     ) -> None:
         if set(die_dimensions) != {"m", "n"}:
             raise ValueError("vector dimensions must contain exactly m/n")
@@ -458,6 +463,7 @@ class _LayerBuilder:
             OperatorMapping(
                 "m", self.VECTOR,
                 batch_partition_degree=batch_partition_degree,
+                batch_scaling_unit_count=batch_scaling_unit_count,
             ),
             OperatorHardwareMapping(
                 op_id=op_id,
@@ -560,6 +566,7 @@ class _LayerBuilder:
         dram_write_logical_bytes_per_token: Optional[int] = None,
         shared_die_factor: int = 1,
         noc_direction: Optional[str] = None,
+        batch_scaling_unit_count: Optional[int] = None,
     ) -> None:
         matrix = None
         if transfer_bytes is not None:
@@ -600,6 +607,7 @@ class _LayerBuilder:
                 ),
                 batch_partition_degree=batch_partition_degree,
                 shared_die_factor=shared_die_factor,
+                batch_scaling_unit_count=batch_scaling_unit_count,
             ),
             OperatorHardwareMapping(
                 op_id=op_id,
@@ -1157,6 +1165,7 @@ class HardwareMapper:
             expert_ids=expert_ids,
             tokens_per_expert=tokens_per_expert,
             parallel_strategy=parallel_strategy,
+            batch_scaling_unit_count=tokens_per_expert,
         )
         if is_tp:
             # Two-dimensional TP follows the physical hierarchy: chips shard
@@ -1267,6 +1276,7 @@ class HardwareMapper:
                     builder.die_collective_parallel_link_count
                 ),
                 parallel_strategy=parallel_strategy,
+                batch_scaling_unit_count=tokens_per_expert,
             )
             builder.add_comm(
                 f"{prefix}.{suffix}.up_die_allgather",
@@ -1281,6 +1291,7 @@ class HardwareMapper:
                     builder.die_collective_parallel_link_count
                 ),
                 parallel_strategy=parallel_strategy,
+                batch_scaling_unit_count=tokens_per_expert,
             )
         builder.add_vector(
             f"{prefix}.{suffix}.silu", "silu",
@@ -1315,6 +1326,7 @@ class HardwareMapper:
                     builder.die_collective_parallel_link_count
                 ),
                 parallel_strategy=parallel_strategy,
+                batch_scaling_unit_count=tokens_per_expert,
             )
             die_hidden = _exact_div(
                 model.hidden_size, len(builder.die_group),
