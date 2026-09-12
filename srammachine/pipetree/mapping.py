@@ -30,6 +30,16 @@ class OperatorMapping:
     batch_partition_degree: int = 1
     sram_read_bytes_per_mapped_token: int = 0
     sram_read_data_kind: Optional[str] = None
+    # Optional pre-sharing sizes.  Existing byte fields remain the effective
+    # traffic charged to the representative resource, preserving the original
+    # positional API and all scheduling/capacity semantics.
+    dram_read_once_logical_bytes: Optional[int] = None
+    dram_read_logical_bytes_per_token: Optional[int] = None
+    dram_write_logical_bytes_per_token: Optional[int] = None
+    weight_load_logical_fixed_bytes: Optional[int] = None
+    weight_load_logical_bytes_per_token: Optional[int] = None
+    sram_read_logical_bytes_per_mapped_token: Optional[int] = None
+    shared_die_factor: int = 1
 
     def __post_init__(self) -> None:
         if self.batch_axis not in ("B", "M", "m", "size_bytes"):
@@ -46,6 +56,40 @@ class OperatorMapping:
             "sram_read_bytes_per_mapped_token",
         ):
             integer(name, getattr(self, name))
+        for effective_name, logical_name in (
+            ("dram_read_once_bytes", "dram_read_once_logical_bytes"),
+            ("dram_read_bytes_per_token", "dram_read_logical_bytes_per_token"),
+            ("dram_write_bytes_per_token", "dram_write_logical_bytes_per_token"),
+            ("weight_load_fixed_bytes", "weight_load_logical_fixed_bytes"),
+            ("weight_load_bytes_per_token", "weight_load_logical_bytes_per_token"),
+            (
+                "sram_read_bytes_per_mapped_token",
+                "sram_read_logical_bytes_per_mapped_token",
+            ),
+        ):
+            logical = getattr(self, logical_name)
+            if logical is not None:
+                integer(logical_name, logical)
+                if logical < getattr(self, effective_name):
+                    raise ValueError(
+                        f"{logical_name} must be at least {effective_name}"
+                    )
+        integer("shared_die_factor", self.shared_die_factor, 1)
+        has_shared_size = any(
+            getattr(self, name) is not None
+            for name in (
+                "dram_read_once_logical_bytes",
+                "dram_read_logical_bytes_per_token",
+                "dram_write_logical_bytes_per_token",
+                "weight_load_logical_fixed_bytes",
+                "weight_load_logical_bytes_per_token",
+                "sram_read_logical_bytes_per_mapped_token",
+            )
+        )
+        if self.shared_die_factor > 1 and not has_shared_size:
+            raise ValueError(
+                "shared_die_factor greater than one requires a logical size"
+            )
         integer("batch_partition_degree", self.batch_partition_degree, 1)
         if (self.dram_read_once_bytes or self.dram_read_bytes_per_token
                 or self.dram_write_bytes_per_token) and self.dram_resource_id is None:

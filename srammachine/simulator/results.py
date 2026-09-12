@@ -163,6 +163,15 @@ def _command_parameters(
             })
     else:
         raise TypeError(f"unsupported command type: {type(command).__name__}")
+    if (
+        isinstance(command, (DramCmd, WeightLoadCmd, SramReadCmd))
+        and command.logical_size_bytes is not None
+    ):
+        parameters.update({
+            "logical_size_bytes": command.logical_size_bytes,
+            "effective_size_bytes": command.size_bytes,
+            "shared_die_factor": command.shared_die_factor,
+        })
     return _freeze_parameters(parameters)
 
 

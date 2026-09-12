@@ -1,5 +1,5 @@
 """DramResource read/write actions and SramResource weight loading."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping, Optional
 from .base import Command, integer, nonempty
 
@@ -7,10 +7,18 @@ from .base import Command, integer, nonempty
 @dataclass(frozen=True)
 class DramCmd(Command):
     size_bytes: int
+    # ``size_bytes`` is the traffic actually charged to the representative
+    # die.  These keyword-only fields preserve the logical, pre-sharing size
+    # for traces when identical chip-level data is ideally striped over dies.
+    logical_size_bytes: Optional[int] = field(default=None, kw_only=True)
+    shared_die_factor: int = field(default=1, kw_only=True)
 
     def __post_init__(self) -> None:
         super().__post_init__()
         integer("size_bytes", self.size_bytes)
+        _validate_shared_size(
+            self.size_bytes, self.logical_size_bytes, self.shared_die_factor,
+        )
 
 
 @dataclass(frozen=True)
@@ -44,11 +52,16 @@ class SramReadCmd(Command):
 
     size_bytes: int
     data_kind: str
+    logical_size_bytes: Optional[int] = field(default=None, kw_only=True)
+    shared_die_factor: int = field(default=1, kw_only=True)
 
     def __post_init__(self) -> None:
         super().__post_init__()
         integer("size_bytes", self.size_bytes)
         nonempty("data_kind", self.data_kind)
+        _validate_shared_size(
+            self.size_bytes, self.logical_size_bytes, self.shared_die_factor,
+        )
         if self.data_kind not in (
             "kv_nope", "kv_rope", "kv_fused", "kv_value", "flash_kv",
             "dsa_key",
@@ -61,10 +74,15 @@ class WeightLoadCmd(Command):
     """Supply bytes from SRAM to the array independently of DRAM access."""
     size_bytes: int
     weight_shape: Optional[Mapping[str, int]] = None
+    logical_size_bytes: Optional[int] = field(default=None, kw_only=True)
+    shared_die_factor: int = field(default=1, kw_only=True)
 
     def __post_init__(self) -> None:
         super().__post_init__()
         integer("size_bytes", self.size_bytes)
+        _validate_shared_size(
+            self.size_bytes, self.logical_size_bytes, self.shared_die_factor,
+        )
         object.__setattr__(
             self, "weight_shape", _freeze_weight_shape(self.weight_shape),
         )
@@ -83,3 +101,23 @@ def _freeze_weight_shape(
         integer(name, value, 0)
         copied[name] = value
     return copied
+
+
+def _validate_shared_size(
+    effective_size_bytes: int,
+    logical_size_bytes: Optional[int],
+    shared_die_factor: int,
+) -> None:
+    integer("shared_die_factor", shared_die_factor, 1)
+    if logical_size_bytes is None:
+        if shared_die_factor != 1:
+            raise ValueError(
+                "shared_die_factor greater than one requires "
+                "logical_size_bytes"
+            )
+        return
+    integer("logical_size_bytes", logical_size_bytes)
+    if logical_size_bytes < effective_size_bytes:
+        raise ValueError(
+            "logical_size_bytes must be at least the effective size_bytes"
+        )

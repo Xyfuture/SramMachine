@@ -338,6 +338,8 @@ class TreeParser:
                     self._prefetch_weight_shape(
                         op, mapping, mapping.dram_read_once_bytes,
                     ),
+                    logical_size_bytes=mapping.dram_read_once_logical_bytes,
+                    shared_die_factor=mapping.shared_die_factor,
                 ), by_op[op_id][0], once=True)
 
         core_ids = {}
@@ -356,6 +358,13 @@ class TreeParser:
                 readiness.append(emit(DramReadCmd(
                     prefix + ".read", op_id, mapping.dram_resource_id,
                     mapped_batch * mapping.dram_read_bytes_per_token,
+                    logical_size_bytes=(
+                        mapped_batch
+                        * mapping.dram_read_logical_bytes_per_token
+                        if mapping.dram_read_logical_bytes_per_token is not None
+                        else None
+                    ),
+                    shared_die_factor=mapping.shared_die_factor,
                 ), instance))
             load_bytes = (mapping.weight_load_fixed_bytes
                           + mapped_batch * mapping.weight_load_bytes_per_token)
@@ -363,6 +372,17 @@ class TreeParser:
                 load = emit(WeightLoadCmd(
                     prefix + ".load", op_id, mapping.sram_resource_id, load_bytes,
                     self._weight_shape(op, load_bytes),
+                    logical_size_bytes=(
+                        (mapping.weight_load_logical_fixed_bytes or 0)
+                        + mapped_batch
+                        * (mapping.weight_load_logical_bytes_per_token or 0)
+                        if (
+                            mapping.weight_load_logical_fixed_bytes is not None
+                            or mapping.weight_load_logical_bytes_per_token
+                            is not None
+                        ) else None
+                    ),
+                    shared_die_factor=mapping.shared_die_factor,
                 ), instance)
                 edges.extend((source, load) for source in readiness)
                 readiness = [load]
@@ -371,6 +391,13 @@ class TreeParser:
                     prefix + ".sram_read", op_id, mapping.sram_resource_id,
                     mapped_batch * mapping.sram_read_bytes_per_mapped_token,
                     mapping.sram_read_data_kind,
+                    logical_size_bytes=(
+                        mapped_batch
+                        * mapping.sram_read_logical_bytes_per_mapped_token
+                        if mapping.sram_read_logical_bytes_per_mapped_token
+                        is not None else None
+                    ),
+                    shared_die_factor=mapping.shared_die_factor,
                 ), instance)
                 edges.extend((source, sram_read) for source in readiness)
                 readiness = [sram_read]
@@ -385,6 +412,13 @@ class TreeParser:
                 write = emit(DramWriteCmd(
                     prefix + ".write", op_id, mapping.dram_resource_id,
                     mapped_batch * mapping.dram_write_bytes_per_token,
+                    logical_size_bytes=(
+                        mapped_batch
+                        * mapping.dram_write_logical_bytes_per_token
+                        if mapping.dram_write_logical_bytes_per_token is not None
+                        else None
+                    ),
+                    shared_die_factor=mapping.shared_die_factor,
                 ), instance)
                 edges.append((core.cmd_id, write))
 
