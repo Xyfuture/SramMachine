@@ -161,6 +161,7 @@ class SplitTreeOptimizer:
         self._parser = TreeParser(self.hardware_config)
         self._simulator = Simulator(self.hardware_config)
         self._mapping_cache = {}
+        self._graph_cache = {}
         self._evaluation_cache = {}
         self._simulation_count = 0
         self._cache_hit_count = 0
@@ -254,12 +255,9 @@ class SplitTreeOptimizer:
             self._cache_hit_count += 1
             return cached
         mapping = self._mapping(batch, mtp)
-        graph = self._parser.parse(
-            tree,
-            mapping.operators,
-            mapping.operator_mappings,
-            layer_count=self._config.layer_count,
-        )
+        graph = self._candidate_graph(batch, mtp, tree)
+        if graph is None:
+            raise ValueError("SplitTree cannot be lowered exactly for this workload")
         result = self._simulator.run(graph, mapping_result=mapping)
         latency_ns = result.latency_ns
         if latency_ns is None or latency_ns <= 0:
@@ -282,6 +280,29 @@ class SplitTreeOptimizer:
         self._simulation_count += 1
         self._evaluation_cache[key] = evaluation
         return evaluation
+
+    def _candidate_graph(self, batch: int, mtp: bool, tree: PipeTree):
+        """Return a lowered graph, or None for a structurally valid but illegal tree.
+
+        PipeTree divisibility alone is insufficient: some mapped operator dimensions
+        (notably aggregated MoE token groups) must also scale exactly. Such mutations
+        are ordinary out-of-domain SA neighbors rather than fatal search errors.
+        """
+        key = self._key(batch, mtp, tree)
+        if key in self._graph_cache:
+            return self._graph_cache[key]
+        mapping = self._mapping(batch, mtp)
+        try:
+            graph = self._parser.parse(
+                tree,
+                mapping.operators,
+                mapping.operator_mappings,
+                layer_count=self._config.layer_count,
+            )
+        except ValueError:
+            graph = None
+        self._graph_cache[key] = graph
+        return graph
 
     def _workload_tree(
         self, tree: PipeTree, batch: int, mtp: bool,
@@ -323,6 +344,17 @@ class SplitTreeOptimizer:
         for candidate in candidates:
             unique.setdefault(self._key(*candidate), candidate)
         return tuple(unique.values())
+
+    def _random_legal_neighbor(
+        self, evaluation: SplitTreeEvaluation, rng: random.Random,
+    ) -> tuple[int, bool, PipeTree]:
+        """Choose uniformly from parseable neighbors without parsing all eagerly."""
+        neighbors = list(self._neighbors(evaluation))
+        rng.shuffle(neighbors)
+        for candidate in neighbors:
+            if self._candidate_graph(*candidate) is not None:
+                return candidate
+        raise ValueError("annealing candidate has no legal neighbors")
 
     @staticmethod
     def _update_archive(
@@ -377,10 +409,8 @@ class SplitTreeOptimizer:
 
         warm_current = initial
         for _ in range(self._config.warmup_rounds):
-            neighbors = self._neighbors(warm_current)
-            if not neighbors:
-                raise ValueError("annealing candidate has no legal neighbors")
-            warm_current = self._evaluate(*rng.choice(neighbors))
+            candidate = self._random_legal_neighbor(warm_current, rng)
+            warm_current = self._evaluate(*candidate)
             warmup.append(warm_current)
 
         bounds = HypervolumeBounds.from_points(
@@ -393,10 +423,8 @@ class SplitTreeOptimizer:
         current = initial
         accepted = 0
         for iteration in range(self._config.rounds):
-            neighbors = self._neighbors(current)
-            if not neighbors:
-                raise ValueError("annealing candidate has no legal neighbors")
-            candidate = self._evaluate(*rng.choice(neighbors))
+            proposal = self._random_legal_neighbor(current, rng)
+            candidate = self._evaluate(*proposal)
             normalized_archive = tuple(
                 bounds.normalize(item.objective_point) for item in archive
             )

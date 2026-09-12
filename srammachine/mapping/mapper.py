@@ -673,10 +673,10 @@ class HardwareMapper:
         # allowed even when the source model card reports no native next-token
         # prediction layer (currently Kimi K2.5): the mapper force-applies the
         # same ideal two-token workload transformation requested by the user.
-        if inference.input_sequence_length > model.max_position_embeddings:
-            raise ValueError(
-                "input_sequence_length exceeds the model context limit"
-            )
+        # ``max_position_embeddings`` remains descriptive model-card metadata,
+        # not a simulator limit.  Hardware studies may intentionally evaluate
+        # hypothetical contexts beyond the model's published training window.
+        # InferenceConfig already guarantees a positive input sequence length.
         assignments = (
             inference.global_batch_size
             * inference.accepted_tokens_per_step
@@ -685,11 +685,6 @@ class HardwareMapper:
         if assignments < model.num_experts:
             raise ValueError(
                 "batch is too small to activate every routed expert under "
-                "the balanced-routing assumption"
-            )
-        if assignments % model.num_experts:
-            raise ValueError(
-                "token assignments must be divisible by routed experts under "
                 "the balanced-routing assumption"
             )
         _exact_div(model.num_attention_heads, dies, "attention heads")
@@ -1122,11 +1117,10 @@ class HardwareMapper:
     def _balanced_expert_loads(
         global_batch: int, top_k: int, num_experts: int,
     ) -> Tuple[int, ...]:
-        base, remainder = divmod(global_batch * top_k, num_experts)
-        if remainder:
-            raise ValueError(
-                "token assignments must be divisible by routed experts"
-            )
+        # The representative balanced-routing model intentionally rounds down:
+        # every expert receives the same whole-number load and any remainder
+        # assignments are omitted instead of creating a second imbalance group.
+        base = global_batch * top_k // num_experts
         return (base,) * num_experts
 
     @staticmethod
@@ -1541,12 +1535,13 @@ class HardwareMapper:
         loads = self._balanced_expert_loads(
             global_batch, model.top_k, model.num_experts,
         )
-        batch_base, batch_remainder = divmod(
-            base_global_batch, chips,
-        )
+        # Expert-load flooring may discard a small assignment remainder.  Use
+        # that effective routed total for dispatch so all-to-all row and owner
+        # column totals remain physically consistent.
+        effective_assignments = sum(loads)
+        batch_base, batch_remainder = divmod(effective_assignments, chips)
         row_totals = tuple(
-            (batch_base + (chip < batch_remainder))
-            * token_multiplier * model.top_k
+            batch_base + (chip < batch_remainder)
             for chip in range(chips)
         )
         experts_per_chip = _ceil_div(model.num_experts, chips)

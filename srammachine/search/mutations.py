@@ -67,6 +67,14 @@ def legal_tree_mutations(tree: PipeTree) -> Tuple[TreeMutation, ...]:
     if not isinstance(tree, PipeTree):
         raise TypeError("tree must be a PipeTree")
     mutations = []
+
+    def add_if_valid(name: str, root) -> None:
+        """Discard mutations whose changed parent invalidates a descendant split."""
+        try:
+            candidate = PipeTree(tree.batch_size, tree.operator_order, root)
+        except ValueError:
+            return
+        mutations.append((name, candidate))
     groups = tuple(_group_nodes(tree.root, tree.batch_size))
 
     for path, node, incoming_batch in groups:
@@ -76,40 +84,24 @@ def legal_tree_mutations(tree: PipeTree) -> Tuple[TreeMutation, ...]:
         position = divisors.index(node.split)
         if position + 1 < len(divisors):
             updated = replace(node, split=divisors[position + 1])
-            try:
-                candidate = PipeTree(
-                    tree.batch_size, tree.operator_order,
-                    _replace_node(tree.root, path, updated),
-                )
-            except ValueError:
-                # A larger parent split can make a descendant split cease to
-                # divide its now-smaller incoming batch. Such a neighbor is
-                # simply outside the legal SplitTree search space.
-                pass
-            else:
-                mutations.append(("increase_split", candidate))
+            add_if_valid(
+                "increase_split", _replace_node(tree.root, path, updated),
+            )
         if position > 0:
             updated = replace(node, split=divisors[position - 1])
-            mutations.append((
-                "decrease_split",
-                PipeTree(
-                    tree.batch_size, tree.operator_order,
-                    _replace_node(tree.root, path, updated),
-                ),
-            ))
+            add_if_valid(
+                "decrease_split", _replace_node(tree.root, path, updated),
+            )
 
         for index in range(len(node.children) - 1):
             grouped = GroupNode(node.children[index:index + 2], split=1)
             children = (
                 node.children[:index] + (grouped,) + node.children[index + 2:]
             )
-            mutations.append((
+            add_if_valid(
                 "group_siblings",
-                PipeTree(
-                    tree.batch_size, tree.operator_order,
-                    _replace_parent_children(tree.root, path, children),
-                ),
-            ))
+                _replace_parent_children(tree.root, path, children),
+            )
 
         for index, child in enumerate(node.children):
             if (
@@ -122,13 +114,10 @@ def legal_tree_mutations(tree: PipeTree) -> Tuple[TreeMutation, ...]:
                     + child.children
                     + node.children[index + 1:]
                 )
-                mutations.append((
+                add_if_valid(
                     "ungroup",
-                    PipeTree(
-                        tree.batch_size, tree.operator_order,
-                        _replace_parent_children(tree.root, path, children),
-                    ),
-                ))
+                    _replace_parent_children(tree.root, path, children),
+                )
 
     unique = {}
     for name, candidate in mutations:
