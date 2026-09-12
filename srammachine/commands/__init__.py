@@ -4,13 +4,14 @@ from .memory import (
     DramCmd, DramReadCmd, DramWriteCmd, SramReadCmd, WeightLoadCmd,
     WeightPrefetchCmd,
 )
-from .compute import GemmCmd, VectorCmd
+from .compute import FlashAttentionCmd, GemmCmd, VectorCmd
 from .communication import CommCmd, NoCCmd, InterChipCmd
 from .graph import CommandGraph, CommandTrace
 
 __all__ = [
     "Command", "DramCmd", "DramReadCmd", "DramWriteCmd", "SramReadCmd",
     "WeightLoadCmd", "WeightPrefetchCmd",
-    "GemmCmd", "VectorCmd", "CommCmd", "NoCCmd", "InterChipCmd",
+    "GemmCmd", "FlashAttentionCmd", "VectorCmd", "CommCmd", "NoCCmd",
+    "InterChipCmd",
     "CommandGraph", "CommandTrace",
 ]

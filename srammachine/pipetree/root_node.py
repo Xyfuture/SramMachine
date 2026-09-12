@@ -13,7 +13,7 @@ mutate its legal grouping and split choices without changing this definition.
 from dataclasses import dataclass
 from typing import Mapping, Sequence, Tuple
 
-from srammachine.frontend.modules import BMMOp, Operator
+from srammachine.frontend.modules import BMMOp, FlashAttentionOp, Operator
 
 from .tree import GroupNode, Node, OpNode, PipeTree
 
@@ -31,15 +31,27 @@ def _atomic_nodes(
     index = 0
     while index < len(operator_order):
         op_id = operator_order[index]
-        if op_id.endswith(".input_broadcast"):
+        input_suffix = next(
+            (
+                suffix for suffix in (".input_broadcast", ".input_transfer")
+                if op_id.endswith(suffix)
+            ),
+            None,
+        )
+        if input_suffix is not None:
             if index + 2 >= len(operator_order):
                 raise ValueError(f"incomplete BMM communication block: {op_id}")
-            bmm_id = op_id.removesuffix(".input_broadcast")
-            reduce_id = f"{bmm_id}.output_reduce"
+            bmm_id = op_id.removesuffix(input_suffix)
+            output_id = operator_order[index + 2]
             if (
                 operator_order[index + 1] != bmm_id
-                or operator_order[index + 2] != reduce_id
-                or not isinstance(operators[bmm_id], BMMOp)
+                or output_id not in (
+                    f"{bmm_id}.output_reduce",
+                    f"{bmm_id}.output_transfer",
+                )
+                or not isinstance(
+                    operators[bmm_id], (BMMOp, FlashAttentionOp),
+                )
             ):
                 raise ValueError(
                     f"expected broadcast/GEMM/reduce block for {bmm_id}"
@@ -47,14 +59,14 @@ def _atomic_nodes(
             nodes.append(GroupNode((
                 OpNode(op_id),
                 OpNode(bmm_id),
-                OpNode(reduce_id),
+                OpNode(output_id),
             )))
             index += 3
             continue
-        if isinstance(operators[op_id], BMMOp):
+        if isinstance(operators[op_id], (BMMOp, FlashAttentionOp)):
             raise ValueError(f"BMM is missing its input broadcast: {op_id}")
-        if op_id.endswith(".output_reduce"):
-            raise ValueError(f"orphan BMM output reduce: {op_id}")
+        if op_id.endswith((".output_reduce", ".output_transfer")):
+            raise ValueError(f"orphan BMM output communication: {op_id}")
         nodes.append(OpNode(op_id))
         index += 1
     return tuple(nodes)

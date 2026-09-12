@@ -4,7 +4,9 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
-from srammachine.frontend.modules import BMMOp, CommOp, Operator, VectorOp
+from srammachine.frontend.modules import (
+    BMMOp, CommOp, FlashAttentionOp, Operator, VectorOp,
+)
 from srammachine.hardware import DEFAULT_HARDWARE_CONFIG, HardwareConfig
 from srammachine.inference import InferenceConfig, MoEParallelStrategy
 from srammachine.pipetree import (
@@ -170,7 +172,8 @@ class _LayerBuilder:
     VECTOR = "chip0.die0.vector"
     DRAM = "chip0.die0.dram"
     SRAM = "chip0.die0.sram"
-    NOC = "chip0.noc"
+    NOC_INPUT = "chip0.noc_input"
+    NOC_OUTPUT = "chip0.noc_output"
     FABRIC = "system.fabric"
 
     def __init__(
@@ -228,17 +231,33 @@ class _LayerBuilder:
         if op_id in self.operators:
             raise ValueError(f"duplicate generated operator ID: {op_id}")
         expected_resource = (
-            self.PU if isinstance(operator, BMMOp)
+            self.PU if isinstance(operator, (BMMOp, FlashAttentionOp))
             else self.VECTOR if isinstance(operator, VectorOp)
-            else self.NOC if operator.scope == "intra_chip"
+            else self._noc_resource(operator.kind)
+            if operator.scope == "intra_chip"
             else self.FABRIC
         )
-        if mapping.resource_id != expected_resource:
+        valid_resources = (
+            {self.NOC_INPUT, self.NOC_OUTPUT}
+            if isinstance(operator, CommOp)
+            and operator.scope == "intra_chip"
+            and operator.kind == "p2p"
+            else {expected_resource}
+        )
+        if mapping.resource_id not in valid_resources:
             raise ValueError("generated operator is bound to the wrong resource")
         self.order.append(op_id)
         self.operators[op_id] = operator
         self.mappings[op_id] = mapping
         self.hardware_mappings[op_id] = hardware_mapping
+
+    @classmethod
+    def _noc_resource(cls, kind: str) -> str:
+        return (
+            cls.NOC_INPUT
+            if kind in ("broadcast", "allgather")
+            else cls.NOC_OUTPUT
+        )
 
     def _pu_dimensions(self, die_dimensions: Mapping[str, int]) -> Mapping[str, int]:
         dimensions = dict(die_dimensions)
@@ -263,23 +282,43 @@ class _LayerBuilder:
         batch_partition_degree: int = 1,
         sram_read_bytes_per_mapped_token: int = 0,
         sram_read_data_kind: Optional[str] = None,
+        pu_dimensions_override: Optional[Mapping[str, int]] = None,
+        pu_weight_batches: Optional[int] = None,
+        input_group: Optional[Sequence[Any]] = None,
+        input_kind: str = "broadcast",
+        input_suffix: str = "input_broadcast",
+        input_noc_direction: Optional[str] = None,
+        output_kind: str = "reduce",
+        output_group: Optional[Sequence[Any]] = None,
+        output_suffix: str = "output_reduce",
     ) -> None:
         for dimensions in (global_dimensions, chip_dimensions, die_dimensions):
             if set(dimensions) != {"B", "M", "K", "N"}:
                 raise ValueError("BMM dimensions must contain exactly B/M/K/N")
-        pu_dimensions = self._pu_dimensions(die_dimensions)
+        pu_dimensions = (
+            self._pu_dimensions(die_dimensions)
+            if pu_dimensions_override is None
+            else dict(pu_dimensions_override)
+        )
+        if set(pu_dimensions) != {"B", "M", "K", "N"}:
+            raise ValueError("PU BMM dimensions must contain exactly B/M/K/N")
         weight_bytes = 0
         load_bytes = 0
         if weight_batches:
             _positive_integer("weight_batches", weight_batches)
+            if pu_weight_batches is None:
+                pu_weight_batches = weight_batches
+            _positive_integer("pu_weight_batches", pu_weight_batches)
             weight_bytes = (
                 weight_batches * die_dimensions["K"] * die_dimensions["N"]
                 * _WEIGHT_DTYPE_BYTES
             )
             load_bytes = (
-                weight_batches * pu_dimensions["K"] * pu_dimensions["N"]
+                pu_weight_batches * pu_dimensions["K"] * pu_dimensions["N"]
                 * _WEIGHT_DTYPE_BYTES
             )
+        elif pu_weight_batches is not None:
+            raise ValueError("pu_weight_batches requires resident weights")
         input_bytes = (
             pu_dimensions["B"] * pu_dimensions["M"] * pu_dimensions["K"]
             * _ACTIVATION_DTYPE_BYTES
@@ -289,13 +328,17 @@ class _LayerBuilder:
             * _ACTIVATION_DTYPE_BYTES
         )
         self.add_comm(
-            f"{op_id}.input_broadcast", f"{op_kind}_input_broadcast",
-            scope="intra_chip", kind="broadcast",
-            group=self.representative_pu_row,
-            root=self.PU,
+            f"{op_id}.{input_suffix}", f"{op_kind}_{input_suffix}",
+            scope="intra_chip", kind=input_kind,
+            group=(
+                self.representative_pu_row
+                if input_group is None else tuple(input_group)
+            ),
+            root=self.PU if input_kind == "broadcast" else None,
             size_bytes=input_bytes,
             parallel_strategy=parallel_strategy,
             batch_partition_degree=batch_partition_degree,
+            noc_direction=input_noc_direction,
         )
         operator = BMMOp(op_id, **pu_dimensions)
         mapping = OperatorMapping(
@@ -335,10 +378,13 @@ class _LayerBuilder:
             weight_bytes=weight_bytes,
         ))
         self.add_comm(
-            f"{op_id}.output_reduce", f"{op_kind}_output_reduce",
-            scope="intra_chip", kind="reduce",
-            group=self.representative_pu_column,
-            root=self.PU,
+            f"{op_id}.{output_suffix}", f"{op_kind}_{output_suffix}",
+            scope="intra_chip", kind=output_kind,
+            group=(
+                self.representative_pu_column
+                if output_group is None else tuple(output_group)
+            ),
+            root=self.PU if output_kind == "reduce" else None,
             size_bytes=output_bytes,
             reduce_kind="sum",
             parallel_strategy=parallel_strategy,
@@ -383,6 +429,72 @@ class _LayerBuilder:
             ),
         )
 
+    def add_flash_attention(
+        self, op_id: str, op_kind: str, *,
+        global_dimensions: Mapping[str, int],
+        chip_dimensions: Mapping[str, int],
+        die_dimensions: Mapping[str, int],
+        parallel_strategy: str,
+        dram_read_bytes_per_token: int,
+        sram_read_bytes_per_mapped_token: int,
+        batch_axis: str = "B",
+    ) -> None:
+        """Add one fused FlashAttention critical path on a representative PU."""
+        names = {"B", "M", "qk_K", "qk_N", "sv_K", "sv_N"}
+        for dimensions in (global_dimensions, chip_dimensions, die_dimensions):
+            if set(dimensions) != names:
+                raise ValueError(
+                    "FlashAttention dimensions must contain exactly "
+                    "B/M/qk_K/qk_N/sv_K/sv_N"
+                )
+        rows = self.hardware_config.chip.logic_die.pu_mesh_rows
+        columns = self.hardware_config.chip.logic_die.pu_mesh_columns
+        pu_dimensions = dict(die_dimensions)
+        pu_dimensions["qk_K"] = _ceil_div(die_dimensions["qk_K"], rows)
+        pu_dimensions["qk_N"] = _ceil_div(die_dimensions["qk_N"], columns)
+        pu_dimensions["sv_K"] = _ceil_div(die_dimensions["sv_K"], columns)
+        pu_dimensions["sv_N"] = _ceil_div(die_dimensions["sv_N"], columns)
+
+        input_bytes = (
+            pu_dimensions["B"] * pu_dimensions["M"]
+            * pu_dimensions["qk_K"] * _ACTIVATION_DTYPE_BYTES
+        )
+        output_bytes = (
+            pu_dimensions["B"] * pu_dimensions["M"]
+            * pu_dimensions["sv_N"] * _ACTIVATION_DTYPE_BYTES
+        )
+        self.add_comm(
+            f"{op_id}.input_broadcast", f"{op_kind}_input_broadcast",
+            scope="intra_chip", kind="broadcast",
+            group=self.representative_pu_row, root=self.PU,
+            size_bytes=input_bytes, parallel_strategy=parallel_strategy,
+        )
+        operator = FlashAttentionOp(op_id, **pu_dimensions)
+        mapping = OperatorMapping(
+            batch_axis, self.PU, self.DRAM, self.SRAM,
+            dram_read_bytes_per_token=dram_read_bytes_per_token,
+            sram_read_bytes_per_mapped_token=(
+                sram_read_bytes_per_mapped_token
+            ),
+            sram_read_data_kind="flash_kv",
+        )
+        self._record(operator, mapping, OperatorHardwareMapping(
+            op_id=op_id,
+            op_kind=op_kind,
+            parallel_strategy=parallel_strategy,
+            global_dimensions=global_dimensions,
+            chip_dimensions=chip_dimensions,
+            die_dimensions=die_dimensions,
+            pu_dimensions=pu_dimensions,
+        ))
+        self.add_comm(
+            f"{op_id}.output_reduce", f"{op_kind}_output_reduce",
+            scope="intra_chip", kind="reduce",
+            group=self.representative_pu_column, root=self.PU,
+            size_bytes=output_bytes, reduce_kind="sum",
+            parallel_strategy=parallel_strategy,
+        )
+
     def add_comm(
         self, op_id: str, op_kind: str, *, scope: str, kind: str,
         group: Sequence[Any], parallel_strategy: str,
@@ -393,6 +505,7 @@ class _LayerBuilder:
         parallel_link_count: int = 1,
         batch_partition_degree: int = 1,
         dram_write_bytes_per_token: int = 0,
+        noc_direction: Optional[str] = None,
     ) -> None:
         matrix = None
         if transfer_bytes is not None:
@@ -402,7 +515,17 @@ class _LayerBuilder:
             root=root, reduce_kind=reduce_kind, transfer_bytes=matrix,
             parallel_link_count=parallel_link_count,
         )
-        resource = self.NOC if scope == "intra_chip" else self.FABRIC
+        if noc_direction not in (None, "input", "output"):
+            raise ValueError("noc_direction must be input or output")
+        if scope == "inter_chip" and noc_direction is not None:
+            raise ValueError("noc_direction applies only to intra-chip NoC")
+        resource = self.FABRIC
+        if scope == "intra_chip":
+            resource = (
+                self.NOC_INPUT if noc_direction == "input"
+                else self.NOC_OUTPUT if noc_direction == "output"
+                else self._noc_resource(kind)
+            )
         if size_bytes is not None:
             dimensions = {"size_bytes": max(size_bytes, 1)}
         else:
@@ -660,27 +783,27 @@ class HardwareMapper:
             weight_batches=local_heads,
             batch_axis="B",
         )
-        # The NoPE and RoPE score terms are one concatenated dot product:
-        # [Q_nope_absorbed, Q_rope] @ [KV_latent, K_rope].  Keeping this as
-        # one logical BMM preserves the arithmetic while requiring only one
-        # representative PU-column output reduction.
+        # FlashAttention consumes the concatenated NoPE/RoPE Q and streams
+        # the corresponding KV tile once.  Scores are never materialized on
+        # the NoC; QK and SV are charged as one PU command.
         fused_qk_width = model.kv_lora_rank + model.qk_rope_head_dim
-        builder.add_bmm(
-            "attn.qk_fused", "qk_fused",
-            global_dimensions=self._dims(
-                global_head_batch, 1, fused_qk_width, attention_history,
-            ),
-            chip_dimensions=self._dims(
-                chip_head_batch, 1, fused_qk_width, attention_history,
-            ),
-            die_dimensions=self._dims(
-                die_head_batch, 1, fused_qk_width, attention_history,
-            ),
+        flash_dimensions = lambda head_batch: {
+            "B": head_batch,
+            "M": 1,
+            "qk_K": fused_qk_width,
+            "qk_N": attention_history,
+            "sv_K": attention_history,
+            "sv_N": model.kv_lora_rank,
+        }
+        builder.add_flash_attention(
+            "attn.flash_attention", "flash_attention",
+            global_dimensions=flash_dimensions(global_head_batch),
+            chip_dimensions=flash_dimensions(chip_head_batch),
+            die_dimensions=flash_dimensions(die_head_batch),
             parallel_strategy=strategy,
             dram_read_bytes_per_token=(
                 attention_history * fused_qk_width * _KV_CACHE_DTYPE_BYTES
             ),
-            batch_axis="B",
             sram_read_bytes_per_mapped_token=(
                 (
                     _ceil_div(model.kv_lora_rank, pu_rows)
@@ -689,63 +812,31 @@ class HardwareMapper:
                 * _ceil_div(attention_history, pu_columns)
                 * _KV_CACHE_DTYPE_BYTES
             ),
-            sram_read_data_kind="kv_fused",
         )
-        builder.add_vector(
-            "attn.softmax", "softmax",
-            global_dimensions={
-                "m": global_head_batch, "n": attention_history,
-            },
-            chip_dimensions={
-                "m": chip_head_batch, "n": attention_history,
-            },
-            die_dimensions={
-                "m": die_head_batch, "n": attention_history,
-            },
-            parallel_strategy=strategy,
-        )
+
+        # O projection contracts both the local-head and latent dimensions.
+        # Folding heads into K is algebraically identical to the batched form,
+        # keeps the PU FLOPs and weight tile unchanged, and reduces the NoC
+        # output from per-head partials to one hidden tile per request.
         builder.add_bmm(
-            "attn.sv_latent", "sv_latent",
+            "attn.vo_absorb", "vo_absorb_head_folded_k",
             global_dimensions=self._dims(
-                global_head_batch, 1, attention_history, model.kv_lora_rank,
+                1, global_batch,
+                model.num_attention_heads * model.kv_lora_rank,
+                model.hidden_size,
             ),
             chip_dimensions=self._dims(
-                chip_head_batch, 1, attention_history, model.kv_lora_rank,
+                1, chip_batch,
+                model.num_attention_heads * model.kv_lora_rank,
+                model.hidden_size,
             ),
             die_dimensions=self._dims(
-                die_head_batch, 1, attention_history, model.kv_lora_rank,
+                1, chip_batch, local_heads * model.kv_lora_rank,
+                model.hidden_size,
             ),
             parallel_strategy=strategy,
-            batch_axis="B",
-            sram_read_bytes_per_mapped_token=(
-                _ceil_div(attention_history, pu_rows)
-                * _ceil_div(model.kv_lora_rank, pu_columns)
-                * _KV_CACHE_DTYPE_BYTES
-            ),
-            sram_read_data_kind="kv_value",
-        )
-        builder.add_bmm(
-            "attn.vo_absorb", "vo_absorb",
-            global_dimensions=self._dims(
-                global_head_batch, 1, model.kv_lora_rank, model.hidden_size,
-            ),
-            chip_dimensions=self._dims(
-                chip_head_batch, 1, model.kv_lora_rank, model.hidden_size,
-            ),
-            die_dimensions=self._dims(
-                die_head_batch, 1, model.kv_lora_rank, model.hidden_size,
-            ),
-            parallel_strategy=strategy,
-            weight_batches=local_heads,
-            batch_axis="B",
-        )
-        builder.add_vector(
-            "attn.local_head_reduce", "head_reduce",
-            global_dimensions={"m": global_batch, "n": model.hidden_size},
-            chip_dimensions={"m": chip_batch, "n": model.hidden_size},
-            die_dimensions={"m": chip_batch, "n": model.hidden_size},
-            parallel_strategy=strategy,
-            flops_per_element=max(local_heads - 1, 1),
+            weight_batches=1,
+            batch_axis="M",
         )
         builder.add_comm(
             "attn.die_output_reduce", "die_output_reduce",
@@ -903,11 +994,90 @@ class HardwareMapper:
         suffix = f"tokens{tokens_per_expert}"
         chip_tp_degree = chips if parallel_strategy == "moe_tp" else 1
         chip_expert_count = expert_count
+        is_ep = parallel_strategy == "moe_ep_die_tp4"
+        is_tp = parallel_strategy == "moe_tp"
+        pu_rows = self.hardware_config.chip.logic_die.pu_mesh_rows
+        pu_columns = self.hardware_config.chip.logic_die.pu_mesh_columns
+        pu_count = pu_rows * pu_columns
         common = dict(
             expert_ids=expert_ids,
             tokens_per_expert=tokens_per_expert,
             parallel_strategy=parallel_strategy,
         )
+        if is_tp:
+            # Two-dimensional TP follows the physical hierarchy: chips shard
+            # Up/Gate N, dies shard K, and the 16 PUs partition experts.
+            chip_intermediate = _exact_div(
+                model.moe_intermediate_size, chips,
+                "TP intermediate dimension across chips",
+            )
+            up_die_dimensions = self._dims(
+                expert_count,
+                tokens_per_expert,
+                _exact_div(
+                    model.hidden_size, len(builder.die_group),
+                    "TP Up/Gate K dimension across dies",
+                ),
+                2 * chip_intermediate,
+            )
+        else:
+            chip_intermediate = local_intermediate
+            up_die_dimensions = self._dims(
+                expert_count, tokens_per_expert, model.hidden_size,
+                2 * local_intermediate,
+            )
+        up_overrides = {}
+        if is_ep:
+            # EP Up/Gate uses all four K rows but only two N shards.  The
+            # other factor of two partitions experts, so a representative
+            # input is broadcast to two columns rather than all four.  This
+            # preserves PU FLOPs and weight bytes while halving the input
+            # critical path.
+            expert_partitions = 2
+            n_partitions = pu_columns // expert_partitions
+            up_overrides = {
+                "pu_dimensions_override": self._dims(
+                    _exact_div(
+                        expert_count, expert_partitions,
+                        "EP experts for Up/Gate PU partition",
+                    ),
+                    tokens_per_expert,
+                    _exact_div(
+                        model.hidden_size, pu_rows,
+                        "EP Up/Gate K dimension",
+                    ),
+                    _exact_div(
+                        2 * local_intermediate, n_partitions,
+                        "EP Up/Gate N dimension",
+                    ),
+                ),
+                "pu_weight_batches": expert_count // expert_partitions,
+                "input_group": builder.representative_pu_row[:n_partitions],
+            }
+        elif is_tp:
+            # Keep the die-local K/N shards whole within one PU.  Distinct
+            # PUs own distinct experts, preserving PU FLOPs and weight bytes
+            # without replicating the long input across a PU row.
+            pu_experts = _exact_div(
+                expert_count, pu_count,
+                "TP experts for Up/Gate PU partition",
+            )
+            up_overrides = {
+                "pu_dimensions_override": self._dims(
+                    pu_experts,
+                    tokens_per_expert,
+                    up_die_dimensions["K"],
+                    up_die_dimensions["N"],
+                ),
+                "pu_weight_batches": pu_experts,
+                "input_kind": "p2p",
+                "input_suffix": "input_transfer",
+                "input_group": ("chip0.die0.input", builder.PU),
+                "input_noc_direction": "input",
+                "output_kind": "p2p",
+                "output_group": (builder.PU, "chip0.die0.output"),
+                "output_suffix": "output_transfer",
+            }
         builder.add_bmm(
             f"{prefix}.{suffix}.up_gate", "moe_up_gate",
             global_dimensions=self._dims(
@@ -918,13 +1088,46 @@ class HardwareMapper:
                 chip_expert_count, tokens_per_expert, model.hidden_size,
                 2 * model.moe_intermediate_size // chip_tp_degree,
             ),
-            die_dimensions=self._dims(
-                expert_count, tokens_per_expert, model.hidden_size,
-                2 * local_intermediate,
-            ),
+            die_dimensions=up_die_dimensions,
             weight_batches=expert_count,
+            **up_overrides,
             **common,
         )
+        if is_tp:
+            # The four K-sharded dies produce partial Up/Gate outputs.  Model
+            # allreduce explicitly as reduce-scatter on noc_output followed
+            # by allgather on noc_input.  The end-to-end bytes/time are the
+            # same, while the two full-duplex directions can be independently
+            # pipelined across microbatches.
+            up_output_bytes = (
+                expert_count * tokens_per_expert
+                * 2 * chip_intermediate * _ACTIVATION_DTYPE_BYTES
+            )
+            builder.add_comm(
+                f"{prefix}.{suffix}.up_die_reduce_scatter",
+                "moe_up_gate_die_reduce_scatter",
+                scope="intra_chip", kind="reduce_scatter",
+                group=builder.die_group,
+                size_bytes=up_output_bytes,
+                parallel_link_count=(
+                    builder.die_collective_parallel_link_count
+                ),
+                parallel_strategy=parallel_strategy,
+            )
+            builder.add_comm(
+                f"{prefix}.{suffix}.up_die_allgather",
+                "moe_up_gate_die_allgather",
+                scope="intra_chip", kind="allgather",
+                group=builder.die_group,
+                size_bytes=_exact_div(
+                    up_output_bytes, len(builder.die_group),
+                    "TP Up/Gate reduce-scatter output",
+                ),
+                parallel_link_count=(
+                    builder.die_collective_parallel_link_count
+                ),
+                parallel_strategy=parallel_strategy,
+            )
         builder.add_vector(
             f"{prefix}.{suffix}.silu", "silu",
             global_dimensions={
@@ -937,10 +1140,95 @@ class HardwareMapper:
             },
             die_dimensions={
                 "m": expert_count * tokens_per_expert,
-                "n": local_intermediate,
+                "n": chip_intermediate,
             },
             **common,
         )
+        if is_ep:
+            # Up/Gate is column-parallel across dies.  Gather the much
+            # smaller post-SiLU intermediate before making Down output-
+            # parallel across dies, avoiding a full-hidden die allreduce.
+            builder.add_comm(
+                f"{prefix}.{suffix}.intermediate_die_allgather",
+                "moe_intermediate_die_allgather",
+                scope="intra_chip", kind="allgather",
+                group=builder.die_group,
+                size_bytes=(
+                    expert_count * tokens_per_expert * local_intermediate
+                    * _ACTIVATION_DTYPE_BYTES
+                ),
+                parallel_link_count=(
+                    builder.die_collective_parallel_link_count
+                ),
+                parallel_strategy=parallel_strategy,
+            )
+            die_hidden = _exact_div(
+                model.hidden_size, len(builder.die_group),
+                "EP Down hidden dimension",
+            )
+            down_pu_experts = _exact_div(
+                expert_count, pu_rows, "EP experts for Down PU partition",
+            )
+            down_die_dimensions = self._dims(
+                expert_count, tokens_per_expert,
+                model.moe_intermediate_size, die_hidden,
+            )
+            down_overrides = {
+                "pu_dimensions_override": self._dims(
+                    down_pu_experts,
+                    tokens_per_expert,
+                    model.moe_intermediate_size,
+                    _exact_div(
+                        die_hidden, pu_columns,
+                        "EP Down N dimension",
+                    ),
+                ),
+                "pu_weight_batches": down_pu_experts,
+                "output_kind": "p2p",
+                "output_group": (
+                    builder.PU, "chip0.die0.output",
+                ),
+                "output_suffix": "output_transfer",
+            }
+        elif is_tp:
+            # Invert the Up/Gate layout: chips shard Down K and dies shard N.
+            # PUs again partition experts only, so both local transfers are
+            # p2p rather than a broadcast/reduce across a PU row or column.
+            down_pu_experts = _exact_div(
+                expert_count, pu_count, "TP experts for Down PU partition",
+            )
+            down_die_dimensions = self._dims(
+                expert_count, tokens_per_expert,
+                chip_intermediate,
+                _exact_div(
+                    model.hidden_size, len(builder.die_group),
+                    "TP Down N dimension across dies",
+                ),
+            )
+            down_overrides = {
+                "pu_dimensions_override": self._dims(
+                    down_pu_experts,
+                    tokens_per_expert,
+                    down_die_dimensions["K"],
+                    down_die_dimensions["N"],
+                ),
+                "pu_weight_batches": down_pu_experts,
+                "input_kind": "p2p",
+                "input_suffix": "input_transfer",
+                "input_group": ("chip0.die0.input", builder.PU),
+                "input_noc_direction": "input",
+                "output_kind": "p2p",
+                "output_group": (
+                    builder.PU, "chip0.die0.output",
+                ),
+                "output_suffix": "output_transfer",
+            }
+        else:
+            down_die_dimensions = self._dims(
+                expert_count, tokens_per_expert,
+                local_intermediate, model.hidden_size,
+            )
+            down_overrides = {}
         builder.add_bmm(
             f"{prefix}.{suffix}.down", "moe_down",
             global_dimensions=self._dims(
@@ -952,11 +1240,9 @@ class HardwareMapper:
                 model.moe_intermediate_size // chip_tp_degree,
                 model.hidden_size,
             ),
-            die_dimensions=self._dims(
-                expert_count, tokens_per_expert,
-                local_intermediate, model.hidden_size,
-            ),
+            die_dimensions=down_die_dimensions,
             weight_batches=expert_count,
+            **down_overrides,
             **common,
         )
 
@@ -992,21 +1278,26 @@ class HardwareMapper:
                 parallel_strategy=strategy,
             )
         builder.add_comm(
-            "moe.tp_die_reduce", "die_partial_reduce",
-            scope="intra_chip", kind="allreduce", group=builder.die_group,
-            size_bytes=(
-                global_batch * model.hidden_size * dtype
-            ),
-            parallel_link_count=builder.die_collective_parallel_link_count,
-            parallel_strategy=strategy,
-        )
-        builder.add_comm(
             "moe.tp_chip_reduce_scatter", "tp_to_dp_reduce_scatter",
             scope="inter_chip", kind="reduce_scatter",
             group=builder.chip_group,
             size_bytes=(
                 global_batch * model.hidden_size * dtype
             ),
+            parallel_strategy=strategy,
+        )
+        builder.add_comm(
+            "moe.tp_output_die_allgather", "tp_output_die_allgather",
+            scope="intra_chip", kind="allgather", group=builder.die_group,
+            size_bytes=(
+                local_batch
+                * _exact_div(
+                    model.hidden_size, dies,
+                    "TP output hidden dimension across dies",
+                )
+                * dtype
+            ),
+            parallel_link_count=builder.die_collective_parallel_link_count,
             parallel_strategy=strategy,
         )
         builder.add_vector(
@@ -1126,18 +1417,6 @@ class HardwareMapper:
                 tp_degree=dies,
                 parallel_strategy=strategy,
             )
-        representative_assignments = sum(
-            loads[expert] for expert in representative_experts
-        )
-        builder.add_comm(
-            "moe.ep_die_reduce", "die_partial_reduce",
-            scope="intra_chip", kind="allreduce", group=builder.die_group,
-            size_bytes=(
-                representative_assignments * model.hidden_size * dtype
-            ),
-            parallel_link_count=builder.die_collective_parallel_link_count,
-            parallel_strategy=strategy,
-        )
         combine = tuple(
             tuple(dispatch[column][row] for column in range(chips))
             for row in range(chips)
@@ -1146,6 +1425,19 @@ class HardwareMapper:
             "moe.ep_combine", "expert_combine", scope="inter_chip",
             kind="alltoall", group=builder.chip_group,
             transfer_bytes=combine, parallel_strategy=strategy,
+        )
+        builder.add_comm(
+            "moe.ep_output_die_allgather", "ep_output_die_allgather",
+            scope="intra_chip", kind="allgather", group=builder.die_group,
+            size_bytes=(
+                local_batch
+                * _exact_div(
+                    model.hidden_size, dies, "EP output hidden dimension",
+                )
+                * dtype
+            ),
+            parallel_link_count=builder.die_collective_parallel_link_count,
+            parallel_strategy=strategy,
         )
         builder.add_vector(
             "moe.ep_residual", "residual",

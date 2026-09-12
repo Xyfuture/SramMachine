@@ -7,7 +7,8 @@ from typing import Tuple, Type
 from Desim import FIFO, SimModule, SimSession, SimTime
 
 from srammachine.commands import (
-    Command, DramCmd, GemmCmd, InterChipCmd, NoCCmd, VectorCmd,
+    Command, DramCmd, FlashAttentionCmd, GemmCmd, InterChipCmd, NoCCmd,
+    VectorCmd,
     SramReadCmd, WeightLoadCmd,
 )
 from srammachine.hardware import HardwareConfig
@@ -140,11 +141,15 @@ class SramResourceStage(HardwareResourceStage):
 
 
 class ProcessingUnitStage(HardwareResourceStage):
-    accepted_command_types = (GemmCmd,)
+    accepted_command_types = (GemmCmd, FlashAttentionCmd)
 
-    def latency_ns(self, command: GemmCmd) -> int:
+    def latency_ns(self, command: GemmCmd | FlashAttentionCmd) -> int:
         self._validate_command(command)
-        flops = 2 * command.B * command.M * command.K * command.N
+        flops = (
+            command.total_flops
+            if isinstance(command, FlashAttentionCmd)
+            else 2 * command.B * command.M * command.K * command.N
+        )
         peak_flops = (
             self.hardware_config.chip.logic_die.processing_unit.peak_flops
         )
@@ -207,7 +212,7 @@ def stage_class_for_command(command: Command):
         return DramResourceStage
     if isinstance(command, (WeightLoadCmd, SramReadCmd)):
         return SramResourceStage
-    if isinstance(command, GemmCmd):
+    if isinstance(command, (GemmCmd, FlashAttentionCmd)):
         return ProcessingUnitStage
     if isinstance(command, VectorCmd):
         return VectorUnitStage

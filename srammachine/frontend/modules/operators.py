@@ -48,6 +48,23 @@ class BMMOp(Operator):
 
 
 @dataclass
+class FlashAttentionOp(Operator):
+    """Fused QK/online-softmax/SV with two explicit GEMM shapes."""
+
+    B: int
+    M: int
+    qk_K: int
+    qk_N: int
+    sv_K: int
+    sv_N: int
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        for name in ("B", "M", "qk_K", "qk_N", "sv_K", "sv_N"):
+            _integer(name, getattr(self, name), 1)
+
+
+@dataclass
 class VectorOp(Operator):
     """m vectors of dimension n; kind and params describe the operation.
 

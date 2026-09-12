@@ -50,7 +50,8 @@ class SramReadCmd(Command):
         integer("size_bytes", self.size_bytes)
         nonempty("data_kind", self.data_kind)
         if self.data_kind not in (
-            "kv_nope", "kv_rope", "kv_fused", "kv_value", "dsa_key",
+            "kv_nope", "kv_rope", "kv_fused", "kv_value", "flash_kv",
+            "dsa_key",
         ):
             raise ValueError("unsupported SRAM read data_kind")
 

@@ -10,6 +10,7 @@ from srammachine.commands import (
     CommandGraph,
     CommCmd,
     DramCmd,
+    FlashAttentionCmd,
     GemmCmd,
     InterChipCmd,
     NoCCmd,
@@ -59,7 +60,7 @@ def _freeze_parameters(parameters: Mapping[str, Any]) -> Mapping[str, Any]:
 def _command_category(command: Command) -> CommandCategory:
     if isinstance(command, WeightPrefetchCmd):
         return CommandCategory.PREFETCH
-    if isinstance(command, (GemmCmd, VectorCmd)):
+    if isinstance(command, (GemmCmd, FlashAttentionCmd, VectorCmd)):
         return CommandCategory.COMPUTE
     if isinstance(command, (DramCmd, WeightLoadCmd, SramReadCmd)):
         return CommandCategory.MEMORY
@@ -103,6 +104,19 @@ def _command_parameters(
             "gemm_k": command.K,
             "gemm_n": command.N,
         }
+    elif isinstance(command, FlashAttentionCmd):
+        parameters = {
+            "B": command.B,
+            "M": command.M,
+            "qk_K": command.qk_K,
+            "qk_N": command.qk_N,
+            "sv_K": command.sv_K,
+            "sv_N": command.sv_N,
+            "qk_flops": command.qk_flops,
+            "sv_flops": command.sv_flops,
+            "total_flops": command.total_flops,
+            "softmax_flops": 0,
+        }
     elif isinstance(command, VectorCmd):
         parameters = {
             "kind": command.kind,
@@ -136,6 +150,11 @@ def _command_parameters(
                 hardware_config.chip.noc.link_bandwidth_bytes_per_second
             )
             parameters.update({
+                "noc_direction": (
+                    "input" if command.resource_id.endswith("noc_input")
+                    else "output" if command.resource_id.endswith("noc_output")
+                    else "unspecified"
+                ),
                 "noc_parallel_link_count": command.parallel_link_count,
                 "noc_link_bandwidth_bytes_per_second": link_bandwidth,
                 "noc_effective_bandwidth_bytes_per_second": (

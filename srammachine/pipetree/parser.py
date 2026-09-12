@@ -11,11 +11,13 @@ from typing import Iterator, Mapping, Tuple
 
 from srammachine.commands import (
     CommandGraph, CommandTrace, DramCmd, DramReadCmd, DramWriteCmd,
-    SramReadCmd, WeightLoadCmd, WeightPrefetchCmd, GemmCmd, VectorCmd, NoCCmd,
-    InterChipCmd,
+    SramReadCmd, WeightLoadCmd, WeightPrefetchCmd, FlashAttentionCmd, GemmCmd,
+    VectorCmd, NoCCmd, InterChipCmd,
 )
 from srammachine.commands.base import integer
-from srammachine.frontend.modules import BMMOp, VectorOp, CommOp, Operator
+from srammachine.frontend.modules import (
+    BMMOp, CommOp, FlashAttentionOp, Operator, VectorOp,
+)
 from srammachine.hardware import DEFAULT_HARDWARE_CONFIG, HardwareConfig
 from .mapping import OperatorMapping
 from .tree import GroupNode, Node, OpInstance, OpNode, PipeTree
@@ -225,12 +227,14 @@ class TreeParser:
             consumers = [
                 graph.command(successor)
                 for successor in graph.successors(command.cmd_id)
-                if isinstance(graph.command(successor), GemmCmd)
+                if isinstance(
+                    graph.command(successor), (GemmCmd, FlashAttentionCmd),
+                )
             ]
             if len(consumers) != 1:
                 raise ValueError(
                     f"weight load {command.cmd_id} must directly feed "
-                    "exactly one GemmCmd"
+                    "exactly one PU compute command"
                 )
             core = consumers[0]
             if core.cmd_id in load_by_core:
@@ -241,7 +245,7 @@ class TreeParser:
 
         gemms_by_pu = {}
         for command in graph.commands:
-            if isinstance(command, GemmCmd):
+            if isinstance(command, (GemmCmd, FlashAttentionCmd)):
                 gemms_by_pu.setdefault(command.resource_id, []).append(
                     command.cmd_id
                 )
@@ -292,7 +296,7 @@ class TreeParser:
         checked = {}
         for op_id in tree.operator_order:
             op, mapping = operators[op_id], mappings[op_id]
-            if not isinstance(op, (BMMOp, VectorOp, CommOp)):
+            if not isinstance(op, (BMMOp, FlashAttentionOp, VectorOp, CommOp)):
                 raise TypeError(f"unsupported operator: {op_id}")
             if op.op_id != op_id:
                 raise ValueError(f"operator key does not match op_id: {op_id}")
@@ -300,7 +304,7 @@ class TreeParser:
                 raise TypeError(f"expected OperatorMapping for {op_id}")
             # Snapshot and revalidate mutable model operators without changing them.
             op = replace(op)
-            axes = (("B", "M") if isinstance(op, BMMOp) else
+            axes = (("B", "M") if isinstance(op, (BMMOp, FlashAttentionOp)) else
                     ("m",) if isinstance(op, VectorOp) else ("size_bytes",))
             if mapping.batch_axis not in axes:
                 raise ValueError(f"{op_id}: batch_axis must be one of {axes}")
@@ -471,6 +475,15 @@ class TreeParser:
             dimensions = {name: getattr(op, name) for name in ("B", "M", "K", "N")}
             dimensions[mapping.batch_axis] = scale(dimensions[mapping.batch_axis])
             return GemmCmd(**common, **dimensions)
+        if isinstance(op, FlashAttentionOp):
+            dimensions = {
+                name: getattr(op, name)
+                for name in ("B", "M", "qk_K", "qk_N", "sv_K", "sv_N")
+            }
+            dimensions[mapping.batch_axis] = scale(
+                dimensions[mapping.batch_axis]
+            )
+            return FlashAttentionCmd(**common, **dimensions)
         if isinstance(op, VectorOp):
             return VectorCmd(**common, kind=op.kind, m=scale(op.m), n=op.n, params=op.params)
         cls = NoCCmd if op.scope == "intra_chip" else InterChipCmd
