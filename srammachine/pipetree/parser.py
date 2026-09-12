@@ -216,9 +216,11 @@ class TreeParser:
         """Allow a static weight load only one actual GEMM ahead per PU.
 
         The window is defined by the complete GEMM stream, including dynamic
-        right-operand operations such as QK and SV.  Once every direct input
-        of GEMM ``i`` has completed, GEMM ``i`` is ready on its PU and the
-        static weight for GEMM ``i + 1`` may load concurrently on SRAM.
+        right-operand operations such as FlashAttention.  A load waits until
+        the immediately preceding GEMM is ready and the GEMM two positions
+        back has completed.  Thus the next weight may overlap the current
+        compute, but independent microbatches cannot accumulate more than the
+        current and next weights while several ready GEMMs queue on one PU.
         """
         load_by_core = {}
         for command in graph.commands:
@@ -262,6 +264,14 @@ class TreeParser:
                     for source in graph.predecessors(previous_core)
                     if source != load_id
                 )
+                # Readiness alone is insufficient when independent
+                # microbatches queue several GEMMs on the same PU: multiple
+                # future loads could otherwise accumulate before any queued
+                # GEMM starts.  Completion of the GEMM two positions back
+                # frees the current slot, while readiness of the immediately
+                # preceding GEMM preserves one-step load/compute overlap.
+                if index >= 2:
+                    buffer_edges.append((cores[index - 2], load_id))
 
         if not buffer_edges:
             return graph
