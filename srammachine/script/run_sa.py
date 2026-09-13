@@ -25,8 +25,9 @@ import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 import traceback
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from srammachine.hardware import DEFAULT_HARDWARE_CONFIG
 from srammachine.inference import InferenceConfig, MoEParallelStrategy
@@ -43,6 +44,23 @@ SUPPORTED_MODELS = (
 )
 DEFAULT_SEED = SimulatedAnnealingConfig().random_seed
 DEFAULT_OUTPUT_DIR = Path("best split tree result")
+CSV_OMITTED_FIELDS = frozenset(("best_split_trees", "restart_results"))
+CSV_FIELDNAMES = (
+    "model", "global_batch_size", "mtp_enabled", "input_sequence_length",
+    "output_sequence_length", "moe_strategy", "kv_cache_dtype",
+    "warmup_rounds", "rounds", "restart_count", "initial_temperature",
+    "final_temperature", "layer_count", "base_seed", "chip_count",
+    "case_seed", "baseline_latency_ns", "pareto_best_latency_ns",
+    "baseline_single_user_throughput_per_second",
+    "pareto_best_single_user_throughput_per_second",
+    "baseline_total_throughput_tokens_per_second",
+    "pareto_best_total_throughput_tokens_per_second",
+    "latency_reduction_fraction", "throughput_improvement_fraction",
+    "proposal_count", "candidate_simulation_count",
+    "materialization_simulation_count", "simulator_run_count",
+    "cache_hit_count", "accepted_proposal_count",
+    "is_model_global_pareto",
+)
 
 
 @dataclass(frozen=True)
@@ -328,20 +346,67 @@ def _unique_path(directory: Path, stem: str, suffix: str) -> Path:
 
 
 def _csv_rows(rows: Iterable[dict[str, Any]]) -> Iterable[dict[str, Any]]:
-    omitted = {"best_split_trees", "restart_results"}
     for row in rows:
-        yield {key: value for key, value in row.items() if key not in omitted}
+        unexpected = set(row) - CSV_OMITTED_FIELDS - set(CSV_FIELDNAMES)
+        if unexpected:
+            raise ValueError(f"unexpected CSV fields: {sorted(unexpected)}")
+        yield {field: row.get(field, "") for field in CSV_FIELDNAMES}
+
+
+def _write_csv_rows(stream, rows: Iterable[dict[str, Any]]) -> None:
+    writer = csv.DictWriter(stream, fieldnames=CSV_FIELDNAMES)
+    writer.writeheader()
+    writer.writerows(_csv_rows(rows))
+
+
+def create_csv_checkpoint(path: Path) -> None:
+    """Create an empty, valid CSV before any worker process is launched."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("x", encoding="utf-8-sig", newline="") as stream:
+        _write_csv_rows(stream, ())
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def append_csv_checkpoint(path: Path, row: dict[str, Any]) -> None:
+    """Durably append one completed case; its global Pareto status is unknown."""
+    checkpoint_row = dict(row)
+    checkpoint_row.pop("is_model_global_pareto", None)
+    with path.open("a", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=CSV_FIELDNAMES)
+        writer.writerow(next(_csv_rows((checkpoint_row,))))
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def finalize_csv_checkpoint(
+    path: Path, rows: Sequence[dict[str, Any]],
+) -> None:
+    """Atomically replace a checkpoint with the sorted, finalized result."""
+    if not rows:
+        raise ValueError("cannot finalize an empty SA comparison")
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8-sig", newline="", delete=False,
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
+        ) as stream:
+            temporary_path = Path(stream.name)
+            _write_csv_rows(stream, rows)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
 
 
 def write_csv(path: Path, rows: Sequence[dict[str, Any]]) -> None:
     if not rows:
         raise ValueError("cannot write an empty SA comparison")
     path.parent.mkdir(parents=True, exist_ok=True)
-    serialized = list(_csv_rows(rows))
     with path.open("x", encoding="utf-8-sig", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=tuple(serialized[0]))
-        writer.writeheader()
-        writer.writerows(serialized)
+        _write_csv_rows(stream, rows)
 
 
 def write_model_json(
@@ -397,7 +462,10 @@ def write_model_json(
         stream.write("\n")
 
 
-def _execute(cases: Sequence[SACase], worker_count: int) -> list[dict[str, Any]]:
+def _execute(
+    cases: Sequence[SACase], worker_count: int,
+    on_result: Callable[[dict[str, Any]], None] | None = None,
+) -> list[dict[str, Any]]:
     results = []
     context = multiprocessing.get_context("spawn")
     # One process handles exactly one case.  Besides isolating Desim's global
@@ -416,6 +484,8 @@ def _execute(cases: Sequence[SACase], worker_count: int) -> list[dict[str, Any]]
                     f"{error_details}"
                 )
             assert result is not None
+            if on_result is not None:
+                on_result(result)
             results.append(result)
             print(
                 "completed "
@@ -444,13 +514,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     workers = choose_worker_count(
         len(cases), args.workers, logical_cpu_count=detected,
     )
+    output_dir = args.output_dir
+    timestamp = datetime.now().astimezone()
+    minute = timestamp.strftime("%Y%m%d_%H%M")
+    generated_at = timestamp.isoformat()
+    csv_path = args.output_csv
+    if csv_path is None:
+        csv_path = _unique_path(
+            output_dir, f"{minute}_sa_throughput_comparison", ".csv",
+        )
+    create_csv_checkpoint(csv_path)
     print(
         f"detected {detected} logical CPUs; running {len(cases)} cases "
         f"with {workers} worker processes",
         flush=True,
     )
+    print(f"CSV checkpoint: {csv_path}", flush=True)
 
-    results = _execute(cases, workers)
+    saved_count = 0
+
+    def save_completed_case(row: dict[str, Any]) -> None:
+        nonlocal saved_count
+        append_csv_checkpoint(csv_path, row)
+        saved_count += 1
+
+    try:
+        results = _execute(cases, workers, on_result=save_completed_case)
+    except BaseException:
+        print(
+            f"partial CSV retained: {csv_path} "
+            f"({saved_count}/{len(cases)} completed cases)",
+            file=sys.stderr, flush=True,
+        )
+        raise
     model_rank = {model: index for index, model in enumerate(args.models)}
     strategy_rank = {
         strategy: index for index, strategy in enumerate(args.moe_strategy)
@@ -461,16 +557,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     ))
     results = mark_model_pareto(results)
 
-    output_dir = args.output_dir
-    timestamp = datetime.now().astimezone()
-    minute = timestamp.strftime("%Y%m%d_%H%M")
-    generated_at = timestamp.isoformat()
-    csv_path = args.output_csv
-    if csv_path is None:
-        csv_path = _unique_path(
-            output_dir, f"{minute}_sa_throughput_comparison", ".csv",
-        )
-    write_csv(csv_path, results)
+    finalize_csv_checkpoint(csv_path, results)
 
     json_paths = []
     for model in args.models:

@@ -124,6 +124,8 @@ python -m srammachine.script.run_sa --models deepseek-v3 --mtp off on --batch-si
 1. 一份跨模型、MoE策略、batch和MTP的汇总CSV。
 2. 每个 `(model, MoE strategy)` 一份包含最优SplitTree的JSON。
 
+CSV在worker启动前就会创建。每完成一个case，主进程会立刻追加该case的最终指标并强制刷新到磁盘。因此程序被终止或某个case失败时，已经完成的结果仍保留在启动时打印的`CSV checkpoint`路径中。部分CSV的`is_model_global_pareto`字段为空；只有全部case成功后，该文件才会被原子整理并写入最终Pareto标记。
+
 自动文件名以本地时间精确到分钟，并在重名时追加序号，不会覆盖已有结果。
 
 CSV 的关键字段包括：
@@ -173,3 +175,4 @@ Pareto front 只在固定配置内部计算。分组字段包括模型、MoE策�
 - 一个命令可以同时指定`--moe-strategy tp ep`；汇总CSV合并两种策略，每种策略单独导出JSON。
 - 显式指定的 `--output-csv` 如果已经存在，脚本会拒绝覆盖。
 - 普通 SA 搜索不会生成 Perfetto trace；需要分析逐 command 时间线时，应对选定 SplitTree 单独调用 Simulator 的 trace 接口。
+- 中断后保留的部分CSV只包含指标，不包含完整最佳SplitTree，也不会自动续跑；完整SplitTree JSON仍只在全部case成功后生成。
