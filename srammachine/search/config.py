@@ -20,6 +20,7 @@ class SimulatedAnnealingConfig:
     mtp_values: Tuple[bool, ...] = (False, True)
     warmup_rounds: int = 16
     rounds: int = 50
+    restart_count: int = 4
     random_seed: int = 20260912
     initial_temperature: float = 1.0
     final_temperature: float = 0.01
@@ -44,7 +45,7 @@ class SimulatedAnnealingConfig:
             raise ValueError("mtp_values must contain booleans")
         if len(set(mtp_values)) != len(mtp_values):
             raise ValueError("mtp_values must not contain duplicates")
-        for name in ("warmup_rounds", "rounds", "layer_count"):
+        for name in ("warmup_rounds", "rounds", "restart_count", "layer_count"):
             _positive_integer(name, getattr(self, name))
         if type(self.random_seed) is not int:
             raise TypeError("random_seed must be an integer")
@@ -95,4 +96,16 @@ def derive_workload_seed(
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
 
 
-__all__ = ["SimulatedAnnealingConfig", "derive_workload_seed"]
+def derive_restart_seed(workload_seed: int, restart_index: int) -> int:
+    """Derive a stable seed for one annealing restart."""
+    if type(workload_seed) is not int:
+        raise TypeError("workload_seed must be an integer")
+    if type(restart_index) is not int or restart_index < 0:
+        raise ValueError("restart_index must be a nonnegative integer")
+    payload = f"{workload_seed}\x00restart\x00{restart_index}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+
+
+__all__ = [
+    "SimulatedAnnealingConfig", "derive_workload_seed", "derive_restart_seed",
+]

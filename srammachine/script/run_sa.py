@@ -58,6 +58,7 @@ class SACase:
     kv_cache_dtype: str
     warmup_rounds: int
     rounds: int
+    restart_count: int
     initial_temperature: float
     final_temperature: float
     layer_count: int
@@ -91,6 +92,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--batch-sizes", nargs="+", required=True, type=_positive_int,
     )
     parser.add_argument("--rounds", required=True, type=_positive_int)
+    parser.add_argument(
+        "--restarts", type=_positive_int, default=4,
+        help="full deterministic restarts per workload (default: 4)",
+    )
     parser.add_argument(
         "--input-sequence-length", required=True, type=_positive_int,
     )
@@ -150,6 +155,7 @@ def _make_cases(args: argparse.Namespace) -> list[SACase]:
             kv_cache_dtype=args.kv_cache_dtype,
             warmup_rounds=args.warmup_rounds,
             rounds=args.rounds,
+            restart_count=args.restarts,
             initial_temperature=args.initial_temperature,
             final_temperature=args.final_temperature,
             layer_count=args.layer_count,
@@ -197,6 +203,7 @@ def _run_case(case: SACase) -> dict[str, Any]:
             mtp_values=(case.mtp_enabled,),
             warmup_rounds=case.warmup_rounds,
             rounds=case.rounds,
+            restart_count=case.restart_count,
             random_seed=case.base_seed,
             initial_temperature=case.initial_temperature,
             final_temperature=case.final_temperature,
@@ -211,7 +218,20 @@ def _run_case(case: SACase) -> dict[str, Any]:
     best = workload.best_evaluation
     return {
         **asdict(case),
+        "chip_count": DEFAULT_HARDWARE_CONFIG.chip_count,
         "case_seed": workload.random_seed,
+        "restart_count": workload.restart_count,
+        "restart_results": [
+            {
+                "restart_index": item.restart_index,
+                "random_seed": item.random_seed,
+                "proposal_count": item.proposal_count,
+                "candidate_simulation_count": item.candidate_simulation_count,
+                "cache_hit_count": item.cache_hit_count,
+                "accepted_proposal_count": item.accepted_proposal_count,
+            }
+            for item in workload.restart_results
+        ],
         "baseline_latency_ns": baseline.latency_ns,
         "pareto_best_latency_ns": best.latency_ns,
         "baseline_single_user_throughput_per_second": (
@@ -256,10 +276,19 @@ def _dominates(left: dict[str, Any], right: dict[str, Any]) -> bool:
 
 
 def mark_model_pareto(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Mark the raw cross-workload Pareto front independently per model."""
+    """Mark a raw Pareto front within each fixed inference/hardware setup."""
+    group_fields = (
+        "model", "moe_strategy", "input_sequence_length",
+        "output_sequence_length", "kv_cache_dtype", "layer_count",
+        "chip_count",
+    )
     marked = []
     for row in rows:
-        peers = [item for item in rows if item["model"] == row["model"]]
+        group = tuple(row[field] for field in group_fields)
+        peers = [
+            item for item in rows
+            if tuple(item[field] for field in group_fields) == group
+        ]
         copied = dict(row)
         copied["is_model_global_pareto"] = not any(
             _dominates(other, row) for other in peers if other is not row
@@ -282,7 +311,7 @@ def _unique_path(directory: Path, stem: str, suffix: str) -> Path:
 
 
 def _csv_rows(rows: Iterable[dict[str, Any]]) -> Iterable[dict[str, Any]]:
-    omitted = {"best_split_trees"}
+    omitted = {"best_split_trees", "restart_results"}
     for row in rows:
         yield {key: value for key, value in row.items() if key not in omitted}
 
@@ -330,6 +359,7 @@ def write_model_json(
             "kv_cache_dtype": first["kv_cache_dtype"],
             "warmup_rounds_per_workload": first["warmup_rounds"],
             "rounds_per_workload": first["rounds"],
+            "restart_count_per_workload": first["restart_count"],
             "initial_temperature": first["initial_temperature"],
             "final_temperature": first["final_temperature"],
             "layer_count": first["layer_count"],

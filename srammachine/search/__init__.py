@@ -1,12 +1,14 @@
 """SplitTree direct execution and HVI-guided simulated annealing."""
 
-from .config import SimulatedAnnealingConfig, derive_workload_seed
+from .config import (
+    SimulatedAnnealingConfig, derive_restart_seed, derive_workload_seed,
+)
 from .hypervolume import (
     HypervolumeBounds, dominates, hypervolume_2d,
     hypervolume_improvement, nondominated_points,
 )
 from .optimizer import (
-    ParetoPoint, SplitTreeEvaluation, SplitTreeOptimizer,
+    AnnealingRestartResult, ParetoPoint, SplitTreeEvaluation, SplitTreeOptimizer,
     SplitTreeSearchResult, WorkloadSearchResult,
 )
 from .serialization import (
@@ -16,9 +18,9 @@ from .serialization import (
 __all__ = [
     "SimulatedAnnealingConfig", "SplitTreeOptimizer", "SplitTreeEvaluation",
     "ParetoPoint", "SplitTreeSearchResult", "HypervolumeBounds",
-    "WorkloadSearchResult",
+    "WorkloadSearchResult", "AnnealingRestartResult",
     "dominates", "nondominated_points", "hypervolume_2d",
     "hypervolume_improvement", "split_tree_to_dict",
     "split_tree_from_dict", "load_pareto_split_tree",
-    "derive_workload_seed",
+    "derive_workload_seed", "derive_restart_seed",
 ]

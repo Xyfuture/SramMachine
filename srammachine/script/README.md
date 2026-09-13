@@ -81,7 +81,7 @@ python -m srammachine.script.run_sa --models deepseek-v3.2 --mtp off on --batch-
 | `--models` | 一个或多个模型名称 |
 | `--mtp` | `off`、`on`，也可以同时指定 |
 | `--batch-sizes` | 一个或多个全局 batch size |
-| `--rounds` | 每个独立 case 的正式 SA 轮数 |
+| `--rounds` | 每次 restart 的正式 SA 轮数 |
 | `--input-sequence-length` | decoding 时使用的历史上下文长度 |
 | `--output-sequence-length` | 输出长度元数据 |
 | `--moe-strategy` | MoE 并行策略：`tp` 或 `ep` |
@@ -96,6 +96,7 @@ python -m srammachine.script.run_sa --models deepseek-v3.2 --mtp off on --batch-
 | `--final-temperature` | `0.01` | 最终温度 |
 | `--layer-count` | `4` | 用于估算稳态层间隔的代表层数量 |
 | `--seed` | `20260912` | SA 基础随机种子 |
+| `--restarts` | `4` | 每个 case 的确定性完整重启次数 |
 | `--workers` | 自动 | 最大并行 worker 进程数 |
 | `--output-dir` | `best split tree result` | CSV 和 JSON 默认输出目录 |
 | `--output-csv` | 自动命名 | 指定汇总 CSV 的完整路径 |
@@ -137,7 +138,9 @@ MTP 关闭时 `accepted_tokens_per_step=1`；MTP1 开启时假设第二个 token
 
 ## 使用注意事项
 
-- `--rounds` 是每个 `(model, batch, MTP)` case 的轮数，不是所有 case 共用的总轮数。
+- `--rounds` 是每次 restart 的正式轮数；`--warmup-rounds` 也会在每次 restart 中完整执行。
+- 默认每个 `(model, batch, MTP)` case 运行4次 restart，因此正式 proposal 总数为 `case数 × 4 × --rounds`。
+- 各 restart 使用稳定且不同的随机种子，搜索状态相互独立，但会共享同一 case 已完成的仿真评分以避免重复运行 Desim。
 - case 数量等于 `模型数 × batch 数 × MTP 状态数`。
 - 默认会使用尽可能多的逻辑核心；大型搜索也会占用较多内存，必要时使用 `--workers` 限制并发。
 - 不同 case 位于独立进程中，不共享 Desim 状态或 SA 搜索轨迹。

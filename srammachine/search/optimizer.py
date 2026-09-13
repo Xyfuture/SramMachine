@@ -16,10 +16,30 @@ from srammachine.mapping import (
 from srammachine.pipetree import PipeTree, TreeParser
 from srammachine.simulator import SimulationResult, Simulator
 
-from .config import SimulatedAnnealingConfig, derive_workload_seed
+from .config import (
+    SimulatedAnnealingConfig, derive_restart_seed, derive_workload_seed,
+)
 from .hypervolume import HypervolumeBounds, dominates, hypervolume_improvement
 from .mutations import legal_tree_mutations, rebind_split_tree
 from .serialization import split_tree_to_dict
+
+
+def _select_proposal(candidates, rng, score_cache, tree_key, parse):
+    """Prefer a valid, globally unevaluated neighbor over cached neighbors."""
+    shuffled = list(candidates)
+    rng.shuffle(shuffled)
+    cached = []
+    for tree in shuffled:
+        key = tree_key(tree)
+        if key in score_cache:
+            cached.append(tree)
+            continue
+        graph = parse(tree)
+        if graph is not None:
+            return tree, graph
+    if cached:
+        return cached[0], None
+    raise ValueError("annealing candidate has no legal neighbors")
 
 
 @dataclass(frozen=True)
@@ -116,6 +136,34 @@ class ParetoPoint:
 
 
 @dataclass(frozen=True)
+class AnnealingRestartResult:
+    """Search statistics for one deterministic annealing restart."""
+
+    restart_index: int
+    random_seed: int
+    proposal_count: int
+    candidate_simulation_count: int
+    cache_hit_count: int
+    accepted_proposal_count: int
+    normalization_bounds: HypervolumeBounds
+
+    def __post_init__(self) -> None:
+        if type(self.restart_index) is not int or self.restart_index < 0:
+            raise ValueError("restart_index must be a nonnegative integer")
+        if type(self.random_seed) is not int:
+            raise TypeError("random_seed must be an integer")
+        for name in (
+            "proposal_count", "candidate_simulation_count", "cache_hit_count",
+            "accepted_proposal_count",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+        if not isinstance(self.normalization_bounds, HypervolumeBounds):
+            raise TypeError("normalization_bounds must be HypervolumeBounds")
+
+
+@dataclass(frozen=True)
 class WorkloadSearchResult:
     """Independent SplitTree search result for one fixed batch/MTP workload."""
 
@@ -132,14 +180,37 @@ class WorkloadSearchResult:
     normalization_bounds: HypervolumeBounds
     initial_tree_fallback: bool
     random_seed: int = 20260912
+    restart_results: Tuple[AnnealingRestartResult, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.random_seed) is not int:
             raise TypeError("random_seed must be an integer")
+        restarts = tuple(self.restart_results)
+        if not restarts or any(
+            not isinstance(item, AnnealingRestartResult) for item in restarts
+        ):
+            raise ValueError("restart_results must contain restart statistics")
+        if tuple(item.restart_index for item in restarts) != tuple(range(len(restarts))):
+            raise ValueError("restart indices must be contiguous from zero")
+        for aggregate_name in (
+            "proposal_count", "candidate_simulation_count", "cache_hit_count",
+            "accepted_proposal_count",
+        ):
+            if getattr(self, aggregate_name) != sum(
+                getattr(item, aggregate_name) for item in restarts
+            ):
+                raise ValueError(
+                    f"{aggregate_name} must equal the sum across restarts"
+                )
         best = tuple(self.best_evaluations)
         if not best or any(not isinstance(item, SplitTreeEvaluation) for item in best):
             raise ValueError("best_evaluations must contain evaluations")
         object.__setattr__(self, "best_evaluations", best)
+        object.__setattr__(self, "restart_results", restarts)
+
+    @property
+    def restart_count(self) -> int:
+        return len(self.restart_results)
 
     @property
     def best_evaluation(self) -> SplitTreeEvaluation:
@@ -483,57 +554,82 @@ class SplitTreeOptimizer:
             start_tree, retain_full=(start_tree != baseline_tree),
         )
 
-        rng = random.Random(seed)
+        def proposal(current: _CandidateScore, rng: random.Random):
+            return _select_proposal(
+                (tree for _, tree in legal_tree_mutations(current.split_tree)),
+                rng, score_cache, self._tree_key, parse,
+            )
 
-        def proposal(current: _CandidateScore):
-            candidates = [tree for _, tree in legal_tree_mutations(current.split_tree)]
-            rng.shuffle(candidates)
-            for tree in candidates:
-                key = self._tree_key(tree)
-                if key in score_cache:
-                    return tree, None
-                graph = parse(tree)
-                if graph is not None:
-                    return tree, graph
-            raise ValueError("annealing candidate has no legal neighbors")
+        combined_archive = []
+        all_warmup = []
+        restart_results = []
+        setup_simulations = candidate_simulations
+        setup_cache_hits = cache_hits
+        for restart_index in range(self._config.restart_count):
+            restart_seed = derive_restart_seed(seed, restart_index)
+            rng = random.Random(restart_seed)
+            simulations_before = candidate_simulations
+            hits_before = cache_hits
 
-        warmup = [baseline_score, start_score]
-        warm_current = start_score
-        for _ in range(self._config.warmup_rounds):
-            tree, graph = proposal(warm_current)
-            warm_current = score(tree, graph)
-            warmup.append(warm_current)
-        bounds = HypervolumeBounds.from_points(
-            item.objective_point for item in warmup
+            warmup = [baseline_score, start_score]
+            warm_current = start_score
+            for _ in range(self._config.warmup_rounds):
+                tree, graph = proposal(warm_current, rng)
+                warm_current = score(tree, graph)
+                warmup.append(warm_current)
+            all_warmup.extend(warmup)
+            bounds = HypervolumeBounds.from_points(
+                item.objective_point for item in warmup
+            )
+            archive = []
+            for item in warmup:
+                archive = self._update_archive(archive, item)
+
+            # Continue from this restart's warmup endpoint. Each restart owns
+            # its state, bounds, temperature, and archive; only expensive
+            # simulation scores are shared across restarts.
+            current = warm_current
+            accepted = 0
+            for iteration in range(self._config.rounds):
+                tree, graph = proposal(current, rng)
+                candidate = score(tree, graph)
+                normalized_archive = tuple(
+                    bounds.normalize(item.objective_point) for item in archive
+                )
+                reward = hypervolume_improvement(
+                    normalized_archive, bounds.normalize(candidate.objective_point),
+                )
+                distance = self._domination_distance(archive, candidate, bounds)
+                archive = self._update_archive(archive, candidate)
+                temperature = self._temperature(self._config, iteration)
+                if reward > 0 or rng.random() < math.exp(-distance / temperature):
+                    current = candidate
+                    accepted += 1
+
+            for item in archive:
+                combined_archive = self._update_archive(combined_archive, item)
+            restart_results.append(AnnealingRestartResult(
+                restart_index=restart_index,
+                random_seed=restart_seed,
+                proposal_count=self._config.rounds,
+                candidate_simulation_count=(
+                    candidate_simulations - simulations_before
+                    + (setup_simulations if restart_index == 0 else 0)
+                ),
+                cache_hit_count=(
+                    cache_hits - hits_before
+                    + (setup_cache_hits if restart_index == 0 else 0)
+                ),
+                accepted_proposal_count=accepted,
+                normalization_bounds=bounds,
+            ))
+
+        workload_bounds = HypervolumeBounds.from_points(
+            item.objective_point for item in all_warmup
         )
-        archive = []
-        for item in warmup:
-            archive = self._update_archive(archive, item)
-
-        # Continue from the state reached by warmup.  Resetting to the baseline
-        # while retaining the stronger warmup archive makes ordinary stepping
-        # stones look dominated and can freeze the formal annealing walk.
-        current = warm_current
-        accepted = 0
-        for iteration in range(self._config.rounds):
-            tree, graph = proposal(current)
-            candidate = score(tree, graph)
-            normalized_archive = tuple(
-                bounds.normalize(item.objective_point) for item in archive
-            )
-            reward = hypervolume_improvement(
-                normalized_archive, bounds.normalize(candidate.objective_point),
-            )
-            distance = self._domination_distance(archive, candidate, bounds)
-            archive = self._update_archive(archive, candidate)
-            temperature = self._temperature(self._config, iteration)
-            if reward > 0 or rng.random() < math.exp(-distance / temperature):
-                current = candidate
-                accepted += 1
-
-        best_point = max(item.objective_point for item in archive)
+        best_point = max(item.objective_point for item in combined_archive)
         best_scores = tuple(
-            item for item in archive if item.objective_point == best_point
+            item for item in combined_archive if item.objective_point == best_point
         )
         baseline_evaluation = materialize(baseline_score)
         initial_evaluation = materialize(start_score)
@@ -548,14 +644,17 @@ class SplitTreeOptimizer:
             baseline_evaluation=baseline_evaluation,
             initial_evaluation=initial_evaluation,
             best_evaluations=best_evaluations,
-            proposal_count=self._config.rounds,
+            proposal_count=self._config.rounds * self._config.restart_count,
             candidate_simulation_count=candidate_simulations,
             materialization_simulation_count=materializations,
             cache_hit_count=cache_hits,
-            accepted_proposal_count=accepted,
-            normalization_bounds=bounds,
+            accepted_proposal_count=sum(
+                item.accepted_proposal_count for item in restart_results
+            ),
+            normalization_bounds=workload_bounds,
             initial_tree_fallback=fallback,
             random_seed=seed,
+            restart_results=tuple(restart_results),
         )
 
     @staticmethod
@@ -646,6 +745,7 @@ class SplitTreeOptimizer:
                 "mtp_values": list(self._config.mtp_values),
                 "warmup_rounds_per_workload": self._config.warmup_rounds,
                 "rounds_per_workload": self._config.rounds,
+                "restart_count_per_workload": self._config.restart_count,
                 "random_seed": self._config.random_seed,
                 "initial_temperature": self._config.initial_temperature,
                 "final_temperature": self._config.final_temperature,
@@ -700,6 +800,23 @@ class SplitTreeOptimizer:
             "global_batch_size": item.global_batch_size,
             "mtp_enabled": item.mtp_enabled,
             "random_seed": item.random_seed,
+            "restart_count": item.restart_count,
+            "restart_results": [
+                {
+                    "restart_index": restart.restart_index,
+                    "random_seed": restart.random_seed,
+                    "proposal_count": restart.proposal_count,
+                    "candidate_simulation_count": (
+                        restart.candidate_simulation_count
+                    ),
+                    "cache_hit_count": restart.cache_hit_count,
+                    "accepted_proposal_count": restart.accepted_proposal_count,
+                    "normalization_bounds": cls._bounds_payload(
+                        restart.normalization_bounds
+                    ),
+                }
+                for restart in item.restart_results
+            ],
             "baseline_latency_ns": baseline.latency_ns,
             "best_latency_ns": best.latency_ns,
             "latency_reduction_fraction": item.latency_reduction_fraction,
@@ -746,6 +863,7 @@ class SplitTreeOptimizer:
 
 
 __all__ = [
-    "SplitTreeEvaluation", "ParetoPoint", "WorkloadSearchResult",
+    "SplitTreeEvaluation", "ParetoPoint", "AnnealingRestartResult",
+    "WorkloadSearchResult",
     "SplitTreeSearchResult", "SplitTreeOptimizer",
 ]
