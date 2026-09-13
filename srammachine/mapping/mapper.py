@@ -156,8 +156,10 @@ class HardwareMappingResult:
         loads = tuple(self.expert_token_loads)
         if len(loads) != self.model_config.num_experts:
             raise ValueError("expert_token_loads must cover every routed expert")
-        if any(type(load) is not int or load <= 0 for load in loads):
-            raise ValueError("every routed expert must have a positive token load")
+        if any(type(load) is not int or load < 0 for load in loads):
+            raise ValueError("routed expert token loads must be nonnegative integers")
+        if not any(loads):
+            raise ValueError("at least one routed expert must have a positive token load")
         if not isinstance(self.root_node, RootNode):
             raise TypeError("root_node must be a RootNode")
         operators = dict(self.operators)
@@ -690,10 +692,13 @@ class HardwareMapper:
             * inference.accepted_tokens_per_step
             * model.top_k
         )
-        if assignments < model.num_experts:
+        if (
+            inference.moe_parallel_strategy is MoEParallelStrategy.EP
+            and assignments < chips
+        ):
             raise ValueError(
-                "batch is too small to activate every routed expert under "
-                "the balanced-routing assumption"
+                "EP batch is too small to activate at least one routed expert "
+                "on every chip under the balanced-routing assumption"
             )
         _exact_div(model.num_attention_heads, dies, "attention heads")
         _exact_div(
@@ -1125,11 +1130,35 @@ class HardwareMapper:
     def _balanced_expert_loads(
         global_batch: int, top_k: int, num_experts: int,
     ) -> Tuple[int, ...]:
-        # The representative balanced-routing model intentionally rounds down:
-        # every expert receives the same whole-number load and any remainder
-        # assignments are omitted instead of creating a second imbalance group.
-        base = global_batch * top_k // num_experts
-        return (base,) * num_experts
+        """Return deterministic TP loads, allowing a sparse active subset."""
+        assignments = global_batch * top_k
+        if assignments >= num_experts:
+            # Preserve the established large-batch model: every expert gets
+            # the same floored load and the remainder is intentionally omitted.
+            base = assignments // num_experts
+            return (base,) * num_experts
+        # Routed experts are shape-equivalent here, so deterministic low IDs
+        # represent the sparse active subset without changing critical latency.
+        return (1,) * assignments + (0,) * (num_experts - assignments)
+
+    @staticmethod
+    def _balanced_ep_expert_loads(
+        global_batch: int, top_k: int, num_experts: int,
+        ownership: Sequence[Sequence[int]],
+    ) -> Tuple[int, ...]:
+        """Return equal per-chip EP pressure with deterministic sparse experts."""
+        assignments = global_batch * top_k
+        if assignments >= num_experts:
+            base = assignments // num_experts
+            return (base,) * num_experts
+        assignments_per_chip = assignments // len(ownership)
+        loads = [0] * num_experts
+        for expert_ids in ownership:
+            if assignments_per_chip > len(expert_ids):
+                raise ValueError("EP sparse load exceeds one chip's expert ownership")
+            for expert_id in expert_ids[:assignments_per_chip]:
+                loads[expert_id] = 1
+        return tuple(loads)
 
     @staticmethod
     def _groups_for_experts(
@@ -1137,6 +1166,8 @@ class HardwareMapper:
     ) -> Tuple[Tuple[Tuple[int, ...], int], ...]:
         grouped = {}
         for expert_id in expert_ids:
+            if loads[expert_id] == 0:
+                continue
             grouped.setdefault(loads[expert_id], []).append(expert_id)
         return tuple(
             (tuple(grouped[token_count]), token_count)
@@ -1200,10 +1231,7 @@ class HardwareMapper:
             n_partitions = pu_columns // expert_partitions
             up_overrides = {
                 "pu_dimensions_override": self._dims(
-                    _exact_div(
-                        expert_count, expert_partitions,
-                        "EP experts for Up/Gate PU partition",
-                    ),
+                    _ceil_div(expert_count, expert_partitions),
                     tokens_per_expert,
                     _exact_div(
                         model.hidden_size, pu_rows,
@@ -1214,17 +1242,16 @@ class HardwareMapper:
                         "EP Up/Gate N dimension",
                     ),
                 ),
-                "pu_weight_batches": expert_count // expert_partitions,
+                "pu_weight_batches": _ceil_div(
+                    expert_count, expert_partitions,
+                ),
                 "input_group": builder.representative_pu_row[:n_partitions],
             }
         elif is_tp:
             # Keep the die-local K/N shards whole within one PU.  Distinct
             # PUs own distinct experts, preserving PU FLOPs and weight bytes
             # without replicating the long input across a PU row.
-            pu_experts = _exact_div(
-                expert_count, pu_count,
-                "TP experts for Up/Gate PU partition",
-            )
+            pu_experts = _ceil_div(expert_count, pu_count)
             up_overrides = {
                 "pu_dimensions_override": self._dims(
                     pu_experts,
@@ -1332,9 +1359,7 @@ class HardwareMapper:
                 model.hidden_size, len(builder.die_group),
                 "EP Down hidden dimension",
             )
-            down_pu_experts = _exact_div(
-                expert_count, pu_rows, "EP experts for Down PU partition",
-            )
+            down_pu_experts = _ceil_div(expert_count, pu_rows)
             down_die_dimensions = self._dims(
                 expert_count, tokens_per_expert,
                 model.moe_intermediate_size, die_hidden,
@@ -1360,9 +1385,7 @@ class HardwareMapper:
             # Invert the Up/Gate layout: chips shard Down K and dies shard N.
             # PUs again partition experts only, so both local transfers are
             # p2p rather than a broadcast/reduce across a PU row or column.
-            down_pu_experts = _exact_div(
-                expert_count, pu_count, "TP experts for Down PU partition",
-            )
+            down_pu_experts = _ceil_div(expert_count, pu_count)
             down_die_dimensions = self._dims(
                 expert_count, tokens_per_expert,
                 chip_intermediate,
@@ -1544,18 +1567,6 @@ class HardwareMapper:
         local_batch = _ceil_div(base_global_batch, chips) * token_multiplier
         dtype = _ACTIVATION_DTYPE_BYTES
         strategy = "moe_ep_die_tp4"
-        loads = self._balanced_expert_loads(
-            global_batch, model.top_k, model.num_experts,
-        )
-        # Expert-load flooring may discard a small assignment remainder.  Use
-        # that effective routed total for dispatch so all-to-all row and owner
-        # column totals remain physically consistent.
-        effective_assignments = sum(loads)
-        batch_base, batch_remainder = divmod(effective_assignments, chips)
-        row_totals = tuple(
-            batch_base + (chip < batch_remainder)
-            for chip in range(chips)
-        )
         experts_per_chip = _ceil_div(model.num_experts, chips)
         ownership = tuple(
             tuple(range(
@@ -1565,6 +1576,15 @@ class HardwareMapper:
         )
         if len(ownership) != chips:
             raise ValueError("expert ownership must produce one shard per chip")
+        loads = self._balanced_ep_expert_loads(
+            global_batch, model.top_k, model.num_experts, ownership,
+        )
+        # Sparse EP discards assignments that cannot form a complete equal
+        # round across all chips. Use the resulting routed total consistently
+        # for both dispatch rows and expert-owner columns.
+        effective_assignments = sum(loads)
+        assignments_per_chip = effective_assignments // chips
+        row_totals = (assignments_per_chip,) * chips
         builder.expert_token_loads = loads
         builder.expert_ownership = ownership
         column_totals = tuple(

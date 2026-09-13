@@ -6,7 +6,7 @@ Invoke from the SramMachine project directory, for example::
       --models deepseek-v3 deepseek-v3.2 \
       --mtp off on --batch-sizes 256 512 --rounds 50 \
       --input-sequence-length 20000 --output-sequence-length 600 \
-      --moe-strategy tp
+      --moe-strategy tp ep
 
 Desim owns process-global simulation state.  Each workload therefore runs in
 its own process; using threads here would let concurrent cases reset each
@@ -83,7 +83,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run one independent SplitTree simulated-annealing search per "
-            "(model, batch, MTP) case and export throughput comparisons."
+            "(model, MoE strategy, batch, MTP) case and export throughput "
+            "comparisons."
         ),
     )
     parser.add_argument("--models", nargs="+", required=True, choices=SUPPORTED_MODELS)
@@ -103,7 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-sequence-length", required=True, type=_positive_int,
     )
     parser.add_argument(
-        "--moe-strategy", required=True, choices=("tp", "ep"),
+        "--moe-strategy", nargs="+", required=True, choices=("tp", "ep"),
     )
     parser.add_argument(
         "--kv-cache-dtype", choices=("fp8", "fp16"), default="fp8",
@@ -134,12 +135,17 @@ def _validate_args(
         parser.error("--mtp must not contain duplicates")
     if len(set(args.batch_sizes)) != len(args.batch_sizes):
         parser.error("--batch-sizes must not contain duplicates")
+    if len(set(args.moe_strategy)) != len(args.moe_strategy):
+        parser.error("--moe-strategy must not contain duplicates")
     if args.final_temperature > args.initial_temperature:
         parser.error("--final-temperature must not exceed --initial-temperature")
     if args.output_csv is not None and args.output_csv.exists():
         parser.error(f"--output-csv already exists: {args.output_csv}")
     args.batch_sizes = sorted(args.batch_sizes)
     args.mtp = sorted(args.mtp, key=lambda value: value == "on")
+    args.moe_strategy = sorted(
+        args.moe_strategy, key=lambda value: ("tp", "ep").index(value),
+    )
     return args
 
 
@@ -151,7 +157,7 @@ def _make_cases(args: argparse.Namespace) -> list[SACase]:
             mtp_enabled=mtp == "on",
             input_sequence_length=args.input_sequence_length,
             output_sequence_length=args.output_sequence_length,
-            moe_strategy=args.moe_strategy,
+            moe_strategy=strategy,
             kv_cache_dtype=args.kv_cache_dtype,
             warmup_rounds=args.warmup_rounds,
             rounds=args.rounds,
@@ -162,6 +168,7 @@ def _make_cases(args: argparse.Namespace) -> list[SACase]:
             base_seed=args.seed,
         )
         for model in args.models
+        for strategy in args.moe_strategy
         for batch in args.batch_sizes
         for mtp in args.mtp
     ]
@@ -328,11 +335,16 @@ def write_csv(path: Path, rows: Sequence[dict[str, Any]]) -> None:
 
 
 def write_model_json(
-    path: Path, model: str, rows: Sequence[dict[str, Any]],
+    path: Path, model: str, strategy: str, rows: Sequence[dict[str, Any]],
     *, generated_at: str, detected_cpus: int, worker_count: int,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    workloads = [dict(row) for row in rows if row["model"] == model]
+    workloads = [
+        dict(row) for row in rows
+        if row["model"] == model and row["moe_strategy"] == strategy
+    ]
+    if not workloads:
+        raise ValueError("model/strategy has no workload rows")
     front = [{
         "global_batch_size": row["global_batch_size"],
         "mtp_enabled": row["mtp_enabled"],
@@ -390,13 +402,15 @@ def _execute(cases: Sequence[SACase], worker_count: int) -> list[dict[str, Any]]
                     pending.cancel()
                 raise RuntimeError(
                     "SA case failed: "
-                    f"model={case.model}, batch={case.global_batch_size}, "
+                    f"model={case.model}, strategy={case.moe_strategy}, "
+                    f"batch={case.global_batch_size}, "
                     f"mtp={'on' if case.mtp_enabled else 'off'}"
                 ) from error
             results.append(result)
             print(
                 "completed "
-                f"model={case.model} batch={case.global_batch_size} "
+                f"model={case.model} strategy={case.moe_strategy} "
+                f"batch={case.global_batch_size} "
                 f"mtp={'on' if case.mtp_enabled else 'off'} "
                 "best="
                 f"{result['pareto_best_total_throughput_tokens_per_second']:.3f} "
@@ -424,8 +438,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     results = _execute(cases, workers)
     model_rank = {model: index for index, model in enumerate(args.models)}
+    strategy_rank = {
+        strategy: index for index, strategy in enumerate(args.moe_strategy)
+    }
     results.sort(key=lambda row: (
-        model_rank[row["model"]], row["global_batch_size"], row["mtp_enabled"],
+        model_rank[row["model"]], strategy_rank[row["moe_strategy"]],
+        row["global_batch_size"], row["mtp_enabled"],
     ))
     results = mark_model_pareto(results)
 
@@ -442,16 +460,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     json_paths = []
     for model in args.models:
-        path = _unique_path(
-            output_dir,
-            f"{minute}_{_safe_name(model)}_{args.moe_strategy}_sa_best_splittrees",
-            ".json",
-        )
-        write_model_json(
-            path, model, results, generated_at=generated_at,
-            detected_cpus=detected, worker_count=workers,
-        )
-        json_paths.append(path)
+        for strategy in args.moe_strategy:
+            path = _unique_path(
+                output_dir,
+                f"{minute}_{_safe_name(model)}_{strategy}_sa_best_splittrees",
+                ".json",
+            )
+            write_model_json(
+                path, model, strategy, results, generated_at=generated_at,
+                detected_cpus=detected, worker_count=workers,
+            )
+            json_paths.append(path)
 
     print(f"CSV: {csv_path}")
     for path in json_paths:
