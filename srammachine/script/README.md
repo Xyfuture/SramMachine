@@ -56,6 +56,8 @@ python -m srammachine.script.run_sa --help
 min(系统逻辑核心数, case 数量)
 ```
 
+Batch size会按降序进入任务队列，使耗时通常更长的大batch优先运行，减少并行末期只剩少数重型case的长尾。不同batch之间没有同步屏障；任一worker空闲后都会立即领取队列中的下一项。完整CSV也按batch降序整理，运行中checkpoint仍按实际完成顺序追加。
+
 可通过 `--workers` 手动限制进程数。如果内存不足，建议降低该值。
 
 每个 case 默认执行4次完整且确定性的 restart。各 restart 的温度、预热边界和接受链相互独立，但共享该 case 已完成的仿真评分。邻居生成会优先探索尚未评估的合法 SplitTree，只有当前树的全部直接邻居都已评估后才回退到缓存候选。

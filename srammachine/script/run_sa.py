@@ -159,7 +159,9 @@ def _validate_args(
         parser.error("--final-temperature must not exceed --initial-temperature")
     if args.output_csv is not None and args.output_csv.exists():
         parser.error(f"--output-csv already exists: {args.output_csv}")
-    args.batch_sizes = sorted(args.batch_sizes)
+    # Submit the heaviest workloads first.  There is no barrier between batch
+    # sizes: each replacement worker immediately takes the next queued case.
+    args.batch_sizes = sorted(args.batch_sizes, reverse=True)
     args.mtp = sorted(args.mtp, key=lambda value: value == "on")
     args.moe_strategy = sorted(
         args.moe_strategy, key=lambda value: ("tp", "ep").index(value),
@@ -553,7 +555,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     results.sort(key=lambda row: (
         model_rank[row["model"]], strategy_rank[row["moe_strategy"]],
-        row["global_batch_size"], row["mtp_enabled"],
+        -row["global_batch_size"], row["mtp_enabled"],
     ))
     results = mark_model_pareto(results)
 
