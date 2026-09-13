@@ -50,7 +50,7 @@ conda activate SramMachine
 python -m srammachine.script.run_sa --help
 ```
 
-脚本将每个 `(model, MoE strategy, batch size, MTP)` 组合视为一个独立 SA case。由于 Desim 使用进程内全局仿真状态，脚本采用多进程而不是多线程。默认并发数为：
+脚本将每个 `(model, MoE strategy, batch size, MTP)` 组合视为一个独立 SA case。由于 Desim 使用进程内全局仿真状态，脚本采用多进程而不是多线程。每个 worker 只运行一个 case，完成后立即退出，由操作系统完整回收 Desim、greenlet 和 Python/native allocator 占用，再创建新 worker 处理后续 case。默认并发数为：
 
 ```text
 min(系统逻辑核心数, case 数量)
@@ -169,6 +169,7 @@ Pareto front 只在固定配置内部计算。分组字段包括模型、MoE策�
 - case 数量等于 `模型数 × MoE策略数 × batch数 × MTP状态数`。
 - 默认会使用尽可能多的逻辑核心；大型搜索也会占用较多内存，必要时使用 `--workers` 限制并发。
 - 不同 case 位于独立进程中，不共享 Desim 状态或 SA 搜索轨迹。
+- worker在每个case结束后都会回收，因此已完成case不会持续累积内存。峰值内存通常约为`并发worker数 × 单个最大case内存`；若峰值过高，应降低`--workers`。
 - 一个命令可以同时指定`--moe-strategy tp ep`；汇总CSV合并两种策略，每种策略单独导出JSON。
 - 显式指定的 `--output-csv` 如果已经存在，脚本会拒绝覆盖。
 - 普通 SA 搜索不会生成 Perfetto trace；需要分析逐 command 时间线时，应对选定 SplitTree 单独调用 Simulator 的 trace 接口。

@@ -16,6 +16,13 @@ from .records import CommandExecution
 from .vector_costs import vector_flop_count
 
 
+# Desim does not provide lifecycle management for persistent SimModule workers.
+# A private sentinel lets GraphExecutor stop every resource coroutine cleanly
+# after the final command, instead of leaving suspended greenlets retaining the
+# graph, FIFOs, events, and their Python stacks between Simulator.run() calls.
+_STAGE_STOP = object()
+
+
 def _rate_duration_ns(work, rate) -> int:
     if work == 0:
         return 0
@@ -73,6 +80,7 @@ class HardwareResourceStage(SimModule, ABC):
         self.completion_fifo = completion_fifo
         self.command_fifo = FIFO(1)
         self._outstanding = False
+        self._closed = False
         self.register_coroutine(self._process)
 
     @property
@@ -80,11 +88,24 @@ class HardwareResourceStage(SimModule, ABC):
         return self._outstanding
 
     def submit(self, command: Command) -> None:
+        if self._closed:
+            raise RuntimeError(f"resource stage is closed: {self.resource_id}")
         self._validate_command(command)
         if self._outstanding:
             raise RuntimeError(f"resource stage is busy: {self.resource_id}")
         self._outstanding = True
         self.command_fifo.write(command)
+
+    def close(self) -> None:
+        """Stop this stage after its currently submitted command has completed."""
+        if self._closed:
+            return
+        if self._outstanding:
+            raise RuntimeError(
+                f"cannot close busy resource stage: {self.resource_id}"
+            )
+        self._closed = True
+        self.command_fifo.write(_STAGE_STOP)
 
     def _validate_command(self, command: Command) -> None:
         if not isinstance(command, self.accepted_command_types):
@@ -96,6 +117,8 @@ class HardwareResourceStage(SimModule, ABC):
     def _process(self) -> None:
         while True:
             command = self.command_fifo.read()
+            if command is _STAGE_STOP:
+                return
             start_time_ns = SimSession.sim_time.cycle
             duration_ns = self.latency_ns(command)
             if type(duration_ns) is not int or duration_ns < 0:

@@ -16,7 +16,6 @@ other's ``SimSession``.
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -26,6 +25,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import traceback
 from typing import Any, Iterable, Sequence
 
 from srammachine.hardware import DEFAULT_HARDWARE_CONFIG
@@ -270,6 +270,16 @@ def _run_case(case: SACase) -> dict[str, Any]:
     }
 
 
+def _run_case_envelope(
+    case: SACase,
+) -> tuple[SACase, dict[str, Any] | None, str | None]:
+    """Return a serializable result while retaining failing case context."""
+    try:
+        return case, _run_case(case), None
+    except BaseException:
+        return case, None, traceback.format_exc()
+
+
 def _dominates(left: dict[str, Any], right: dict[str, Any]) -> bool:
     left_single = left["pareto_best_single_user_throughput_per_second"]
     left_total = left["pareto_best_total_throughput_tokens_per_second"]
@@ -390,22 +400,22 @@ def write_model_json(
 def _execute(cases: Sequence[SACase], worker_count: int) -> list[dict[str, Any]]:
     results = []
     context = multiprocessing.get_context("spawn")
-    executor = ProcessPoolExecutor(max_workers=worker_count, mp_context=context)
-    futures = {executor.submit(_run_case, case): case for case in cases}
+    # One process handles exactly one case.  Besides isolating Desim's global
+    # session, this makes the OS reclaim greenlet stacks and native allocator
+    # arenas before a later case starts (especially important on Windows).
+    pool = context.Pool(processes=worker_count, maxtasksperchild=1)
     try:
-        for future in as_completed(futures):
-            case = futures[future]
-            try:
-                result = future.result()
-            except Exception as error:
-                for pending in futures:
-                    pending.cancel()
+        completed = pool.imap_unordered(_run_case_envelope, cases, chunksize=1)
+        for case, result, error_details in completed:
+            if error_details is not None:
                 raise RuntimeError(
                     "SA case failed: "
                     f"model={case.model}, strategy={case.moe_strategy}, "
                     f"batch={case.global_batch_size}, "
-                    f"mtp={'on' if case.mtp_enabled else 'off'}"
-                ) from error
+                    f"mtp={'on' if case.mtp_enabled else 'off'}\n"
+                    f"{error_details}"
+                )
+            assert result is not None
             results.append(result)
             print(
                 "completed "
@@ -417,8 +427,12 @@ def _execute(cases: Sequence[SACase], worker_count: int) -> list[dict[str, Any]]
                 "tokens/s",
                 flush=True,
             )
+        pool.close()
+    except BaseException:
+        pool.terminate()
+        raise
     finally:
-        executor.shutdown(wait=True, cancel_futures=True)
+        pool.join()
     return results
 
 

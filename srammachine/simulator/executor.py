@@ -4,6 +4,7 @@ import heapq
 from types import MappingProxyType
 
 from Desim import FIFO, SimModule, SimSession
+from greenlet import GreenletExit
 
 from srammachine.commands import CommandGraph
 from srammachine.hardware import DEFAULT_HARDWARE_CONFIG, HardwareConfig
@@ -133,6 +134,8 @@ class GraphExecutor(SimModule):
             for execution in batch:
                 self._commit(execution)
             self._dispatch_idle_resources()
+        for stage in self._stages.values():
+            stage.close()
 
     def result(self) -> ExecutionResult:
         """Return an immutable result after all commands have completed."""
@@ -164,12 +167,39 @@ class GraphExecutor(SimModule):
         """Run one graph in a fresh Desim global session."""
         SimSession.reset()
         SimSession.init()
-        executor = cls(graph, hardware_config)
-        SimSession.scheduler.run()
-        if not executor.is_complete:
-            incomplete = [
-                command.cmd_id for command in graph.commands
-                if executor.states[command.cmd_id] is not CommandState.COMPLETED
-            ]
-            raise RuntimeError(f"simulation deadlocked: {incomplete}")
-        return executor.result()
+        completed = False
+        try:
+            executor = cls(graph, hardware_config)
+            SimSession.scheduler.run()
+            if not executor.is_complete:
+                incomplete = [
+                    command.cmd_id for command in graph.commands
+                    if executor.states[command.cmd_id] is not CommandState.COMPLETED
+                ]
+                raise RuntimeError(f"simulation deadlocked: {incomplete}")
+            result = executor.result()
+            completed = True
+            return result
+        finally:
+            cls._release_session(completed)
+
+    @staticmethod
+    def _release_session(preserve_finished_scheduler: bool) -> None:
+        """Release Desim greenlet stacks and module references after one run."""
+        modules = tuple(SimSession.sim_modules)
+        for module in modules:
+            for coroutine in tuple(module._coroutines):
+                if not coroutine.dead:
+                    try:
+                        coroutine.throw(GreenletExit)
+                    except GreenletExit:
+                        pass
+                module._coroutines.discard(coroutine)
+
+        # Keeping the successfully finished scheduler preserves the existing
+        # public ability to inspect SimSession.sim_time after simulate().  The
+        # module registry can still be cleared, which releases the graph and all
+        # FIFO/Event ownership chains.  Failed sessions are unusable and reset.
+        SimSession.sim_modules = []
+        if not preserve_finished_scheduler:
+            SimSession.reset()
