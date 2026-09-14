@@ -105,6 +105,8 @@ def _command_parameters(
             "gemm_k": command.K,
             "gemm_n": command.N,
             "qk_flops": command.qk_flops,
+            "main_gemm_flops": command.main_gemm_flops,
+            "main_gemm_flops_override": command.main_gemm_flops_override,
             "relu_flops": command.relu_flops,
             "head_reduce_flops": command.head_reduce_flops,
             "total_flops": command.total_flops,

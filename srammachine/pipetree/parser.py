@@ -549,6 +549,12 @@ class TreeParser:
                 FusedIndexerScoreCmd
                 if isinstance(op, FusedIndexerScoreOp) else GemmCmd
             )
+            if isinstance(op, FusedIndexerScoreOp):
+                dimensions["main_gemm_flops_override"] = (
+                    None
+                    if op.main_gemm_flops_override is None
+                    else scale(op.main_gemm_flops_override)
+                )
             return command_type(**common, **dimensions)
         if isinstance(op, FlashAttentionOp):
             dimensions = {

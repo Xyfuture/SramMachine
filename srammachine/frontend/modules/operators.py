@@ -51,9 +51,26 @@ class BMMOp(Operator):
 class FusedIndexerScoreOp(BMMOp):
     """Full-K indexer QK with row-local ReLU and weighted head reduction."""
 
+    main_gemm_flops_override: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.main_gemm_flops_override is not None:
+            _integer(
+                "main_gemm_flops_override",
+                self.main_gemm_flops_override,
+                1,
+            )
+
     @property
     def qk_flops(self) -> int:
+        if self.main_gemm_flops_override is not None:
+            return self.main_gemm_flops_override
         return 2 * self.B * self.M * self.K * self.N
+
+    @property
+    def main_gemm_flops(self) -> int:
+        return self.qk_flops
 
     @property
     def relu_flops(self) -> int:

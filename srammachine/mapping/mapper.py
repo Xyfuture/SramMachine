@@ -315,6 +315,7 @@ class _LayerBuilder:
         output_suffix: str = "output_reduce",
         output_bytes_override: Optional[int] = None,
         fused_indexer_score: bool = False,
+        main_gemm_flops_override: Optional[int] = None,
         batch_scaling_unit_count: Optional[int] = None,
     ) -> None:
         for dimensions in (global_dimensions, chip_dimensions, die_dimensions):
@@ -365,6 +366,10 @@ class _LayerBuilder:
         if output_bytes_override is not None:
             _positive_integer("output_bytes_override", output_bytes_override)
             output_bytes = output_bytes_override
+        if main_gemm_flops_override is not None and not fused_indexer_score:
+            raise ValueError(
+                "main_gemm_flops_override requires fused_indexer_score"
+            )
         self.add_comm(
             f"{op_id}.{input_suffix}", f"{op_kind}_{input_suffix}",
             scope="intra_chip", kind=input_kind,
@@ -380,7 +385,12 @@ class _LayerBuilder:
             batch_scaling_unit_count=batch_scaling_unit_count,
         )
         operator_type = FusedIndexerScoreOp if fused_indexer_score else BMMOp
-        operator = operator_type(op_id, **pu_dimensions)
+        operator_kwargs = dict(pu_dimensions)
+        if fused_indexer_score:
+            operator_kwargs["main_gemm_flops_override"] = (
+                main_gemm_flops_override
+            )
+        operator = operator_type(op_id, **operator_kwargs)
         mapping = OperatorMapping(
             batch_axis, self.PU,
             self.DRAM if (
@@ -988,14 +998,17 @@ class HardwareMapper:
             raise ValueError("DSA model requires complete indexer dimensions")
         request = builder.request
         kv_dtype_bytes = request.inference_config.kv_cache_bytes_per_element
+        base_global_batch = request.inference_config.global_batch_size
+        token_multiplier = request.inference_config.accepted_tokens_per_step
         dies = self.hardware_config.chip.logic_die_count
         pu_rows = self.hardware_config.chip.logic_die.pu_mesh_rows
         pu_columns = self.hardware_config.chip.logic_die.pu_mesh_columns
-        global_batch = (
-            request.inference_config.global_batch_size
-            * request.inference_config.accepted_tokens_per_step
-        )
+        pu_count = dies * pu_rows * pu_columns
+        global_batch = base_global_batch * token_multiplier
         history = request.inference_config.input_sequence_length
+        local_req = _ceil_div(
+            base_global_batch, self.hardware_config.chip_count,
+        )
         local_heads = model.indexer_num_heads // dies
         chip_width = (
             model.indexer_num_heads * model.indexer_head_dim
@@ -1006,7 +1019,7 @@ class HardwareMapper:
             + model.indexer_head_dim + local_heads
         )
         # Query projections and per-head indexer weights are distinct die
-        # shards.  Only the shared 128-wide key projection is normalized.
+        # shards. Only the shared 128-wide key projection is normalized.
         effective_shared_key_width = _ceil_div(
             model.indexer_head_dim, dies,
         )
@@ -1058,6 +1071,64 @@ class HardwareMapper:
                 model.indexer_head_dim * kv_dtype_bytes
             ),
         )
+
+        # Preserve the old per-PU Q x K_cache GEMM work as an explicit scalar.
+        # The fused post-processing terms intentionally use the new BMKN.
+        old_pu_B = chip_batch
+        old_pu_M = _ceil_div(local_heads, pu_rows)
+        old_pu_N = _ceil_div(history, pu_columns)
+        old_main_gemm_flops = (
+            2 * old_pu_B * old_pu_M * model.indexer_head_dim * old_pu_N
+        )
+        top_k = min(2048, history)
+
+        if base_global_batch <= 128:
+            pu_dimensions = self._dims(
+                chip_batch, old_pu_M, model.indexer_head_dim, old_pu_N,
+            )
+            batch_partition_degree = 1
+            output_kind = "reduce"
+            output_group = None
+            output_suffix = "output_reduce"
+            output_bytes = (
+                chip_batch * old_pu_N * _ACTIVATION_DTYPE_BYTES
+            )
+            main_gemm_override = None
+        elif base_global_batch < 1024:
+            pu_per_req = _exact_div(
+                pu_count, local_req, "PU count per request",
+            )
+            pu_dimensions = self._dims(
+                token_multiplier, model.indexer_num_heads,
+                model.indexer_head_dim, _ceil_div(history, pu_per_req),
+            )
+            batch_partition_degree = local_req
+            output_kind = "p2p"
+            output_group = (builder.PU, "chip0.die0.output")
+            output_suffix = "output_transfer"
+            output_bytes = token_multiplier * top_k * 4
+            main_gemm_override = old_main_gemm_flops
+        else:
+            # At BS=1024 on a 32-chip system there are only 32 local
+            # requests. Inactive PUs are left idle; active PUs own one
+            # complete request. For local_req >= 64 the requested ratio is
+            # exact and each active PU owns req_per_pu requests.
+            req_per_pu = (
+                1 if local_req < pu_count else _exact_div(
+                    local_req, pu_count, "requests per PU",
+                )
+            )
+            pu_dimensions = self._dims(
+                req_per_pu * token_multiplier, model.indexer_num_heads,
+                model.indexer_head_dim, history,
+            )
+            batch_partition_degree = pu_count
+            output_kind = "p2p"
+            output_group = (builder.PU, "chip0.die0.output")
+            output_suffix = "output_transfer"
+            output_bytes = req_per_pu * token_multiplier * top_k * 2
+            main_gemm_override = old_main_gemm_flops
+
         builder.add_bmm(
             "attn.dsa_qk_score", "indexer_qk_score",
             global_dimensions=self._dims(
@@ -1073,7 +1144,7 @@ class HardwareMapper:
                 model.indexer_head_dim, history,
             ),
             parallel_strategy=strategy,
-            # The indexer key cache is the same on every die.  As for MLA KV,
+            # The indexer key cache is the same on every die. As for MLA KV,
             # model perfect chip-level sharing and stream one fourth of both
             # DRAM and SRAM traffic without adding a synthetic NoC transfer.
             dram_read_bytes_per_token=(
@@ -1086,41 +1157,36 @@ class HardwareMapper:
                 history * model.indexer_head_dim * kv_dtype_bytes
             ),
             batch_axis="B",
-            # PU rows own disjoint indexer-head groups, columns retain the
-            # history split, and each PU consumes full K. ReLU and weighted
-            # head aggregation stay local and are fused into this PU command.
-            pu_dimensions_override=self._dims(
-                chip_batch,
-                _ceil_div(local_heads, pu_rows),
-                model.indexer_head_dim,
-                _ceil_div(history, pu_columns),
-            ),
+            pu_dimensions_override=pu_dimensions,
             fused_indexer_score=True,
+            main_gemm_flops_override=main_gemm_override,
             sram_read_bytes_per_mapped_token=(
                 _shared_effective_bytes(
-                    model.indexer_head_dim * _ceil_div(history, pu_columns)
+                    model.indexer_head_dim * pu_dimensions["N"]
                     * kv_dtype_bytes,
                     dies,
                 )
             ),
             sram_read_logical_bytes_per_mapped_token=(
-                model.indexer_head_dim * _ceil_div(history, pu_columns)
+                model.indexer_head_dim * pu_dimensions["N"]
                 * kv_dtype_bytes
             ),
             sram_read_data_kind="dsa_key",
             shared_die_factor=dies,
-            output_bytes_override=(
-                chip_batch * _ceil_div(history, pu_columns)
-                * _ACTIVATION_DTYPE_BYTES
-            ),
+            batch_partition_degree=batch_partition_degree,
+            output_kind=output_kind,
+            output_group=output_group,
+            output_suffix=output_suffix,
+            output_bytes_override=output_bytes,
         )
-        builder.add_comm(
-            "attn.dsa_score_reduce", "indexer_score_reduce",
-            scope="intra_chip", kind="allreduce", group=builder.die_group,
-            size_bytes=chip_batch * history * _ACTIVATION_DTYPE_BYTES,
-            parallel_link_count=builder.die_collective_parallel_link_count,
-            parallel_strategy=strategy,
-        )
+        if base_global_batch <= 128:
+            builder.add_comm(
+                "attn.dsa_score_reduce", "indexer_score_reduce",
+                scope="intra_chip", kind="allreduce", group=builder.die_group,
+                size_bytes=chip_batch * history * _ACTIVATION_DTYPE_BYTES,
+                parallel_link_count=builder.die_collective_parallel_link_count,
+                parallel_strategy=strategy,
+            )
 
     @staticmethod
     def _balanced_expert_loads(
