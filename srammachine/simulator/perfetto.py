@@ -3,8 +3,10 @@
 from dataclasses import dataclass
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import re
+import tempfile
 from typing import Any, Mapping, Optional, Union
 
 from .results import SimulationResult
@@ -217,9 +219,24 @@ def export_perfetto_trace(
     directory = Path(output_dir)
     directory.mkdir(parents=True, exist_ok=True)
     path = _trace_path(directory, label, timestamp or datetime.now().astimezone())
-    with path.open("x", encoding="utf-8") as stream:
-        json.dump(_trace_payload(result), stream, ensure_ascii=False, indent=2)
-        stream.write("\n")
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", delete=False,
+            dir=directory, prefix=f".{path.name}.", suffix=".tmp",
+        ) as stream:
+            temporary_path = Path(stream.name)
+            json.dump(
+                _trace_payload(result), stream,
+                ensure_ascii=False, indent=2,
+            )
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
     return path
 
 

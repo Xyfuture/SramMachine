@@ -154,8 +154,9 @@ python -m srammachine.script.run_sa --models deepseek-v3 --mtp off on --batch-si
 1. 一份跨模型、MoE策略、batch和MTP的汇总CSV。
 2. 每个 `(model, MoE strategy, MTP)` 一份包含最优SplitTree的JSON；上述全量配置共16份。
 3. 每个case选择一棵最优SplitTree重放并导出一份Perfetto trace；上述全量配置共144份。
+4. `case checkpoints/<CSV文件名>/`目录中每个已完成case一份可独立重放的SplitTree JSON；上述全量配置共144份。
 
-CSV在worker启动前就会创建。每完成一个case，主进程会立刻追加该case的最终指标并强制刷新到磁盘。因此程序被终止或某个case失败时，已经完成的结果仍保留在启动时打印的`CSV checkpoint`路径中。部分CSV的`is_model_global_pareto`字段为空；只有全部case成功后，该文件才会被原子整理并写入最终Pareto标记。
+CSV在worker启动前就会创建。每个worker完成SA后，会先原子写入该case的SplitTree checkpoint，再生成并原子写入Perfetto trace；两者均成功后才向主进程报告case完成。主进程随后将完整指标、路径和PU利用率写入CSV并强制刷新。因此程序被终止或某个case失败时，已经报告完成的case仍保留CSV、SplitTree和trace。若恰好在某个case的trace重放期间退出，该case尚未记入CSV，但已经写好的SplitTree checkpoint仍会保留。部分CSV的`is_model_global_pareto`字段为空；只有全部case成功后，该文件才会写入最终Pareto标记。
 
 自动文件名以本地时间精确到分钟，并在重名时追加序号，不会覆盖已有结果。
 
@@ -182,7 +183,7 @@ CSV 的关键字段包括：
 
 MTP 关闭时 `accepted_tokens_per_step=1`；MTP1 开启时假设第二个 token 总能被接受，因此该值为 2。
 
-每个模型与MoE策略组合的JSON保存全部workload指标、跨batch/MTP的Pareto front、每次restart的统计，以及所有并列最优SplitTree。`best_split_trees_by_workload`明确列出每个batch和MTP状态的最佳树；其中`split_tree_records`的每一棵树都附带`global_batch_size`和`mtp_enabled`，因此MTP off/on不会混淆。旧的`split_trees`裸结构字段继续保留以兼容已有工具。JSON中的Pareto front树可以继续通过`load_pareto_split_tree()`读取和复现。
+每个模型、MoE策略和MTP组合的最终JSON保存全部batch workload指标、Pareto front、每次restart的统计，以及所有并列最优SplitTree。`best_split_trees_by_workload`明确列出每个batch的最佳树；其中`split_tree_records`的每一棵树都附带`global_batch_size`和`mtp_enabled`。旧的`split_trees`裸结构字段继续保留以兼容已有工具。最终JSON和case checkpoint中的树都可以通过`load_pareto_split_tree()`读取和复现。
 
 Pareto front 只在固定配置内部计算。分组字段包括模型、MoE策略、ISL、OSL、KV dtype、layer count和chip count；TP与EP或不同推理配置不会互相支配。CSV中的`pareto_best_*`表示固定workload内搜索到的最好结果，`is_model_global_pareto`表示该结果是否位于对应固定配置的跨batch/MTP Pareto front。
 
@@ -203,7 +204,7 @@ Pareto front 只在固定配置内部计算。分组字段包括模型、MoE策�
 - 默认会使用尽可能多的逻辑核心；大型搜索也会占用较多内存，必要时使用 `--workers` 限制并发。
 - 不同 case 位于独立进程中，不共享 Desim 状态或 SA 搜索轨迹。
 - worker在每个case结束后都会回收，因此已完成case不会持续累积内存。峰值内存通常约为`并发worker数 × 单个最大case内存`；若峰值过高，应降低`--workers`。
-- 一个命令可以同时指定`--moe-strategy tp ep`；汇总CSV合并两种策略，每种策略单独导出JSON。
+- 一个命令可以同时指定`--moe-strategy tp ep`；汇总CSV合并两种策略，最终JSON按模型、策略和MTP分别导出。
 - 显式指定的 `--output-csv` 如果已经存在，脚本会拒绝覆盖。
-- 全部case完成后，脚本会重放每个case选中的最优SplitTree并生成Perfetto trace和稳态PU利用率；trace阶段不增加SA搜索轮数。
-- 中断后保留的部分CSV只包含指标，不包含完整最佳SplitTree，也不会自动续跑；完整SplitTree JSON仍只在全部case成功后生成。
+- 每个case搜索完成后，脚本立即保存独立SplitTree checkpoint、重放该树并生成Perfetto trace和稳态PU利用率；trace阶段不增加SA搜索轮数。
+- 中断后，已完成case的CSV、独立SplitTree checkpoint和trace均保留；正在运行的case仍需重新搜索，脚本暂不自动续跑。

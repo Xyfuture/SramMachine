@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 import json
 import multiprocessing
@@ -87,6 +87,12 @@ class SACase:
     final_temperature: float
     layer_count: int
     base_seed: int
+    artifact_dir: str | None = None
+    case_checkpoint_dir: str | None = None
+    run_stamp: str | None = None
+    generated_at: str | None = None
+    detected_cpus: int | None = None
+    worker_count: int | None = None
 
 
 def _positive_int(value: str) -> int:
@@ -251,8 +257,14 @@ def _run_case(case: SACase) -> dict[str, Any]:
     workload = result.workload_results[0]
     baseline = workload.baseline_evaluation
     best = workload.best_evaluation
-    return {
-        **asdict(case),
+    case_fields = asdict(case)
+    for internal in (
+        "artifact_dir", "case_checkpoint_dir", "run_stamp",
+        "generated_at", "detected_cpus", "worker_count",
+    ):
+        case_fields.pop(internal)
+    row = {
+        **case_fields,
         "chip_count": DEFAULT_HARDWARE_CONFIG.chip_count,
         "case_seed": workload.random_seed,
         "restart_count": workload.restart_count,
@@ -296,6 +308,9 @@ def _run_case(case: SACase) -> dict[str, Any]:
             for item in workload.best_evaluations
         ],
     }
+    if case.artifact_dir is not None:
+        _persist_case_artifacts(row, case)
+    return row
 
 
 def _run_case_envelope(
@@ -423,8 +438,11 @@ def write_model_json(
     path: Path, model: str, strategy: str, mtp_enabled: bool,
     rows: Sequence[dict[str, Any]],
     *, generated_at: str, detected_cpus: int, worker_count: int,
+    overwrite: bool = False,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and not overwrite:
+        raise FileExistsError(path)
     workloads = [
         dict(row) for row in rows
         if (
@@ -504,9 +522,21 @@ def write_model_json(
         "best_split_trees_by_workload": best_by_workload,
         "pareto_front": front,
     }
-    with path.open("x", encoding="utf-8") as stream:
-        json.dump(payload, stream, ensure_ascii=False, indent=2)
-        stream.write("\n")
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", delete=False,
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
+        ) as stream:
+            temporary_path = Path(stream.name)
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
 
 
 def write_case_trace(
@@ -552,6 +582,48 @@ def write_case_trace(
     )
     metrics = steady_pu_metrics(artifacts.simulation_result.command_results)
     return artifacts.trace_path, metrics["pu_utilization_percent"]
+
+
+def _persist_case_artifacts(row: dict[str, Any], case: SACase) -> None:
+    """Atomically persist one completed case before its worker returns."""
+    required = (
+        case.artifact_dir, case.case_checkpoint_dir, case.run_stamp,
+        case.generated_at, case.detected_cpus, case.worker_count,
+    )
+    if any(value is None for value in required):
+        raise ValueError("case artifact context is incomplete")
+    checkpoint_dir = Path(case.case_checkpoint_dir)
+    case_stem = (
+        f"{case.run_stamp}_{_safe_name(row['model'])}_{row['moe_strategy']}_"
+        f"mtp_{'on' if row['mtp_enabled'] else 'off'}_"
+        f"bs{row['global_batch_size']}_sa_case_checkpoint"
+    )
+    split_tree_path = _unique_path(checkpoint_dir, case_stem, ".json")
+    row["best_split_tree_path"] = str(split_tree_path)
+    row["selected_split_tree_index"] = 0
+    write_model_json(
+        split_tree_path, row["model"], row["moe_strategy"],
+        row["mtp_enabled"], [dict(row, is_model_global_pareto=True)],
+        generated_at=case.generated_at,
+        detected_cpus=case.detected_cpus,
+        worker_count=case.worker_count,
+    )
+    trace_path, pu_utilization = write_case_trace(
+        row, Path(case.artifact_dir),
+    )
+    row["steady_pu_utilization_percent"] = pu_utilization
+    row["trace_path"] = str(trace_path)
+    # Refresh the checkpoint atomically with the completed trace metadata.
+    # The first version remains intact if trace replay is interrupted.
+    write_model_json(
+        split_tree_path, row["model"], row["moe_strategy"],
+        row["mtp_enabled"], [dict(row, is_model_global_pareto=True)],
+        generated_at=case.generated_at,
+        detected_cpus=case.detected_cpus,
+        worker_count=case.worker_count,
+        overwrite=True,
+    )
+    print(f"Case SplitTree checkpoint: {split_tree_path}", flush=True)
 
 
 def _execute(
@@ -616,6 +688,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_dir, f"{minute}_sa_throughput_comparison", ".csv",
         )
     create_csv_checkpoint(csv_path)
+    # Give every worker a private artifact context. It persists one reloadable
+    # SplitTree and trace before returning its completed result to this process.
+    artifact_dir = csv_path.parent
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    case_checkpoint_dir = (
+        artifact_dir / "case checkpoints" / csv_path.stem
+    )
+    case_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    cases = [
+        replace(
+            case, artifact_dir=str(artifact_dir),
+            case_checkpoint_dir=str(case_checkpoint_dir),
+            run_stamp=minute, generated_at=generated_at,
+            detected_cpus=detected, worker_count=workers,
+        )
+        for case in cases
+    ]
     print(
         f"detected {detected} logical CPUs; running {len(cases)} cases "
         f"with {workers} worker processes",
@@ -624,11 +713,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"CSV checkpoint: {csv_path}", flush=True)
 
     saved_count = 0
+    checkpoint_rows = []
 
     def save_completed_case(row: dict[str, Any]) -> None:
         nonlocal saved_count
         append_csv_checkpoint(csv_path, row)
         saved_count += 1
+        checkpoint_rows.append(row)
+        finalize_csv_checkpoint(csv_path, checkpoint_rows)
 
     try:
         results = _execute(cases, workers, on_result=save_completed_case)
@@ -648,12 +740,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         -row["global_batch_size"], row["mtp_enabled"],
     ))
     results = mark_model_pareto(results)
-
-    # All artifacts live beside the finalized CSV.  This also keeps an
-    # explicitly supplied --output-csv self-contained, regardless of
-    # --output-dir.
-    artifact_dir = csv_path.parent
-    artifact_dir.mkdir(parents=True, exist_ok=True)
 
     json_specs = []
     for model in args.models:
@@ -685,13 +771,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                         row["selected_split_tree_index"] = 0
                 json_specs.append((path, model, strategy, mtp_enabled))
 
-    trace_paths = []
-    for row in results:
-        trace_path, pu_utilization = write_case_trace(row, artifact_dir)
-        row["steady_pu_utilization_percent"] = pu_utilization
-        row["trace_path"] = str(trace_path)
-        trace_paths.append(trace_path)
-
     json_paths = []
     for path, model, strategy, mtp_enabled in json_specs:
         write_model_json(
@@ -706,8 +785,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"CSV: {csv_path}")
     for path in json_paths:
         print(f"SplitTree JSON: {path}")
-    for path in trace_paths:
-        print(f"Perfetto trace: {path}")
+    print(f"Case checkpoints: {case_checkpoint_dir}")
     return 0
 
 
