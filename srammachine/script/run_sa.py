@@ -31,12 +31,15 @@ from typing import Any, Callable, Iterable, Sequence
 
 from srammachine.hardware import DEFAULT_HARDWARE_CONFIG
 from srammachine.inference import InferenceConfig, MoEParallelStrategy
-from srammachine.mapping import HardwareMappingRequest
+from srammachine.mapping import HardwareMapper, HardwareMappingRequest
+from srammachine.pipetree import TreeParser
 from srammachine.search import (
     SimulatedAnnealingConfig,
     SplitTreeOptimizer,
+    split_tree_from_dict,
     split_tree_to_dict,
 )
+from srammachine.simulator import Simulator, steady_pu_metrics
 
 
 SUPPORTED_MODELS = (
@@ -46,20 +49,23 @@ DEFAULT_SEED = SimulatedAnnealingConfig().random_seed
 DEFAULT_OUTPUT_DIR = Path("best split tree result")
 CSV_OMITTED_FIELDS = frozenset(("best_split_trees", "restart_results"))
 CSV_FIELDNAMES = (
-    "model", "global_batch_size", "mtp_enabled", "input_sequence_length",
-    "output_sequence_length", "moe_strategy", "kv_cache_dtype",
+    "model", "mtp_enabled", "moe_strategy", "global_batch_size",
+    "input_sequence_length", "output_sequence_length", "kv_cache_dtype",
+    "pareto_best_total_throughput_tokens_per_second",
+    "pareto_best_single_user_throughput_per_second",
+    "steady_pu_utilization_percent",
+    "baseline_latency_ns", "pareto_best_latency_ns",
+    "baseline_single_user_throughput_per_second",
+    "baseline_total_throughput_tokens_per_second",
+    "latency_reduction_fraction", "throughput_improvement_fraction",
     "warmup_rounds", "rounds", "restart_count", "initial_temperature",
     "final_temperature", "layer_count", "base_seed", "chip_count",
-    "case_seed", "baseline_latency_ns", "pareto_best_latency_ns",
-    "baseline_single_user_throughput_per_second",
-    "pareto_best_single_user_throughput_per_second",
-    "baseline_total_throughput_tokens_per_second",
-    "pareto_best_total_throughput_tokens_per_second",
-    "latency_reduction_fraction", "throughput_improvement_fraction",
+    "case_seed",
     "proposal_count", "candidate_simulation_count",
     "materialization_simulation_count", "simulator_run_count",
     "cache_hit_count", "accepted_proposal_count",
     "is_model_global_pareto",
+    "best_split_tree_path", "selected_split_tree_index", "trace_path",
 )
 
 
@@ -157,6 +163,8 @@ def _validate_args(
         parser.error("--moe-strategy must not contain duplicates")
     if args.final_temperature > args.initial_temperature:
         parser.error("--final-temperature must not exceed --initial-temperature")
+    if args.layer_count < 3:
+        parser.error("--layer-count must be at least 3 for steady-state PU utilization")
     if args.output_csv is not None and args.output_csv.exists():
         parser.error(f"--output-csv already exists: {args.output_csv}")
     # Submit the heaviest workloads first.  There is no barrier between batch
@@ -412,16 +420,21 @@ def write_csv(path: Path, rows: Sequence[dict[str, Any]]) -> None:
 
 
 def write_model_json(
-    path: Path, model: str, strategy: str, rows: Sequence[dict[str, Any]],
+    path: Path, model: str, strategy: str, mtp_enabled: bool,
+    rows: Sequence[dict[str, Any]],
     *, generated_at: str, detected_cpus: int, worker_count: int,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     workloads = [
         dict(row) for row in rows
-        if row["model"] == model and row["moe_strategy"] == strategy
+        if (
+            row["model"] == model
+            and row["moe_strategy"] == strategy
+            and row["mtp_enabled"] == mtp_enabled
+        )
     ]
     if not workloads:
-        raise ValueError("model/strategy has no workload rows")
+        raise ValueError("model/strategy/MTP has no workload rows")
     def tree_records(row: dict[str, Any]) -> list[dict[str, Any]]:
         """Label every tree with the workload that produced it.
 
@@ -471,6 +484,7 @@ def write_model_json(
         "hardware": {"chip_count": DEFAULT_HARDWARE_CONFIG.chip_count},
         "search": {
             "moe_parallel_strategy": first["moe_strategy"],
+            "mtp_enabled": mtp_enabled,
             "input_sequence_length": first["input_sequence_length"],
             "output_sequence_length": first["output_sequence_length"],
             "kv_cache_dtype": first["kv_cache_dtype"],
@@ -485,15 +499,59 @@ def write_model_json(
             "worker_process_count": worker_count,
         },
         "workloads": workloads,
-        # Unlike pareto_front, this contains one entry for every batch/MTP
-        # workload, including dominated points.  Eight batches searched with
-        # MTP off/on therefore produce sixteen workload entries.
+        # Unlike pareto_front, this contains one entry for every batch
+        # workload for this fixed MTP state, including dominated points.
         "best_split_trees_by_workload": best_by_workload,
         "pareto_front": front,
     }
     with path.open("x", encoding="utf-8") as stream:
         json.dump(payload, stream, ensure_ascii=False, indent=2)
         stream.write("\n")
+
+
+def write_case_trace(
+    row: dict[str, Any], output_dir: Path,
+) -> tuple[Path, float]:
+    """Replay one selected best tree and write its Perfetto trace."""
+    best_trees = row.get("best_split_trees")
+    if not best_trees:
+        raise ValueError("SA row has no best SplitTree")
+    tree_index = row.get("selected_split_tree_index", 0)
+    if type(tree_index) is not int or not 0 <= tree_index < len(best_trees):
+        raise ValueError("selected SplitTree index is out of range")
+
+    request = HardwareMappingRequest(
+        row["model"],
+        InferenceConfig(
+            global_batch_size=row["global_batch_size"],
+            input_sequence_length=row["input_sequence_length"],
+            output_sequence_length=row["output_sequence_length"],
+            moe_parallel_strategy=MoEParallelStrategy(row["moe_strategy"]),
+            kv_cache_dtype=row["kv_cache_dtype"],
+            mtp_enabled=row["mtp_enabled"],
+        ),
+    )
+    mapping = HardwareMapper().map(request)
+    tree = split_tree_from_dict(best_trees[tree_index])
+    graph = TreeParser().parse(
+        tree,
+        mapping.operators,
+        mapping.operator_mappings,
+        layer_count=row["layer_count"],
+    )
+    trace_label = (
+        f"{_safe_name(row['model'])}_{row['moe_strategy']}_"
+        f"mtp_{'on' if row['mtp_enabled'] else 'off'}_"
+        f"bs{row['global_batch_size']}"
+    )
+    artifacts = Simulator().run_and_trace(
+        graph,
+        mapping_result=mapping,
+        trace_label=trace_label,
+        output_dir=output_dir,
+    )
+    metrics = steady_pu_metrics(artifacts.simulation_result.command_results)
+    return artifacts.trace_path, metrics["pu_utilization_percent"]
 
 
 def _execute(
@@ -591,25 +649,65 @@ def main(argv: Sequence[str] | None = None) -> int:
     ))
     results = mark_model_pareto(results)
 
-    finalize_csv_checkpoint(csv_path, results)
+    # All artifacts live beside the finalized CSV.  This also keeps an
+    # explicitly supplied --output-csv self-contained, regardless of
+    # --output-dir.
+    artifact_dir = csv_path.parent
+    artifact_dir.mkdir(parents=True, exist_ok=True)
 
-    json_paths = []
+    json_specs = []
     for model in args.models:
         for strategy in args.moe_strategy:
-            path = _unique_path(
-                output_dir,
-                f"{minute}_{_safe_name(model)}_{strategy}_sa_best_splittrees",
-                ".json",
-            )
-            write_model_json(
-                path, model, strategy, results, generated_at=generated_at,
-                detected_cpus=detected, worker_count=workers,
-            )
-            json_paths.append(path)
+            for mtp_enabled in (False, True):
+                if not any(
+                    row["model"] == model
+                    and row["moe_strategy"] == strategy
+                    and row["mtp_enabled"] == mtp_enabled
+                    for row in results
+                ):
+                    continue
+                path = _unique_path(
+                    artifact_dir,
+                    (
+                        f"{minute}_{_safe_name(model)}_{strategy}_"
+                        f"mtp_{'on' if mtp_enabled else 'off'}_"
+                        "sa_best_splittrees"
+                    ),
+                    ".json",
+                )
+                for row in results:
+                    if (
+                        row["model"] == model
+                        and row["moe_strategy"] == strategy
+                        and row["mtp_enabled"] == mtp_enabled
+                    ):
+                        row["best_split_tree_path"] = str(path)
+                        row["selected_split_tree_index"] = 0
+                json_specs.append((path, model, strategy, mtp_enabled))
+
+    trace_paths = []
+    for row in results:
+        trace_path, pu_utilization = write_case_trace(row, artifact_dir)
+        row["steady_pu_utilization_percent"] = pu_utilization
+        row["trace_path"] = str(trace_path)
+        trace_paths.append(trace_path)
+
+    json_paths = []
+    for path, model, strategy, mtp_enabled in json_specs:
+        write_model_json(
+            path, model, strategy, mtp_enabled, results,
+            generated_at=generated_at, detected_cpus=detected,
+            worker_count=workers,
+        )
+        json_paths.append(path)
+
+    finalize_csv_checkpoint(csv_path, results)
 
     print(f"CSV: {csv_path}")
     for path in json_paths:
         print(f"SplitTree JSON: {path}")
+    for path in trace_paths:
+        print(f"Perfetto trace: {path}")
     return 0
 
 

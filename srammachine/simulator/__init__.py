@@ -15,6 +15,7 @@ from .results import (
     build_simulation_result,
 )
 from .simulator import Simulator
+from .utilization import PU_COMMAND_TYPES, steady_pu_metrics
 from .stages import (
     DramResourceStage,
     HardwareResourceStage,
@@ -47,5 +48,7 @@ __all__ = [
     "DEFAULT_TRACE_OUTPUT_DIR",
     "SimulationArtifacts",
     "export_perfetto_trace",
+    "PU_COMMAND_TYPES",
+    "steady_pu_metrics",
     "VECTOR_FLOPS_PER_ELEMENT",
 ]
