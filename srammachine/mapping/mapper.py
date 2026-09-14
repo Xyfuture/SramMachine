@@ -1095,9 +1095,11 @@ class HardwareMapper:
             )
             main_gemm_override = None
         elif base_global_batch < 1024:
-            pu_per_req = _exact_div(
-                pu_count, local_req, "PU count per request",
-            )
+            # Use the largest equal per-request PU allocation and leave any
+            # remainder idle. This keeps custom meshes and non-power-of-two
+            # local request counts valid without overlapping sequence shards.
+            pu_per_req = pu_count // local_req
+            _positive_integer("PU count per request", pu_per_req)
             pu_dimensions = self._dims(
                 token_multiplier, model.indexer_num_heads,
                 model.indexer_head_dim, _ceil_div(history, pu_per_req),
@@ -1106,7 +1108,8 @@ class HardwareMapper:
             output_kind = "p2p"
             output_group = (builder.PU, "chip0.die0.output")
             output_suffix = "output_transfer"
-            output_bytes = token_multiplier * top_k * 4
+            local_top_k = min(2048, pu_dimensions["N"])
+            output_bytes = token_multiplier * local_top_k * 4
             main_gemm_override = old_main_gemm_flops
         else:
             # At BS=1024 on a 32-chip system there are only 32 local
@@ -1126,7 +1129,9 @@ class HardwareMapper:
             output_kind = "p2p"
             output_group = (builder.PU, "chip0.die0.output")
             output_suffix = "output_transfer"
-            output_bytes = req_per_pu * token_multiplier * top_k * 2
+            # Each top-k candidate carries a 2-byte shard-local token ID and
+            # a 2-byte score. The source PU identifies the shard origin.
+            output_bytes = req_per_pu * token_multiplier * top_k * 4
             main_gemm_override = old_main_gemm_flops
 
         builder.add_bmm(
@@ -1862,7 +1867,16 @@ class HardwareMapper:
         global_batch = base_global_batch * token_multiplier
         local_batch = _ceil_div(base_global_batch, chips) * token_multiplier
         dtype = _ACTIVATION_DTYPE_BYTES
-        strategy = "moe_ep_die_tp4"
+        use_hierarchical_ep = (
+            model.model_name in {
+                "deepseek-v3", "deepseek-v3.2", "glm-5.1",
+            }
+            and base_global_batch >= 2048
+        )
+        strategy = (
+            "moe_ep_hierarchical_die_expert"
+            if use_hierarchical_ep else "moe_ep_die_tp4"
+        )
         experts_per_chip = _ceil_div(model.num_experts, chips)
         ownership = tuple(
             tuple(range(
@@ -1895,18 +1909,37 @@ class HardwareMapper:
             transfer_bytes=dispatch, parallel_strategy=strategy,
         )
         representative_experts = ownership[0]
+        if use_hierarchical_ep:
+            if len(representative_experts) != 16:
+                raise ValueError(
+                    "hierarchical EP requires exactly 16 experts per chip"
+                )
+            # A representative die owns one contiguous quarter of the chip's
+            # experts. Its four PU rows each execute one expert, while the
+            # four columns shard the intermediate dimension.
+            representative_experts = representative_experts[:4]
         for expert_ids, token_count in self._groups_for_experts(
             representative_experts, loads,
         ):
-            self._add_expert_group(
-                builder, prefix="moe.ep", expert_ids=expert_ids,
-                tokens_per_expert=token_count,
-                global_expert_count=sum(
-                    load == token_count for load in loads
-                ),
-                tp_degree=dies,
-                parallel_strategy=strategy,
-            )
+            if use_hierarchical_ep:
+                self._add_hierarchical_ep_expert_group(
+                    builder, expert_ids=expert_ids,
+                    tokens_per_expert=token_count,
+                    global_expert_count=sum(
+                        load == token_count for load in loads
+                    ),
+                    strategy=strategy,
+                )
+            else:
+                self._add_expert_group(
+                    builder, prefix="moe.ep", expert_ids=expert_ids,
+                    tokens_per_expert=token_count,
+                    global_expert_count=sum(
+                        load == token_count for load in loads
+                    ),
+                    tp_degree=dies,
+                    parallel_strategy=strategy,
+                )
         combine = tuple(
             tuple(dispatch[column][row] for column in range(chips))
             for row in range(chips)
@@ -1916,6 +1949,18 @@ class HardwareMapper:
             kind="alltoall", group=builder.chip_group,
             transfer_bytes=combine, parallel_strategy=strategy,
         )
+        if use_hierarchical_ep:
+            builder.add_comm(
+                "moe.ep_output_die_reduce_scatter",
+                "ep_output_die_reduce_scatter",
+                scope="intra_chip", kind="reduce_scatter",
+                group=builder.die_group,
+                size_bytes=local_batch * model.hidden_size * dtype,
+                parallel_link_count=(
+                    builder.die_collective_parallel_link_count
+                ),
+                parallel_strategy=strategy,
+            )
         builder.add_comm(
             "moe.ep_output_die_allgather", "ep_output_die_allgather",
             scope="intra_chip", kind="allgather", group=builder.die_group,
@@ -1938,6 +1983,99 @@ class HardwareMapper:
             die_dimensions={"m": local_batch, "n": model.hidden_size},
             parallel_strategy=strategy,
             flops_per_element=1,
+        )
+
+    def _add_hierarchical_ep_expert_group(
+        self, builder: _LayerBuilder, *, expert_ids: Sequence[int],
+        tokens_per_expert: int, global_expert_count: int, strategy: str,
+    ) -> None:
+        """Map four die-local experts onto four PU rows for large-BS EP."""
+        model = builder.model_config
+        rows = self.hardware_config.chip.logic_die.pu_mesh_rows
+        columns = self.hardware_config.chip.logic_die.pu_mesh_columns
+        if rows != 4 or columns != 4 or len(expert_ids) != rows:
+            raise ValueError(
+                "hierarchical EP requires a 4x4 PU mesh and four experts/die"
+            )
+        local_intermediate = _exact_div(
+            model.moe_intermediate_size, columns,
+            "hierarchical EP intermediate dimension",
+        )
+        suffix = f"tokens{tokens_per_expert}"
+        common = dict(
+            expert_ids=expert_ids,
+            tokens_per_expert=tokens_per_expert,
+            parallel_strategy=strategy,
+            batch_scaling_unit_count=tokens_per_expert,
+        )
+
+        builder.add_bmm(
+            f"moe.ep.{suffix}.up_gate", "moe_up_gate",
+            global_dimensions=self._dims(
+                global_expert_count, tokens_per_expert, model.hidden_size,
+                2 * model.moe_intermediate_size,
+            ),
+            chip_dimensions=self._dims(
+                16, tokens_per_expert, model.hidden_size,
+                2 * model.moe_intermediate_size,
+            ),
+            die_dimensions=self._dims(
+                4, tokens_per_expert, model.hidden_size,
+                2 * model.moe_intermediate_size,
+            ),
+            pu_dimensions_override=self._dims(
+                1, tokens_per_expert, model.hidden_size,
+                2 * local_intermediate,
+            ),
+            weight_batches=4, pu_weight_batches=1,
+            input_group=builder.representative_pu_row,
+            output_kind="p2p",
+            output_group=(builder.PU, "chip0.die0.output"),
+            output_suffix="output_transfer",
+            **common,
+        )
+        builder.add_vector(
+            f"moe.ep.{suffix}.silu", "silu",
+            global_dimensions={
+                "m": global_expert_count * tokens_per_expert,
+                "n": model.moe_intermediate_size,
+            },
+            chip_dimensions={
+                "m": 16 * tokens_per_expert,
+                "n": model.moe_intermediate_size,
+            },
+            die_dimensions={
+                "m": 4 * tokens_per_expert,
+                "n": model.moe_intermediate_size,
+            },
+            **common,
+        )
+        builder.add_bmm(
+            f"moe.ep.{suffix}.down", "moe_down",
+            global_dimensions=self._dims(
+                global_expert_count, tokens_per_expert,
+                model.moe_intermediate_size, model.hidden_size,
+            ),
+            chip_dimensions=self._dims(
+                16, tokens_per_expert,
+                model.moe_intermediate_size, model.hidden_size,
+            ),
+            die_dimensions=self._dims(
+                4, tokens_per_expert,
+                model.moe_intermediate_size, model.hidden_size,
+            ),
+            pu_dimensions_override=self._dims(
+                1, tokens_per_expert, local_intermediate,
+                model.hidden_size,
+            ),
+            weight_batches=4, pu_weight_batches=1,
+            input_kind="p2p", input_suffix="input_transfer",
+            input_group=("chip0.die0.input", builder.PU),
+            input_noc_direction="input",
+            output_kind="reduce",
+            output_group=builder.representative_pu_row,
+            output_suffix="output_reduce",
+            **common,
         )
 
 

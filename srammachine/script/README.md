@@ -36,7 +36,7 @@ MoE 的当前映射规则为：
   G2×TP8、G4×TP4、G8×TP2，Kimi 的对应阈值为1536、3072、6144。
   group 间切 token，group 内 chip 沿 intermediate 维做 TP，chip 内4个dies
   按expert划分。TP2 在权重超过每die SRAM时分两个expert权重波次执行。
-- EP：expert 在 chips 间划分，每个 chip 内的4个dies继续对本地expert做TP。
+- EP：expert 在 chips 间保持 EP16。DeepSeek-V3、DeepSeek-V3.2 和 GLM-5.1 在 BS≥2048 时使用 hierarchical EP：每 chip 的16个experts连续分给4个dies，每个expert使用一行4个PU；其他情况沿用原 chip 内 die-TP mapping。
 - 小 batch 允许只激活部分experts；inactive expert不产生weight或计算命令。
 
 ## 并行 SA 脚本
@@ -67,6 +67,30 @@ Batch size会按降序进入任务队列，使耗时通常更长的大batch优�
 每个 case 默认执行4次完整且确定性的 restart。各 restart 的温度、预热边界和接受链相互独立，但共享该 case 已完成的仿真评分。邻居生成会优先探索尚未评估的合法 SplitTree，只有当前树的全部直接邻居都已评估后才回退到缓存候选。
 
 ## 基本示例
+
+### 全量 400-round 测试规则
+
+当前全量测试固定覆盖：
+
+- 模型：`deepseek-v3`、`deepseek-v3.2`、`kimi-k2.5`、`glm-5.1`
+- MTP：`off`、`on`
+- MoE：`tp`、`ep`
+- Batch size：`32 64 128 256 512 1024 2048 4096 8192`
+- 每次 restart：400 个正式 SA rounds
+- Restart：4 次
+
+总 case 数为 `4 × 2 × 2 × 9 = 144`。默认4次restart下，每个case实际执行
+`4 × 400 = 1600`个正式proposal，全量共`144 × 4 × 400 = 230400`个正式
+proposal，另有每次restart的warmup。推荐显式写出`--restarts 4`，避免对轮数口径
+产生歧义：
+
+```powershell
+python -m srammachine.script.run_sa --models deepseek-v3 deepseek-v3.2 kimi-k2.5 glm-5.1 --mtp off on --batch-sizes 32 64 128 256 512 1024 2048 4096 8192 --rounds 400 --restarts 4 --input-sequence-length 36000 --output-sequence-length 600 --moe-strategy tp ep --output-dir "..\csv result"
+```
+
+如果“每个case总共400轮”指跨所有restart合计400轮，则应使用
+`--rounds 400 --restarts 1`。`--rounds`始终表示每次restart的正式轮数，
+不会自动除以restart数。
 
 同时运行四个模型、四种 batch size，并分别搜索 MTP 关闭和开启状态：
 
@@ -128,7 +152,8 @@ python -m srammachine.script.run_sa --models deepseek-v3 --mtp off on --batch-si
 一次完整运行会产生：
 
 1. 一份跨模型、MoE策略、batch和MTP的汇总CSV。
-2. 每个 `(model, MoE strategy)` 一份包含最优SplitTree的JSON。
+2. 每个 `(model, MoE strategy, MTP)` 一份包含最优SplitTree的JSON；上述全量配置共16份。
+3. 每个case选择一棵最优SplitTree重放并导出一份Perfetto trace；上述全量配置共144份。
 
 CSV在worker启动前就会创建。每完成一个case，主进程会立刻追加该case的最终指标并强制刷新到磁盘。因此程序被终止或某个case失败时，已经完成的结果仍保留在启动时打印的`CSV checkpoint`路径中。部分CSV的`is_model_global_pareto`字段为空；只有全部case成功后，该文件才会被原子整理并写入最终Pareto标记。
 
@@ -180,5 +205,5 @@ Pareto front 只在固定配置内部计算。分组字段包括模型、MoE策�
 - worker在每个case结束后都会回收，因此已完成case不会持续累积内存。峰值内存通常约为`并发worker数 × 单个最大case内存`；若峰值过高，应降低`--workers`。
 - 一个命令可以同时指定`--moe-strategy tp ep`；汇总CSV合并两种策略，每种策略单独导出JSON。
 - 显式指定的 `--output-csv` 如果已经存在，脚本会拒绝覆盖。
-- 普通 SA 搜索不会生成 Perfetto trace；需要分析逐 command 时间线时，应对选定 SplitTree 单独调用 Simulator 的 trace 接口。
+- 全部case完成后，脚本会重放每个case选中的最优SplitTree并生成Perfetto trace和稳态PU利用率；trace阶段不增加SA搜索轮数。
 - 中断后保留的部分CSV只包含指标，不包含完整最佳SplitTree，也不会自动续跑；完整SplitTree JSON仍只在全部case成功后生成。
