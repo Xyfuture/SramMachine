@@ -35,6 +35,7 @@ class CommandGraph:
     def __init__(
         self, commands: Iterable[Command],
         edges: Iterable[Tuple[str, str]] = (),
+        start_edges: Iterable[Tuple[str, str]] = (),
         traces: Optional[Mapping[str, CommandTrace]] = None,
         scheduling_priorities: Optional[Mapping[str, int]] = None,
     ) -> None:
@@ -57,9 +58,29 @@ class CommandGraph:
             edge_set.add((source, target))
             successors[source].add(target)
             predecessors[target].add(source)
+        start_successors = {key: set() for key in lookup}
+        start_predecessors = {key: set() for key in lookup}
+        start_edge_set = set()
+        for source, target in start_edges:
+            if source not in lookup or target not in lookup:
+                raise ValueError(
+                    f"start edge references missing command: {(source, target)}"
+                )
+            start_edge_set.add((source, target))
+            start_successors[source].add(target)
+            start_predecessors[target].add(source)
         self.edges = tuple(sorted(edge_set, key=lambda e: (self._rank[e[0]], self._rank[e[1]])))
+        self.start_edges = tuple(sorted(start_edge_set, key=lambda e: (self._rank[e[0]], self._rank[e[1]])))
         self._successors = {k: tuple(sorted(v, key=self._rank.get)) for k, v in successors.items()}
         self._predecessors = {k: tuple(sorted(v, key=self._rank.get)) for k, v in predecessors.items()}
+        self._start_successors = {
+            k: tuple(sorted(v, key=self._rank.get))
+            for k, v in start_successors.items()
+        }
+        self._start_predecessors = {
+            k: tuple(sorted(v, key=self._rank.get))
+            for k, v in start_predecessors.items()
+        }
         trace_map = dict(traces or {})
         if not set(trace_map).issubset(lookup):
             raise ValueError("trace references missing command")
@@ -90,16 +111,30 @@ class CommandGraph:
     def successors(self, cmd_id: str) -> Tuple[str, ...]:
         return self._successors[cmd_id]
 
+    def start_predecessors(self, cmd_id: str) -> Tuple[str, ...]:
+        return self._start_predecessors[cmd_id]
+
+    def start_successors(self, cmd_id: str) -> Tuple[str, ...]:
+        return self._start_successors[cmd_id]
+
     def topological_order(self) -> Tuple[str, ...]:
         """Return IDs in topological order, with insertion order breaking ties."""
-        remaining = {k: len(v) for k, v in self._predecessors.items()}
+        combined_predecessors = {
+            key: set(self._predecessors[key]) | set(self._start_predecessors[key])
+            for key in self._lookup
+        }
+        combined_successors = {
+            key: set(self._successors[key]) | set(self._start_successors[key])
+            for key in self._lookup
+        }
+        remaining = {k: len(v) for k, v in combined_predecessors.items()}
         ready = [self._rank[k] for k, degree in remaining.items() if degree == 0]
         heapq.heapify(ready)
         result = []
         while ready:
             key = self.commands[heapq.heappop(ready)].cmd_id
             result.append(key)
-            for target in self._successors[key]:
+            for target in sorted(combined_successors[key], key=self._rank.get):
                 remaining[target] -= 1
                 if remaining[target] == 0:
                     heapq.heappush(ready, self._rank[target])

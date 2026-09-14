@@ -48,6 +48,27 @@ class BMMOp(Operator):
 
 
 @dataclass
+class FusedIndexerScoreOp(BMMOp):
+    """Full-K indexer QK with row-local ReLU and weighted head reduction."""
+
+    @property
+    def qk_flops(self) -> int:
+        return 2 * self.B * self.M * self.K * self.N
+
+    @property
+    def relu_flops(self) -> int:
+        return self.B * self.M * self.N
+
+    @property
+    def head_reduce_flops(self) -> int:
+        return self.B * self.N * (2 * self.M - 1)
+
+    @property
+    def total_flops(self) -> int:
+        return self.qk_flops + self.relu_flops + self.head_reduce_flops
+
+
+@dataclass
 class FlashAttentionOp(Operator):
     """Fused QK/online-softmax/SV with two explicit GEMM shapes."""
 

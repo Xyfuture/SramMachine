@@ -796,6 +796,10 @@ class SplitTreeOptimizer:
     def _workload_payload(cls, item: WorkloadSearchResult) -> dict:
         baseline = item.baseline_evaluation
         best = item.best_evaluation
+        best_split_trees = [
+            split_tree_to_dict(evaluation.split_tree)
+            for evaluation in item.best_evaluations
+        ]
         return {
             "global_batch_size": item.global_batch_size,
             "mtp_enabled": item.mtp_enabled,
@@ -835,14 +839,17 @@ class SplitTreeOptimizer:
             "accepted_proposal_count": item.accepted_proposal_count,
             "initial_tree_fallback": item.initial_tree_fallback,
             "normalization_bounds": cls._bounds_payload(item.normalization_bounds),
-            "best_split_trees": [
-                split_tree_to_dict(evaluation.split_tree)
-                for evaluation in item.best_evaluations
-            ],
+            "best_split_trees": best_split_trees,
+            "best_split_tree_records": [{
+                "global_batch_size": item.global_batch_size,
+                "mtp_enabled": item.mtp_enabled,
+                "split_tree": tree,
+            } for tree in best_split_trees],
         }
 
     @staticmethod
     def _point_payload(point: ParetoPoint) -> dict:
+        split_trees = [split_tree_to_dict(tree) for tree in point.split_trees]
         return {
             "single_user_throughput_per_second": (
                 point.single_user_throughput_per_second
@@ -858,7 +865,12 @@ class SplitTreeOptimizer:
             "global_batch_size": point.global_batch_size,
             "mtp_enabled": point.mtp_enabled,
             "first_discovered_iteration": point.first_discovered_iteration,
-            "split_trees": [split_tree_to_dict(tree) for tree in point.split_trees],
+            "split_trees": split_trees,
+            "split_tree_records": [{
+                "global_batch_size": point.global_batch_size,
+                "mtp_enabled": point.mtp_enabled,
+                "split_tree": tree,
+            } for tree in split_trees],
         }
 
 

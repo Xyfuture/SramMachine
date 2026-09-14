@@ -1,5 +1,10 @@
 """Model operator definitions."""
 
-from .operators import BMMOp, CommOp, FlashAttentionOp, Operator, VectorOp
+from .operators import (
+    BMMOp, CommOp, FlashAttentionOp, FusedIndexerScoreOp, Operator, VectorOp,
+)
 
-__all__ = ["Operator", "BMMOp", "FlashAttentionOp", "VectorOp", "CommOp"]
+__all__ = [
+    "Operator", "BMMOp", "FusedIndexerScoreOp", "FlashAttentionOp",
+    "VectorOp", "CommOp",
+]

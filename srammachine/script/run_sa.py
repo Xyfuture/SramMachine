@@ -422,6 +422,20 @@ def write_model_json(
     ]
     if not workloads:
         raise ValueError("model/strategy has no workload rows")
+    def tree_records(row: dict[str, Any]) -> list[dict[str, Any]]:
+        """Label every tree with the workload that produced it.
+
+        A SplitTree only describes operator grouping/splitting, so its structural
+        JSON cannot by itself say whether it was searched with MTP enabled.  Keep
+        the legacy raw-tree list for replay compatibility, and provide these
+        self-describing records for inspection and downstream analysis.
+        """
+        return [{
+            "global_batch_size": row["global_batch_size"],
+            "mtp_enabled": row["mtp_enabled"],
+            "split_tree": tree,
+        } for tree in row["best_split_trees"]]
+
     front = [{
         "global_batch_size": row["global_batch_size"],
         "mtp_enabled": row["mtp_enabled"],
@@ -434,7 +448,21 @@ def write_model_json(
         "latency_ns": row["pareto_best_latency_ns"],
         "case_seed": row["case_seed"],
         "split_trees": row["best_split_trees"],
+        "split_tree_records": tree_records(row),
     } for row in workloads if row["is_model_global_pareto"]]
+    best_by_workload = [{
+        "global_batch_size": row["global_batch_size"],
+        "mtp_enabled": row["mtp_enabled"],
+        "latency_ns": row["pareto_best_latency_ns"],
+        "single_user_throughput_per_second": (
+            row["pareto_best_single_user_throughput_per_second"]
+        ),
+        "total_throughput_tokens_per_second": (
+            row["pareto_best_total_throughput_tokens_per_second"]
+        ),
+        "split_trees": row["best_split_trees"],
+        "split_tree_records": tree_records(row),
+    } for row in workloads]
     first = workloads[0]
     payload = {
         "format_version": 1,
@@ -457,6 +485,10 @@ def write_model_json(
             "worker_process_count": worker_count,
         },
         "workloads": workloads,
+        # Unlike pareto_front, this contains one entry for every batch/MTP
+        # workload, including dominated points.  Eight batches searched with
+        # MTP off/on therefore produce sixteen workload entries.
+        "best_split_trees_by_workload": best_by_workload,
         "pareto_front": front,
     }
     with path.open("x", encoding="utf-8") as stream:

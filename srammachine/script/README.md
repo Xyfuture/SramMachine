@@ -153,7 +153,7 @@ CSV 的关键字段包括：
 
 MTP 关闭时 `accepted_tokens_per_step=1`；MTP1 开启时假设第二个 token 总能被接受，因此该值为 2。
 
-每个模型与MoE策略组合的JSON保存全部workload指标、跨batch/MTP的Pareto front、每次restart的统计，以及所有并列最优SplitTree。JSON中的Pareto front树可以继续通过`load_pareto_split_tree()`读取和复现。
+每个模型与MoE策略组合的JSON保存全部workload指标、跨batch/MTP的Pareto front、每次restart的统计，以及所有并列最优SplitTree。`best_split_trees_by_workload`明确列出每个batch和MTP状态的最佳树；其中`split_tree_records`的每一棵树都附带`global_batch_size`和`mtp_enabled`，因此MTP off/on不会混淆。旧的`split_trees`裸结构字段继续保留以兼容已有工具。JSON中的Pareto front树可以继续通过`load_pareto_split_tree()`读取和复现。
 
 Pareto front 只在固定配置内部计算。分组字段包括模型、MoE策略、ISL、OSL、KV dtype、layer count和chip count；TP与EP或不同推理配置不会互相支配。CSV中的`pareto_best_*`表示固定workload内搜索到的最好结果，`is_model_global_pareto`表示该结果是否位于对应固定配置的跨batch/MTP Pareto front。
 

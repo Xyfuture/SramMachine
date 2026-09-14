@@ -7,7 +7,8 @@ from typing import Tuple, Type
 from Desim import FIFO, SimModule, SimSession, SimTime
 
 from srammachine.commands import (
-    Command, DramCmd, FlashAttentionCmd, GemmCmd, InterChipCmd, NoCCmd,
+    Command, DramCmd, FlashAttentionCmd, FusedIndexerScoreCmd, GemmCmd,
+    InterChipCmd, NoCCmd,
     VectorCmd,
     SramReadCmd, WeightLoadCmd,
 )
@@ -43,7 +44,7 @@ def _communication_volume_ratio(command) -> Tuple[int, int]:
                 if row != column)
             for column in range(participant_count)
         ]
-        return max(sent + received, default=0), 1
+        return max((*sent, *received), default=0), 1
 
     size_bytes = command.size_bytes
     if command.kind in ("p2p", "broadcast", "reduce"):
@@ -170,7 +171,7 @@ class ProcessingUnitStage(HardwareResourceStage):
         self._validate_command(command)
         flops = (
             command.total_flops
-            if isinstance(command, FlashAttentionCmd)
+            if isinstance(command, (FlashAttentionCmd, FusedIndexerScoreCmd))
             else 2 * command.B * command.M * command.K * command.N
         )
         peak_flops = (

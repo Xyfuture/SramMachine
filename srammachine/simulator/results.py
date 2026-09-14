@@ -11,6 +11,7 @@ from srammachine.commands import (
     CommCmd,
     DramCmd,
     FlashAttentionCmd,
+    FusedIndexerScoreCmd,
     GemmCmd,
     InterChipCmd,
     NoCCmd,
@@ -92,6 +93,22 @@ def _command_parameters(
             "size_bytes": command.size_bytes,
             "data_kind": command.data_kind,
             "operand_role": "right_operand",
+        }
+    elif isinstance(command, FusedIndexerScoreCmd):
+        parameters = {
+            "B": command.B,
+            "M": command.M,
+            "K": command.K,
+            "N": command.N,
+            "gemm_b": command.B,
+            "gemm_m": command.M,
+            "gemm_k": command.K,
+            "gemm_n": command.N,
+            "qk_flops": command.qk_flops,
+            "relu_flops": command.relu_flops,
+            "head_reduce_flops": command.head_reduce_flops,
+            "total_flops": command.total_flops,
+            "fused_indexer_score": True,
         }
     elif isinstance(command, GemmCmd):
         parameters = {
@@ -188,7 +205,7 @@ def _communication_volume_ratio(command: CommCmd) -> Tuple[int, int]:
                 if row != column)
             for column in range(participant_count)
         ]
-        return max(sent + received, default=0), 1
+        return max((*sent, *received), default=0), 1
 
     size_bytes = command.size_bytes or 0
     if command.kind in ("p2p", "broadcast", "reduce"):

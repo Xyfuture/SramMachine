@@ -11,12 +11,13 @@ from typing import Iterator, Mapping, Tuple
 
 from srammachine.commands import (
     CommandGraph, CommandTrace, DramCmd, DramReadCmd, DramWriteCmd,
-    SramReadCmd, WeightLoadCmd, WeightPrefetchCmd, FlashAttentionCmd, GemmCmd,
+    SramReadCmd, WeightLoadCmd, WeightPrefetchCmd, FlashAttentionCmd,
+    FusedIndexerScoreCmd, GemmCmd,
     VectorCmd, NoCCmd, InterChipCmd,
 )
 from srammachine.commands.base import integer
 from srammachine.frontend.modules import (
-    BMMOp, CommOp, FlashAttentionOp, Operator, VectorOp,
+    BMMOp, CommOp, FlashAttentionOp, FusedIndexerScoreOp, Operator, VectorOp,
 )
 from srammachine.hardware import DEFAULT_HARDWARE_CONFIG, HardwareConfig
 from .mapping import OperatorMapping
@@ -82,7 +83,7 @@ class TreeParser:
                 previous = f"layer{layer - 1}."
                 edges.extend((previous + source, prefix + target)
                              for source, target in boundary_edges)
-        graph = CommandGraph(commands, edges, traces)
+        graph = CommandGraph(commands, edges, traces=traces)
         return self._apply_weight_constraints(graph)
 
     def _apply_weight_constraints(self, graph: CommandGraph) -> CommandGraph:
@@ -205,6 +206,7 @@ class TreeParser:
         return CommandGraph(
             graph.commands,
             tuple(graph.edges) + tuple(capacity_edges) + tuple(order_edges),
+            graph.start_edges,
             graph.traces,
             graph.scheduling_priorities,
         )
@@ -213,14 +215,13 @@ class TreeParser:
     def _apply_sa_weight_load_constraints(
         graph: CommandGraph,
     ) -> CommandGraph:
-        """Allow a static weight load only one actual GEMM ahead per PU.
+        """Release the next static weight load when the previous GEMM is ready.
 
         The window is defined by the complete GEMM stream, including dynamic
-        right-operand operations such as FlashAttention.  A load waits until
-        the immediately preceding GEMM is ready and the GEMM two positions
-        back has completed.  Thus the next weight may overlap the current
-        compute, but independent microbatches cannot accumulate more than the
-        current and next weights while several ready GEMMs queue on one PU.
+        right-operand operations such as FlashAttention.  A load waits on the
+        immediately preceding GEMM's readiness predecessors, not on that GEMM's
+        completion, so SRAM weight loading can overlap the current SA compute
+        as expected from the double weight-register design.
         """
         load_by_core = {}
         for command in graph.commands:
@@ -253,31 +254,29 @@ class TreeParser:
                 )
 
         buffer_edges = []
+        buffer_start_edges = []
         for cores in gemms_by_pu.values():
+            loads = [
+                load_by_core[core]
+                for core in cores
+                if core in load_by_core
+            ]
             for index in range(1, len(cores)):
                 load_id = load_by_core.get(cores[index])
                 if load_id is None:
                     continue
                 previous_core = cores[index - 1]
-                buffer_edges.extend(
-                    (source, load_id)
-                    for source in graph.predecessors(previous_core)
-                    if source != load_id
-                )
-                # Readiness alone is insufficient when independent
-                # microbatches queue several GEMMs on the same PU: multiple
-                # future loads could otherwise accumulate before any queued
-                # GEMM starts.  Completion of the GEMM two positions back
-                # frees the current slot, while readiness of the immediately
-                # preceding GEMM preserves one-step load/compute overlap.
-                if index >= 2:
-                    buffer_edges.append((cores[index - 2], load_id))
-
-        if not buffer_edges:
+                buffer_start_edges.append((previous_core, load_id))
+            buffer_edges.extend(
+                (previous, current)
+                for previous, current in zip(loads, loads[1:])
+            )
+        if not buffer_edges and not buffer_start_edges:
             return graph
         return CommandGraph(
             graph.commands,
             tuple(graph.edges) + tuple(buffer_edges),
+            tuple(graph.start_edges) + tuple(buffer_start_edges),
             graph.traces,
             graph.scheduling_priorities,
         )
@@ -291,8 +290,9 @@ class TreeParser:
         return CommandGraph(
             graph.commands,
             graph.edges,
-            graph.traces,
-            priorities,
+            graph.start_edges,
+            traces=graph.traces,
+            scheduling_priorities=priorities,
         )
 
     def _parse_one_layer(
@@ -471,7 +471,7 @@ class TreeParser:
                 ):
                     edges.append((core_ids[source.index], sram_read))
 
-        return CommandGraph(commands, edges, traces)
+        return CommandGraph(commands, edges, traces=traces)
 
     @staticmethod
     def _mapped_batch_size(batch: int, partition_degree: int) -> int:
@@ -545,7 +545,11 @@ class TreeParser:
         if isinstance(op, BMMOp):
             dimensions = {name: getattr(op, name) for name in ("B", "M", "K", "N")}
             dimensions[mapping.batch_axis] = scale(dimensions[mapping.batch_axis])
-            return GemmCmd(**common, **dimensions)
+            command_type = (
+                FusedIndexerScoreCmd
+                if isinstance(op, FusedIndexerScoreOp) else GemmCmd
+            )
+            return command_type(**common, **dimensions)
         if isinstance(op, FlashAttentionOp):
             dimensions = {
                 name: getattr(op, name)

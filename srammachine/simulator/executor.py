@@ -6,7 +6,7 @@ from types import MappingProxyType
 from Desim import FIFO, SimModule, SimSession
 from greenlet import GreenletExit
 
-from srammachine.commands import CommandGraph
+from srammachine.commands import CommandGraph, InterChipCmd
 from srammachine.hardware import DEFAULT_HARDWARE_CONFIG, HardwareConfig
 from .records import CommandExecution, CommandState, ExecutionResult
 from .stages import stage_class_for_command
@@ -37,6 +37,10 @@ class GraphExecutor(SimModule):
             command.cmd_id: len(graph.predecessors(command.cmd_id))
             for command in graph.commands
         }
+        self._remaining_start_predecessors = {
+            command.cmd_id: len(graph.start_predecessors(command.cmd_id))
+            for command in graph.commands
+        }
         self._states = {
             command.cmd_id: CommandState.PENDING for command in graph.commands
         }
@@ -44,10 +48,17 @@ class GraphExecutor(SimModule):
         self._ready_by_resource = {}
         self._busy_resources = set()
         self._completion_fifo = FIFO(max(1, len(graph.commands)))
+        self._stage_keys = {
+            command.cmd_id: self._stage_key(command)
+            for command in graph.commands
+        }
         self._stages = self._build_stages()
 
         for command in graph.commands:
-            if self._remaining_predecessors[command.cmd_id] == 0:
+            if (
+                self._remaining_predecessors[command.cmd_id] == 0
+                and self._remaining_start_predecessors[command.cmd_id] == 0
+            ):
                 self._make_ready(command.cmd_id)
         self.register_coroutine(self._process)
 
@@ -65,43 +76,75 @@ class GraphExecutor(SimModule):
 
     def _build_stages(self):
         stage_types = {}
+        stage_resource_ids = {}
         for command in self.graph.commands:
+            stage_key = self._stage_keys[command.cmd_id]
             stage_type = stage_class_for_command(command)
-            existing = stage_types.setdefault(command.resource_id, stage_type)
+            existing = stage_types.setdefault(stage_key, stage_type)
             if existing is not stage_type:
                 raise ValueError(
                     f"resource_id {command.resource_id!r} mixes "
                     f"{existing.__name__} and {stage_type.__name__}"
                 )
+            stage_resource_ids[stage_key] = command.resource_id
         return {
-            resource_id: stage_type(
-                resource_id, self.hardware_config, self._completion_fifo,
+            stage_key: stage_type(
+                stage_resource_ids[stage_key],
+                self.hardware_config,
+                self._completion_fifo,
             )
-            for resource_id, stage_type in stage_types.items()
+            for stage_key, stage_type in stage_types.items()
         }
+
+    @staticmethod
+    def _stage_key(command) -> str:
+        if isinstance(command, InterChipCmd):
+            return f"{command.resource_id}::{command.cmd_id}"
+        return command.resource_id
 
     def _make_ready(self, cmd_id: str) -> None:
         if self._states[cmd_id] is not CommandState.PENDING:
             raise RuntimeError(f"command cannot become ready twice: {cmd_id}")
         command = self.graph.command(cmd_id)
         self._states[cmd_id] = CommandState.READY
-        heap = self._ready_by_resource.setdefault(command.resource_id, [])
+        heap = self._ready_by_resource.setdefault(self._stage_keys[cmd_id], [])
         heapq.heappush(heap, (
             self.graph.scheduling_priorities[cmd_id], self._rank[cmd_id],
         ))
 
+    def _try_make_ready(self, cmd_id: str) -> None:
+        if self._states[cmd_id] is not CommandState.PENDING:
+            return
+        if (
+            self._remaining_predecessors[cmd_id] == 0
+            and self._remaining_start_predecessors[cmd_id] == 0
+        ):
+            self._make_ready(cmd_id)
+
+    def _release_start_successors(self, cmd_id: str) -> None:
+        for successor in self.graph.start_successors(cmd_id):
+            self._remaining_start_predecessors[successor] -= 1
+            if self._remaining_start_predecessors[successor] < 0:
+                raise RuntimeError(f"negative start dependency count: {successor}")
+            self._try_make_ready(successor)
+
     def _dispatch_idle_resources(self) -> None:
-        for resource_id, stage in self._stages.items():
-            ready = self._ready_by_resource.get(resource_id)
-            if resource_id in self._busy_resources or not ready:
-                continue
-            _, rank = heapq.heappop(ready)
-            command = self.graph.commands[rank]
-            if self._states[command.cmd_id] is not CommandState.READY:
-                raise RuntimeError(f"invalid ready state: {command.cmd_id}")
-            self._states[command.cmd_id] = CommandState.RUNNING
-            self._busy_resources.add(resource_id)
-            stage.submit(command)
+        dispatched = True
+        while dispatched:
+            dispatched = False
+            for stage_key, stage in self._stages.items():
+                ready = self._ready_by_resource.get(stage_key)
+                if stage_key in self._busy_resources or not ready:
+                    continue
+                _, rank = heapq.heappop(ready)
+                command = self.graph.commands[rank]
+                if self._states[command.cmd_id] is not CommandState.READY:
+                    raise RuntimeError(f"invalid ready state: {command.cmd_id}")
+                self._states[command.cmd_id] = CommandState.RUNNING
+                self._busy_resources.add(stage_key)
+                stage.submit(command)
+                self._release_start_successors(command.cmd_id)
+                dispatched = True
 
     def _commit(self, execution: CommandExecution) -> None:
         cmd_id = execution.cmd_id
@@ -114,14 +157,13 @@ class GraphExecutor(SimModule):
             raise ValueError(f"completion resource mismatch: {cmd_id}")
         self._states[cmd_id] = CommandState.COMPLETED
         self._executions[cmd_id] = execution
-        self._busy_resources.remove(command.resource_id)
+        self._busy_resources.remove(self._stage_keys[cmd_id])
 
         for successor in self.graph.successors(cmd_id):
             self._remaining_predecessors[successor] -= 1
             if self._remaining_predecessors[successor] < 0:
                 raise RuntimeError(f"negative dependency count: {successor}")
-            if self._remaining_predecessors[successor] == 0:
-                self._make_ready(successor)
+            self._try_make_ready(successor)
 
     def _process(self) -> None:
         self._dispatch_idle_resources()

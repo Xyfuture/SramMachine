@@ -5,7 +5,7 @@ from types import MappingProxyType
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
 from srammachine.frontend.modules import (
-    BMMOp, CommOp, FlashAttentionOp, Operator, VectorOp,
+    BMMOp, CommOp, FlashAttentionOp, FusedIndexerScoreOp, Operator, VectorOp,
 )
 from srammachine.hardware import DEFAULT_HARDWARE_CONFIG, HardwareConfig
 from srammachine.inference import InferenceConfig, MoEParallelStrategy
@@ -313,6 +313,8 @@ class _LayerBuilder:
         output_kind: str = "reduce",
         output_group: Optional[Sequence[Any]] = None,
         output_suffix: str = "output_reduce",
+        output_bytes_override: Optional[int] = None,
+        fused_indexer_score: bool = False,
         batch_scaling_unit_count: Optional[int] = None,
     ) -> None:
         for dimensions in (global_dimensions, chip_dimensions, die_dimensions):
@@ -360,6 +362,9 @@ class _LayerBuilder:
             pu_dimensions["B"] * pu_dimensions["M"] * pu_dimensions["N"]
             * _ACTIVATION_DTYPE_BYTES
         )
+        if output_bytes_override is not None:
+            _positive_integer("output_bytes_override", output_bytes_override)
+            output_bytes = output_bytes_override
         self.add_comm(
             f"{op_id}.{input_suffix}", f"{op_kind}_{input_suffix}",
             scope="intra_chip", kind=input_kind,
@@ -374,7 +379,8 @@ class _LayerBuilder:
             noc_direction=input_noc_direction,
             batch_scaling_unit_count=batch_scaling_unit_count,
         )
-        operator = BMMOp(op_id, **pu_dimensions)
+        operator_type = FusedIndexerScoreOp if fused_indexer_score else BMMOp
+        operator = operator_type(op_id, **pu_dimensions)
         mapping = OperatorMapping(
             batch_axis, self.PU,
             self.DRAM if (
@@ -1080,43 +1086,33 @@ class HardwareMapper:
                 history * model.indexer_head_dim * kv_dtype_bytes
             ),
             batch_axis="B",
+            # PU rows own disjoint indexer-head groups, columns retain the
+            # history split, and each PU consumes full K. ReLU and weighted
+            # head aggregation stay local and are fused into this PU command.
+            pu_dimensions_override=self._dims(
+                chip_batch,
+                _ceil_div(local_heads, pu_rows),
+                model.indexer_head_dim,
+                _ceil_div(history, pu_columns),
+            ),
+            fused_indexer_score=True,
             sram_read_bytes_per_mapped_token=(
                 _shared_effective_bytes(
-                    _ceil_div(model.indexer_head_dim, pu_rows)
-                    * _ceil_div(history, pu_columns)
+                    model.indexer_head_dim * _ceil_div(history, pu_columns)
                     * kv_dtype_bytes,
                     dies,
                 )
             ),
             sram_read_logical_bytes_per_mapped_token=(
-                _ceil_div(model.indexer_head_dim, pu_rows)
-                * _ceil_div(history, pu_columns)
+                model.indexer_head_dim * _ceil_div(history, pu_columns)
                 * kv_dtype_bytes
             ),
             sram_read_data_kind="dsa_key",
             shared_die_factor=dies,
-        )
-        builder.add_vector(
-            "attn.dsa_relu", "relu",
-            global_dimensions={
-                "m": global_batch * model.indexer_num_heads, "n": history,
-            },
-            chip_dimensions={
-                "m": chip_batch * model.indexer_num_heads, "n": history,
-            },
-            die_dimensions={
-                "m": chip_batch * local_heads, "n": history,
-            },
-            parallel_strategy=strategy,
-            flops_per_element=1,
-        )
-        builder.add_vector(
-            "attn.dsa_head_reduce", "indexer_weighted_head_reduce",
-            global_dimensions={"m": global_batch, "n": history},
-            chip_dimensions={"m": chip_batch, "n": history},
-            die_dimensions={"m": chip_batch, "n": history},
-            parallel_strategy=strategy,
-            flops_per_element=max(2 * local_heads - 1, 1),
+            output_bytes_override=(
+                chip_batch * _ceil_div(history, pu_columns)
+                * _ACTIVATION_DTYPE_BYTES
+            ),
         )
         builder.add_comm(
             "attn.dsa_score_reduce", "indexer_score_reduce",

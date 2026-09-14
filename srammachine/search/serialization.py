@@ -76,7 +76,11 @@ def load_pareto_split_tree(
     with Path(path).open(encoding="utf-8") as stream:
         payload = json.load(stream)
     try:
-        tree = payload["pareto_front"][point_index]["split_trees"][tree_index]
+        point = payload["pareto_front"][point_index]
+        if "split_tree_records" in point:
+            tree = point["split_tree_records"][tree_index]["split_tree"]
+        else:
+            tree = point["split_trees"][tree_index]
     except (KeyError, IndexError, TypeError) as error:
         raise ValueError("Pareto file does not contain the requested tree") from error
     return split_tree_from_dict(tree)

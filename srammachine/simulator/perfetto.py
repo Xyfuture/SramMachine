@@ -129,6 +129,11 @@ def _trace_payload(result: SimulationResult) -> Mapping[str, Any]:
 def _event_name(item) -> str:
     base = f"{item.op_id} [{item.command_type}]"
     parameters = item.parameters
+    if parameters.get("fused_indexer_score"):
+        return (
+            f"{base} B={parameters['gemm_b']} M={parameters['gemm_m']} "
+            f"K={parameters['gemm_k']} N={parameters['gemm_n']} fused_postprocess"
+        )
     if "qk_flops" in parameters:
         return (
             f"{base} QK=[{parameters['B']},{parameters['M']},"
