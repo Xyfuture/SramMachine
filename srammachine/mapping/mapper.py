@@ -1497,6 +1497,232 @@ class HardwareMapper:
             **common,
         )
 
+    @staticmethod
+    def _hierarchical_moe_tp_degrees(
+        model: ModelConfig, base_global_batch: int,
+    ) -> Tuple[int, int]:
+        """Return the fixed token-group and chip-TP degrees for one model."""
+        if model.num_experts == 384:
+            thresholds = ((6144, 8, 2), (3072, 4, 4), (1536, 2, 8))
+        else:
+            thresholds = ((4096, 8, 2), (2048, 4, 4), (1024, 2, 8))
+        for threshold, token_groups, chip_tp_degree in thresholds:
+            if base_global_batch >= threshold:
+                return token_groups, chip_tp_degree
+        return 1, 16
+
+    def _add_hierarchical_tp_expert_group(
+        self, builder: _LayerBuilder, *, expert_ids: Sequence[int],
+        tokens_per_expert: int, token_groups: int, chip_tp_degree: int,
+        phase: str, prefix: str = "moe.tp",
+    ) -> None:
+        """Map one representative die with expert partitioning inside a TP chip."""
+        model = builder.model_config
+        dies = self.hardware_config.chip.logic_die_count
+        pu_count = (
+            self.hardware_config.chip.logic_die.pu_mesh_rows
+            * self.hardware_config.chip.logic_die.pu_mesh_columns
+        )
+        die_experts = len(expert_ids)
+        pu_experts = _exact_div(die_experts, pu_count, "experts per PU")
+        local_intermediate = _exact_div(
+            model.moe_intermediate_size, chip_tp_degree,
+            "hierarchical TP intermediate dimension",
+        )
+        strategy = (
+            f"moe_tp_hierarchical_g{token_groups}_p{chip_tp_degree}"
+        )
+        suffix = f"tokens{tokens_per_expert}"
+        common = dict(
+            expert_ids=expert_ids,
+            tokens_per_expert=tokens_per_expert,
+            parallel_strategy=strategy,
+            batch_scaling_unit_count=tokens_per_expert,
+        )
+
+        if phase == "up_gate":
+            up_die = self._dims(
+                die_experts, tokens_per_expert, model.hidden_size,
+                2 * local_intermediate,
+            )
+            builder.add_bmm(
+                f"{prefix}.{suffix}.up_gate", "moe_up_gate",
+                global_dimensions=self._dims(
+                    model.num_experts, tokens_per_expert, model.hidden_size,
+                    2 * model.moe_intermediate_size,
+                ),
+                chip_dimensions=self._dims(
+                    model.num_experts, tokens_per_expert, model.hidden_size,
+                    2 * local_intermediate,
+                ),
+                die_dimensions=up_die,
+                pu_dimensions_override=self._dims(
+                    pu_experts, tokens_per_expert, model.hidden_size,
+                    2 * local_intermediate,
+                ),
+                weight_batches=die_experts, pu_weight_batches=pu_experts,
+                input_kind="p2p", input_suffix="input_transfer",
+                input_group=("chip0.die0.input", builder.PU),
+                input_noc_direction="input", output_kind="p2p",
+                output_group=(builder.PU, "chip0.die0.output"),
+                output_suffix="output_transfer", **common,
+            )
+            return
+        if phase == "silu":
+            builder.add_vector(
+                f"{prefix}.{suffix}.silu", "silu",
+                global_dimensions={
+                    "m": model.num_experts * tokens_per_expert,
+                    "n": model.moe_intermediate_size,
+                },
+                chip_dimensions={
+                    "m": model.num_experts * tokens_per_expert,
+                    "n": local_intermediate,
+                },
+                die_dimensions={
+                    "m": die_experts * tokens_per_expert,
+                    "n": local_intermediate,
+                },
+                **common,
+            )
+            return
+        if phase != "down":
+            raise ValueError(f"unsupported hierarchical MoE phase: {phase}")
+        down_die = self._dims(
+            die_experts, tokens_per_expert, local_intermediate,
+            model.hidden_size,
+        )
+        builder.add_bmm(
+            f"{prefix}.{suffix}.down", "moe_down",
+            global_dimensions=self._dims(
+                model.num_experts, tokens_per_expert,
+                model.moe_intermediate_size, model.hidden_size,
+            ),
+            chip_dimensions=self._dims(
+                model.num_experts, tokens_per_expert,
+                local_intermediate, model.hidden_size,
+            ),
+            die_dimensions=down_die,
+            pu_dimensions_override=self._dims(
+                pu_experts, tokens_per_expert, local_intermediate,
+                model.hidden_size,
+            ),
+            weight_batches=die_experts, pu_weight_batches=pu_experts,
+            input_kind="p2p", input_suffix="input_transfer",
+            input_group=("chip0.die0.input", builder.PU),
+            input_noc_direction="input", output_kind="p2p",
+            output_group=(builder.PU, "chip0.die0.output"),
+            output_suffix="output_transfer", **common,
+        )
+
+    def _build_hierarchical_moe_tp(
+        self, builder: _LayerBuilder, token_groups: int, chip_tp_degree: int,
+    ) -> None:
+        request = builder.request
+        model = builder.model_config
+        chips = self.hardware_config.chip_count
+        dies = self.hardware_config.chip.logic_die_count
+        base_global_batch = request.inference_config.global_batch_size
+        token_multiplier = request.inference_config.accepted_tokens_per_step
+        global_batch = base_global_batch * token_multiplier
+        group_batch = _exact_div(
+            global_batch, token_groups, "hierarchical TP token group batch",
+        )
+        local_batch = _exact_div(
+            global_batch, chips, "hierarchical TP chip batch",
+        )
+        dtype = _ACTIVATION_DTYPE_BYTES
+        strategy = (
+            f"moe_tp_hierarchical_g{token_groups}_p{chip_tp_degree}"
+        )
+        chip_group = tuple(range(chip_tp_degree))
+
+        builder.add_comm(
+            "moe.tp_input_allgather", "dp_to_tp_allgather",
+            scope="inter_chip", kind="allgather", group=chip_group,
+            size_bytes=local_batch * model.hidden_size * dtype,
+            parallel_strategy=strategy,
+        )
+        loads = self._balanced_expert_loads(
+            group_batch, model.top_k, model.num_experts,
+        )
+        builder.expert_token_loads = loads
+        builder.expert_ownership = tuple(
+            tuple(range(model.num_experts)) for _ in range(chips)
+        )
+        die_expert_count = _exact_div(
+            model.num_experts, dies, "hierarchical TP experts across dies",
+        )
+        representative_die_ids = tuple(range(die_expert_count))
+        grouped = self._groups_for_experts(representative_die_ids, loads)
+        if len(grouped) != 1:
+            raise ValueError("hierarchical TP expects one uniform positive expert load")
+        active_ids, token_count = grouped[0]
+        up_weight_bytes = (
+            len(active_ids) * model.hidden_size
+            * (2 * model.moe_intermediate_size // chip_tp_degree)
+            * _WEIGHT_DTYPE_BYTES
+        )
+        sram_capacity = self.hardware_config.chip.logic_die.memory.sram_capacity_bytes
+        wave_count = _ceil_div(up_weight_bytes, sram_capacity)
+        if len(active_ids) % wave_count:
+            raise ValueError("expert waves must evenly partition representative die experts")
+        experts_per_wave = len(active_ids) // wave_count
+        if experts_per_wave % self.hardware_config.chip.logic_die.processing_unit_count:
+            raise ValueError("each expert wave must evenly partition across die PUs")
+        waves = tuple(
+            active_ids[index * experts_per_wave:(index + 1) * experts_per_wave]
+            for index in range(wave_count)
+        )
+        for phase in ("up_gate", "silu", "down"):
+            for wave_index, wave_ids in enumerate(waves):
+                prefix = (
+                    "moe.tp" if wave_count == 1
+                    else f"moe.tp.wave{wave_index}"
+                )
+                self._add_hierarchical_tp_expert_group(
+                    builder, expert_ids=wave_ids,
+                    tokens_per_expert=token_count,
+                    token_groups=token_groups,
+                    chip_tp_degree=chip_tp_degree,
+                    phase=phase, prefix=prefix,
+                )
+
+        builder.add_comm(
+            "moe.tp_down_die_reduce_scatter",
+            "moe_down_die_reduce_scatter",
+            scope="intra_chip", kind="reduce_scatter",
+            group=builder.die_group,
+            size_bytes=group_batch * model.hidden_size * dtype,
+            parallel_link_count=builder.die_collective_parallel_link_count,
+            parallel_strategy=strategy,
+        )
+        builder.add_comm(
+            "moe.tp_chip_reduce_scatter", "tp_to_dp_reduce_scatter",
+            scope="inter_chip", kind="reduce_scatter", group=chip_group,
+            size_bytes=group_batch * model.hidden_size * dtype,
+            parallel_strategy=strategy,
+        )
+        builder.add_comm(
+            "moe.tp_output_die_allgather", "tp_output_die_allgather",
+            scope="intra_chip", kind="allgather", group=builder.die_group,
+            size_bytes=(
+                local_batch
+                * _exact_div(model.hidden_size, dies, "TP output hidden shard")
+                * dtype
+            ),
+            parallel_link_count=builder.die_collective_parallel_link_count,
+            parallel_strategy=strategy,
+        )
+        builder.add_vector(
+            "moe.tp_residual", "residual",
+            global_dimensions={"m": global_batch, "n": model.hidden_size},
+            chip_dimensions={"m": local_batch, "n": model.hidden_size},
+            die_dimensions={"m": local_batch, "n": model.hidden_size},
+            parallel_strategy=strategy,
+            flops_per_element=1,
+        )
+
     def _build_moe_tp(self, builder: _LayerBuilder) -> None:
         request = builder.request
         model = builder.model_config
@@ -1504,6 +1730,14 @@ class HardwareMapper:
         dies = self.hardware_config.chip.logic_die_count
         base_global_batch = request.inference_config.global_batch_size
         token_multiplier = request.inference_config.accepted_tokens_per_step
+        token_groups, chip_tp_degree = self._hierarchical_moe_tp_degrees(
+            model, base_global_batch,
+        )
+        if token_groups > 1:
+            self._build_hierarchical_moe_tp(
+                builder, token_groups, chip_tp_degree,
+            )
+            return
         # MTP1 sends both accepted query tokens through MoE, so expert loads,
         # activation collectives and arithmetic all see twice the base batch.
         global_batch = base_global_batch * token_multiplier

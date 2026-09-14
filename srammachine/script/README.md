@@ -31,7 +31,11 @@ GraphExecutor + Desim
 
 MoE 的当前映射规则为：
 
-- TP：expert tensor 跨全部 chips 和 dies 切分。
+- TP：小 batch（256-expert 模型 BS≤512、Kimi BS<1536）沿用 TP16。
+  大 batch 使用固定 token-group × chip-TP：256-expert 模型依次为
+  G2×TP8、G4×TP4、G8×TP2，Kimi 的对应阈值为1536、3072、6144。
+  group 间切 token，group 内 chip 沿 intermediate 维做 TP，chip 内4个dies
+  按expert划分。TP2 在权重超过每die SRAM时分两个expert权重波次执行。
 - EP：expert 在 chips 间划分，每个 chip 内的4个dies继续对本地expert做TP。
 - 小 batch 允许只激活部分experts；inactive expert不产生weight或计算命令。
 
