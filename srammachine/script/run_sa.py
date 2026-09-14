@@ -184,6 +184,10 @@ def _validate_args(
 
 
 def _make_cases(args: argparse.Namespace) -> list[SACase]:
+    # Keep batch as the outermost dimension so the process-pool queue is
+    # globally ordered from the heaviest batch to the lightest one.  If model
+    # were outermost, a BS32 case from the first model could start before a
+    # BS4096 case from the next model even though batch_sizes is descending.
     return [
         SACase(
             model=model,
@@ -201,9 +205,9 @@ def _make_cases(args: argparse.Namespace) -> list[SACase]:
             layer_count=args.layer_count,
             base_seed=args.seed,
         )
+        for batch in args.batch_sizes
         for model in args.models
         for strategy in args.moe_strategy
-        for batch in args.batch_sizes
         for mtp in args.mtp
     ]
 
