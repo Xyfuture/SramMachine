@@ -1511,6 +1511,12 @@ class HardwareMapper:
             thresholds = ((6144, 8, 2), (3072, 4, 4), (1536, 2, 8))
         else:
             thresholds = ((4096, 8, 2), (2048, 4, 4), (1024, 2, 8))
+        # The middle G4 x TP4 mapping remains preferable at the largest batch
+        # sizes.  Keep the G8 x TP2 tier defined below for reference, but let
+        # this rule cover its activation range for every supported model.
+        middle_threshold = thresholds[1][0]
+        if base_global_batch >= middle_threshold:
+            return 4, 4
         for threshold, token_groups, chip_tp_degree in thresholds:
             if base_global_batch >= threshold:
                 return token_groups, chip_tp_degree

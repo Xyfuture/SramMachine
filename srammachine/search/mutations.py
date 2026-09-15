@@ -78,8 +78,6 @@ def legal_tree_mutations(tree: PipeTree) -> Tuple[TreeMutation, ...]:
     groups = tuple(_group_nodes(tree.root, tree.batch_size))
 
     for path, node, incoming_batch in groups:
-        if is_atomic_compute_group(node):
-            continue
         divisors = _divisors(incoming_batch)
         position = divisors.index(node.split)
         if position + 1 < len(divisors):
@@ -92,6 +90,13 @@ def legal_tree_mutations(tree: PipeTree) -> Tuple[TreeMutation, ...]:
             add_if_valid(
                 "decrease_split", _replace_node(tree.root, path, updated),
             )
+
+        # The input/core/output children must remain an indivisible block, but
+        # the block itself is a legal microbatch boundary.  Stopping here only
+        # forbids regrouping or ungrouping its three commands; split mutations
+        # above apply the same token partition to all of them.
+        if is_atomic_compute_group(node):
+            continue
 
         for index in range(len(node.children) - 1):
             grouped = GroupNode(node.children[index:index + 2], split=1)
