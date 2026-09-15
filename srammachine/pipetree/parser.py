@@ -72,8 +72,15 @@ class TreeParser:
             prefix = f"layer{layer}."
             for cmd in single.commands:
                 copied_id = prefix + cmd.cmd_id
-                # Copies may carry nested vector parameters: do not share them.
-                commands.append(replace(deepcopy(cmd), cmd_id=copied_id))
+                # Only VectorCmd carries arbitrary nested mutable parameters.
+                # Other commands are immutable or normalize mapping values in
+                # __post_init__, so avoid recursively copying all their fields.
+                copied = (
+                    replace(cmd, cmd_id=copied_id, params=deepcopy(cmd.params))
+                    if isinstance(cmd, VectorCmd)
+                    else replace(cmd, cmd_id=copied_id)
+                )
+                commands.append(copied)
                 traces[copied_id] = replace(single.traces[cmd.cmd_id], layer_index=layer)
             edges.extend((prefix + source, prefix + target) for source, target in single.edges)
             if layer:

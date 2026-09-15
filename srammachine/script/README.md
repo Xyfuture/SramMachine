@@ -200,11 +200,12 @@ Pareto front 只在固定配置内部计算。分组字段包括模型、MoE策�
 - `--rounds` 是每次 restart 的正式轮数；`--warmup-rounds` 也会在每次 restart 中完整执行。
 - 默认每个 `(model, MoE strategy, batch, MTP)` case 运行4次 restart，因此正式 proposal 总数为 `case数 × 4 × --rounds`。
 - 各 restart 使用稳定且不同的随机种子，搜索状态相互独立，但会共享同一 case 已完成的仿真评分以避免重复运行 Desim。
+- SA候选仍使用原TreeParser、GraphExecutor和Desim调度语义；worker只跳过Desim优先队列每次操作附带的重复全表调试扫描，并通过轻量结果路径直接读取候选latency。baseline、最佳树和trace仍生成完整SimulationResult，且最佳树重新物化时会严格核对latency。
 - case 数量等于 `模型数 × MoE策略数 × batch数 × MTP状态数`。
 - 默认会使用尽可能多的逻辑核心；大型搜索也会占用较多内存，必要时使用 `--workers` 限制并发。
 - 不同 case 位于独立进程中，不共享 Desim 状态或 SA 搜索轨迹。
 - 所有case在进入进程池前按BS全局降序排列：全部最大BS先入队，再依次进入较小BS；不设置批次间屏障，空闲worker会立即领取队列中的下一个case。
-- worker在每个case结束后都会回收，因此已完成case不会持续累积内存。峰值内存通常约为`并发worker数 × 单个最大case内存`；若峰值过高，应降低`--workers`。
+- worker在每个case结束后都会回收，因此已完成case不会持续累积内存。默认仍使用全部逻辑线程；在16核32线程Windows机器上峰值内存通常约为`32 × 单个case内存`，若出现分页或内存不足，应显式使用`--workers 16`。
 - 一个命令可以同时指定`--moe-strategy tp ep`；汇总CSV合并两种策略，最终JSON按模型、策略和MTP分别导出。
 - 显式指定的 `--output-csv` 如果已经存在，脚本会拒绝覆盖。
 - 每个case搜索完成后，脚本立即保存独立SplitTree checkpoint、重放该树并生成Perfetto trace和稳态PU利用率；trace阶段不增加SA搜索轮数。

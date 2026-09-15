@@ -73,6 +73,78 @@ class Simulator:
             ),
         )
 
+    def run_latency(
+        self, graph: CommandGraph, *, mapping_result: HardwareMappingResult,
+    ) -> float:
+        """Run the same scheduler and return model latency without trace objects.
+
+        Simulated annealing only needs latency for most candidates.  Building
+        immutable command parameter dictionaries and ``CommandResult`` objects
+        for every rejected tree adds work and memory but cannot affect the
+        scheduler.  Final trees still use :meth:`run` for full materialization.
+        """
+        if not isinstance(graph, CommandGraph):
+            raise TypeError("graph must be a CommandGraph")
+        if not isinstance(mapping_result, HardwareMappingResult):
+            raise TypeError("mapping_result must be a HardwareMappingResult")
+        if mapping_result.chip_count != self.hardware_config.chip_count:
+            raise ValueError(
+                "mapping_result and simulator hardware chip counts differ"
+            )
+        execution = GraphExecutor.simulate(graph, self.hardware_config)
+        graph_ids = tuple(command.cmd_id for command in graph.commands)
+        if set(graph_ids) != set(execution.executions):
+            raise ValueError("execution result does not match the command graph")
+        if graph_ids and set(graph.traces) != set(graph_ids):
+            raise ValueError("every command requires CommandTrace metadata")
+
+        layer_indices = sorted({
+            trace.layer_index for trace in graph.traces.values()
+        })
+        if layer_indices != list(range(len(layer_indices))):
+            raise ValueError("CommandTrace layer indices must be consecutive from 0")
+        if not layer_indices:
+            pipeline_layer_time_ns = 0
+        else:
+            def bounds(layer_index: int, *, core_only: bool) -> tuple[int, int] | None:
+                items = [
+                    execution.executions[command.cmd_id]
+                    for command in graph.commands
+                    if graph.traces[command.cmd_id].layer_index == layer_index
+                    and (not core_only or command.cmd_id.endswith(".core"))
+                ]
+                if not items:
+                    return None
+                return (
+                    min(item.start_time_ns for item in items),
+                    max(item.end_time_ns for item in items),
+                )
+
+            if len(layer_indices) >= 3:
+                previous = bounds(1, core_only=True)
+                current = bounds(2, core_only=True)
+                if previous is None or current is None:
+                    raise ValueError("steady-state layer has no core commands")
+                pipeline_layer_time_ns = current[0] - previous[0]
+            elif len(layer_indices) == 2:
+                previous = bounds(0, core_only=True)
+                current = bounds(1, core_only=True)
+                if previous is None or current is None:
+                    raise ValueError("pipeline layer has no core commands")
+                pipeline_layer_time_ns = current[0] - previous[0]
+            else:
+                active = bounds(0, core_only=True)
+                if active is None:
+                    active = bounds(0, core_only=False)
+                if active is None:
+                    pipeline_layer_time_ns = 0
+                else:
+                    pipeline_layer_time_ns = active[1] - active[0]
+        return (
+            pipeline_layer_time_ns
+            * mapping_result.model_config.num_hidden_layers
+        )
+
     def run_and_trace(
         self,
         graph: CommandGraph,

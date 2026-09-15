@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 import json
@@ -28,6 +29,8 @@ import sys
 import tempfile
 import traceback
 from typing import Any, Callable, Iterable, Sequence
+
+from Desim.Utils import UniquePriorityQueue
 
 from srammachine.hardware import DEFAULT_HARDWARE_CONFIG
 from srammachine.inference import InferenceConfig, MoEParallelStrategy
@@ -230,7 +233,35 @@ def choose_worker_count(
     return min(case_count, limit)
 
 
+@contextmanager
+def _without_desim_priority_queue_validation():
+    """Skip Desim's quadratic debug scan inside one isolated SA worker.
+
+    ``UniquePriorityQueue`` already maintains a ``SortedList`` and a set on
+    every mutation.  Its debug-only ``valid_check`` walks both containers and
+    invokes ``SortedList._check`` before and after every queue operation.  That
+    validates the library implementation rather than changing scheduling.
+    Keep the patch scoped so ordinary Simulator users and the test suite retain
+    all Desim diagnostics.
+    """
+    original = UniquePriorityQueue.valid_check
+
+    def _already_valid(_queue) -> bool:
+        return True
+
+    UniquePriorityQueue.valid_check = _already_valid
+    try:
+        yield
+    finally:
+        UniquePriorityQueue.valid_check = original
+
+
 def _run_case(case: SACase) -> dict[str, Any]:
+    with _without_desim_priority_queue_validation():
+        return _run_case_impl(case)
+
+
+def _run_case_impl(case: SACase) -> dict[str, Any]:
     strategy = MoEParallelStrategy(case.moe_strategy)
     request = HardwareMappingRequest(case.model, InferenceConfig(
         global_batch_size=case.global_batch_size,

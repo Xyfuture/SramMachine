@@ -416,8 +416,9 @@ class SplitTreeOptimizer:
         )
 
     @staticmethod
-    def _metrics(mapping: HardwareMappingResult, result: SimulationResult):
-        latency_ns = result.latency_ns
+    def _metrics_from_latency(
+        mapping: HardwareMappingResult, latency_ns: float,
+    ):
         if latency_ns is None or latency_ns <= 0:
             raise ValueError("annealing candidate produced no positive model latency")
         accepted = mapping.request.inference_config.accepted_tokens_per_step
@@ -425,11 +426,17 @@ class SplitTreeOptimizer:
         batch = mapping.request.inference_config.global_batch_size
         return latency_ns, single_user, single_user * batch
 
+    @classmethod
+    def _metrics(cls, mapping: HardwareMappingResult, result: SimulationResult):
+        return cls._metrics_from_latency(mapping, result.latency_ns)
+
     def _new_score(
         self, mapping: HardwareMappingResult, tree: PipeTree,
-        result: SimulationResult,
+        latency_ns: float,
     ) -> _CandidateScore:
-        latency, single_user, total = self._metrics(mapping, result)
+        latency, single_user, total = self._metrics_from_latency(
+            mapping, latency_ns,
+        )
         score = _CandidateScore(
             mapping.request.inference_config.global_batch_size,
             mapping.request.inference_config.mtp_enabled,
@@ -459,7 +466,7 @@ class SplitTreeOptimizer:
             layer_count=self._config.layer_count,
         )
         result = self._simulator.run(graph, mapping_result=mapping)
-        score = self._new_score(mapping, tree, result)
+        score = self._new_score(mapping, tree, result.latency_ns)
         self._total_candidate_simulations += 1
         return self._evaluation(mapping, score, result)
 
@@ -498,11 +505,16 @@ class SplitTreeOptimizer:
             graph = parse(tree) if graph is None else graph
             if graph is None:
                 raise ValueError("SplitTree cannot be lowered exactly for this workload")
-            result = self._simulator.run(graph, mapping_result=mapping)
-            item = self._new_score(mapping, tree, result)
-            score_cache[key] = item
             if retain_full:
+                result = self._simulator.run(graph, mapping_result=mapping)
+                item = self._new_score(mapping, tree, result.latency_ns)
                 full_cache[key] = self._evaluation(mapping, item, result)
+            else:
+                latency_ns = self._simulator.run_latency(
+                    graph, mapping_result=mapping,
+                )
+                item = self._new_score(mapping, tree, latency_ns)
+            score_cache[key] = item
             candidate_simulations += 1
             return item
 
@@ -565,6 +577,10 @@ class SplitTreeOptimizer:
         restart_results = []
         setup_simulations = candidate_simulations
         setup_cache_hits = cache_hits
+        temperatures = tuple(
+            self._temperature(self._config, iteration)
+            for iteration in range(self._config.rounds)
+        )
         for restart_index in range(self._config.restart_count):
             restart_seed = derive_restart_seed(seed, restart_index)
             rng = random.Random(restart_seed)
@@ -601,7 +617,7 @@ class SplitTreeOptimizer:
                 )
                 distance = self._domination_distance(archive, candidate, bounds)
                 archive = self._update_archive(archive, candidate)
-                temperature = self._temperature(self._config, iteration)
+                temperature = temperatures[iteration]
                 if reward > 0 or rng.random() < math.exp(-distance / temperature):
                     current = candidate
                     accepted += 1
