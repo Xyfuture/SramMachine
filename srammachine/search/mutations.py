@@ -62,8 +62,16 @@ def _divisors(value: int) -> tuple[int, ...]:
     return tuple(divisor for divisor in range(1, value + 1) if value % divisor == 0)
 
 
-def legal_tree_mutations(tree: PipeTree) -> Tuple[TreeMutation, ...]:
-    """Enumerate all one-step legal mutations in stable order."""
+def _deduplicate(mutations) -> Tuple[TreeMutation, ...]:
+    unique = {}
+    for name, candidate in mutations:
+        key = repr(candidate)
+        unique.setdefault(key, (name, candidate))
+    return tuple(unique.values())
+
+
+def _legacy_tree_mutations(tree: PipeTree) -> Tuple[TreeMutation, ...]:
+    """Enumerate the original neighborhood for deterministic regression tests."""
     if not isinstance(tree, PipeTree):
         raise TypeError("tree must be a PipeTree")
     mutations = []
@@ -124,11 +132,120 @@ def legal_tree_mutations(tree: PipeTree) -> Tuple[TreeMutation, ...]:
                     _replace_parent_children(tree.root, path, children),
                 )
 
-    unique = {}
-    for name, candidate in mutations:
-        key = repr(candidate)
-        unique.setdefault(key, (name, candidate))
-    return tuple(unique.values())
+    return _deduplicate(mutations)
+
+
+def legal_tree_mutations(tree: PipeTree) -> Tuple[TreeMutation, ...]:
+    """Enumerate the extended one-step neighborhood in stable order.
+
+    The complete legacy neighborhood is kept first.  Wider wraps, unary
+    microbatch layers, non-adjacent split choices, and boundary shifts are
+    appended so the original candidates retain their relative order.
+    """
+    if not isinstance(tree, PipeTree):
+        raise TypeError("tree must be a PipeTree")
+    mutations = list(_legacy_tree_mutations(tree))
+
+    def add_if_valid(name: str, root) -> None:
+        try:
+            candidate = PipeTree(tree.batch_size, tree.operator_order, root)
+        except ValueError:
+            return
+        mutations.append((name, candidate))
+
+    groups = tuple(_group_nodes(tree.root, tree.batch_size))
+    for path, node, incoming_batch in groups:
+        divisors = _divisors(incoming_batch)
+        position = divisors.index(node.split)
+        adjacent_targets = set()
+        if position > 0:
+            adjacent_targets.add(divisors[position - 1])
+        if position + 1 < len(divisors):
+            adjacent_targets.add(divisors[position + 1])
+        for target in divisors:
+            if target == node.split or target in adjacent_targets:
+                continue
+            updated = replace(node, split=target)
+            add_if_valid(
+                "increase_split" if target > node.split else "decrease_split",
+                _replace_node(tree.root, path, updated),
+            )
+
+        # Structural mutations may wrap an atomic block as one child, but
+        # never regroup the input/compute/output commands inside that block.
+        if is_atomic_compute_group(node):
+            continue
+
+        child_count = len(node.children)
+        for width in range(3, child_count):
+            for start in range(child_count - width + 1):
+                stop = start + width
+                grouped = GroupNode(node.children[start:stop], split=1)
+                children = (
+                    node.children[:start] + (grouped,) + node.children[stop:]
+                )
+                add_if_valid(
+                    "group_siblings",
+                    _replace_parent_children(tree.root, path, children),
+                )
+
+        child_batch = incoming_batch // node.split
+        for index, child in enumerate(node.children):
+            for split in _divisors(child_batch):
+                if split == 1:
+                    continue
+                wrapped = GroupNode((child,), split=split)
+                children = (
+                    node.children[:index] + (wrapped,)
+                    + node.children[index + 1:]
+                )
+                add_if_valid(
+                    "wrap_single",
+                    _replace_parent_children(tree.root, path, children),
+                )
+
+        for index in range(child_count - 1):
+            left = node.children[index]
+            right = node.children[index + 1]
+            if not isinstance(left, GroupNode) or not isinstance(right, GroupNode):
+                continue
+            if is_atomic_compute_group(left) or is_atomic_compute_group(right):
+                continue
+
+            if len(left.children) >= 2:
+                shifted = (
+                    node.children[:index]
+                    + (
+                        replace(left, children=left.children[:-1]),
+                        replace(
+                            right,
+                            children=(left.children[-1],) + right.children,
+                        ),
+                    )
+                    + node.children[index + 2:]
+                )
+                add_if_valid(
+                    "boundary_shift",
+                    _replace_parent_children(tree.root, path, shifted),
+                )
+            if len(right.children) >= 2:
+                shifted = (
+                    node.children[:index]
+                    + (
+                        replace(
+                            left,
+                            children=left.children + (right.children[0],),
+                        ),
+                        replace(right, children=right.children[1:]),
+                    )
+                    + node.children[index + 2:]
+                )
+                add_if_valid(
+                    "boundary_shift",
+                    _replace_parent_children(tree.root, path, shifted),
+                )
+
+    return _deduplicate(mutations)
 
 
 def rebind_split_tree(
