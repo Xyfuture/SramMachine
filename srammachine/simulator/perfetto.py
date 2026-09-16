@@ -129,6 +129,16 @@ def _trace_payload(result: SimulationResult) -> Mapping[str, Any]:
                 args["noc_parallelism_assumption"] = (
                     "4 perimeter edges x 8 lanes at 256 GB/s each"
                 )
+        if item.op_id.startswith("attn."):
+            args["attention_mesh_model"] = (
+                "chip 8x8 PU mesh; 8-way input sharing/output reduction "
+                "for projections; FlashAttention rows are independent; "
+                "KV cache sharing follows the prior effective traffic model"
+            )
+            if item.parameters.get("noc_parallel_link_count") == 8:
+                args["noc_parallelism_assumption"] = (
+                    "8 parallel 256 GB/s PU paths"
+                )
         event = {
             "name": _event_name(item),
             "cat": item.category.value,

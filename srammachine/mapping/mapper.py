@@ -32,12 +32,10 @@ def _ceil_div(value: int, divisor: int) -> int:
 
 
 def _shared_effective_bytes(logical_bytes: int, logic_die_count: int) -> int:
-    """Charge one representative die its ideal share of chip-shared data.
+    """Legacy representative-die share of a chip-shared cache stream.
 
-    The simulator intentionally keeps die-granularity commands.  For data that
-    is bit-identical on every die (compressed KV and indexer keys), the four
-    physical dies are nevertheless treated as one logical chip with perfect
-    striping/multicast.  No extra NoC transfer is charged for this idealization.
+    Attention converts four such shares into one chip-level command. The
+    cache/head reuse estimate itself is intentionally unchanged here.
     """
     _positive_integer("logical_bytes", logical_bytes)
     _positive_integer("logic_die_count", logic_die_count)
@@ -231,6 +229,18 @@ class _LayerBuilder:
             f"chip0.die0.pu{row * columns}" for row in range(rows)
         )
 
+    @staticmethod
+    def chip_mesh_row() -> Tuple[str, ...]:
+        return (_LayerBuilder.PU,) + tuple(
+            f"chip0.pu{column}" for column in range(1, 8)
+        )
+
+    @staticmethod
+    def chip_mesh_column() -> Tuple[str, ...]:
+        return (_LayerBuilder.PU,) + tuple(
+            f"chip0.pu{row * 8}" for row in range(1, 8)
+        )
+
     @property
     def die_collective_parallel_link_count(self) -> int:
         """Physical NoC links striping one adjacent-die logical edge."""
@@ -263,6 +273,8 @@ class _LayerBuilder:
         )
         if (isinstance(operator, VectorOp) and op_id.startswith(("moe.tp", "moe.ep"))
                 and operator.kind in ("silu", "residual")):
+            valid_resources = {self.VECTOR, self.CHIP_VECTOR}
+        if isinstance(operator, VectorOp) and op_id.startswith("attn."):
             valid_resources = {self.VECTOR, self.CHIP_VECTOR}
         if mapping.resource_id not in valid_resources:
             raise ValueError("generated operator is bound to the wrong resource")
@@ -524,6 +536,11 @@ class _LayerBuilder:
         sram_read_logical_bytes_per_mapped_token: Optional[int] = None,
         shared_die_factor: int = 1,
         batch_axis: str = "B",
+        pu_dimensions_override: Optional[Mapping[str, int]] = None,
+        dram_resource_id: Optional[str] = None,
+        sram_resource_id: Optional[str] = None,
+        input_group: Optional[Sequence[str]] = None,
+        output_group: Optional[Sequence[str]] = None,
     ) -> None:
         """Add one fused FlashAttention critical path on a representative PU."""
         names = {"B", "M", "qk_K", "qk_N", "sv_K", "sv_N"}
@@ -540,6 +557,10 @@ class _LayerBuilder:
         pu_dimensions["qk_N"] = _ceil_div(die_dimensions["qk_N"], columns)
         pu_dimensions["sv_K"] = _ceil_div(die_dimensions["sv_K"], columns)
         pu_dimensions["sv_N"] = _ceil_div(die_dimensions["sv_N"], columns)
+        if pu_dimensions_override is not None:
+            pu_dimensions = dict(pu_dimensions_override)
+            if set(pu_dimensions) != names:
+                raise ValueError("invalid FlashAttention PU dimensions")
 
         input_bytes = (
             pu_dimensions["B"] * pu_dimensions["M"]
@@ -552,12 +573,13 @@ class _LayerBuilder:
         self.add_comm(
             f"{op_id}.input_broadcast", f"{op_kind}_input_broadcast",
             scope="intra_chip", kind="broadcast",
-            group=self.representative_pu_row, root=self.PU,
+            group=self.representative_pu_row if input_group is None else tuple(input_group), root=self.PU,
             size_bytes=input_bytes, parallel_strategy=parallel_strategy,
         )
         operator = FlashAttentionOp(op_id, **pu_dimensions)
         mapping = OperatorMapping(
-            batch_axis, self.PU, self.DRAM, self.SRAM,
+            batch_axis, self.PU, dram_resource_id or self.DRAM,
+            sram_resource_id or self.SRAM,
             dram_read_bytes_per_token=dram_read_bytes_per_token,
             dram_read_logical_bytes_per_token=(
                 dram_read_logical_bytes_per_token
@@ -583,7 +605,7 @@ class _LayerBuilder:
         self.add_comm(
             f"{op_id}.output_reduce", f"{op_kind}_output_reduce",
             scope="intra_chip", kind="reduce",
-            group=self.representative_pu_column, root=self.PU,
+            group=self.representative_pu_column if output_group is None else tuple(output_group), root=self.PU,
             size_bytes=output_bytes, reduce_kind="sum",
             parallel_strategy=parallel_strategy,
         )
@@ -759,6 +781,40 @@ class HardwareMapper:
     def _dims(B: int, M: int, K: int, N: int) -> Mapping[str, int]:
         return {"B": B, "M": M, "K": K, "N": N}
 
+    def _attention_projection(
+        self, builder: _LayerBuilder, op_id: str, op_kind: str,
+        global_dimensions: Mapping[str, int],
+        chip_dimensions: Mapping[str, int], strategy: str, *,
+        weight_batches: int = 1, batch_axis: str = "M",
+        dram_write_bytes_per_token: int = 0,
+    ) -> None:
+        """One representative tile of a chip-wide K8×N8 projection."""
+        chip = chip_dimensions
+        pu = self._dims(chip["B"], chip["M"],
+                        _ceil_div(chip["K"], 8), _ceil_div(chip["N"], 8))
+        builder.add_bmm(
+            op_id, op_kind, global_dimensions=global_dimensions,
+            chip_dimensions=chip, die_dimensions=chip,
+            pu_dimensions_override=pu, parallel_strategy=strategy,
+            weight_batches=weight_batches, batch_axis=batch_axis,
+            dram_resource_id=builder.CHIP_DRAM,
+            sram_resource_id=builder.CHIP_SRAM,
+            load_bytes_override=(
+                weight_batches * chip["K"] * chip["N"] * _WEIGHT_DTYPE_BYTES
+            ),
+            dram_write_bytes_per_token=dram_write_bytes_per_token,
+            input_bytes_override=(
+                chip["B"] * chip["M"] * chip["K"] * _ACTIVATION_DTYPE_BYTES
+            ),
+            output_bytes_override=(
+                chip["B"] * chip["M"] * chip["N"] * _ACTIVATION_DTYPE_BYTES
+            ),
+            input_group=builder.chip_mesh_row(),
+            output_group=builder.chip_mesh_column(),
+            input_parallel_link_count=8,
+            output_parallel_link_count=8,
+        )
+
     def _build_attention(self, builder: _LayerBuilder) -> None:
         request = builder.request
         model = builder.model_config
@@ -772,14 +828,12 @@ class HardwareMapper:
         # the per-request DRAM/SRAM cache traffic below remains unchanged.
         global_batch = base_global_batch * token_multiplier
         chip_batch = _ceil_div(base_global_batch, chips) * token_multiplier
-        local_heads = model.num_attention_heads // dies
         pu_rows = self.hardware_config.chip.logic_die.pu_mesh_rows
         pu_columns = self.hardware_config.chip.logic_die.pu_mesh_columns
         latent_width = (
             model.q_lora_rank + model.kv_lora_rank + model.qk_rope_head_dim
         )
-        local_latent = latent_width // dies
-        strategy = "attention_chip_dp_die_head_tp_pu_tp"
+        strategy = "attention_chip_dp_pu_k8_n8"
 
         builder.add_vector(
             "attn.input_norm", "rmsnorm",
@@ -787,8 +841,10 @@ class HardwareMapper:
             chip_dimensions={"m": chip_batch, "n": model.hidden_size},
             die_dimensions={"m": chip_batch, "n": model.hidden_size},
             parallel_strategy=strategy,
+            resource_id=builder.CHIP_VECTOR,
         )
-        builder.add_bmm(
+        self._attention_projection(
+            builder,
             "attn.latent_down", "mla_latent_down_projection",
             global_dimensions=self._dims(
                 1, global_batch, model.hidden_size, latent_width,
@@ -796,29 +852,10 @@ class HardwareMapper:
             chip_dimensions=self._dims(
                 1, chip_batch, model.hidden_size, latent_width,
             ),
-            die_dimensions=self._dims(
-                1, chip_batch, model.hidden_size, local_latent,
-            ),
-            parallel_strategy=strategy,
-            weight_batches=1,
-        )
-        builder.add_comm(
-            "attn.latent_allgather", "latent_allgather",
-            scope="intra_chip", kind="allgather", group=builder.die_group,
-            size_bytes=chip_batch * local_latent * _ACTIVATION_DTYPE_BYTES,
-            parallel_link_count=builder.die_collective_parallel_link_count,
-            parallel_strategy=strategy,
+            strategy=strategy,
             dram_write_bytes_per_token=(
-                _shared_effective_bytes(
-                    (model.kv_lora_rank + model.qk_rope_head_dim)
-                    * kv_dtype_bytes,
-                    dies,
-                )
-            ),
-            dram_write_logical_bytes_per_token=(
                 model.kv_lora_rank + model.qk_rope_head_dim
             ) * kv_dtype_bytes,
-            shared_die_factor=dies,
         )
         if model.use_qk_norm:
             for suffix, width in (
@@ -831,6 +868,7 @@ class HardwareMapper:
                     chip_dimensions={"m": chip_batch, "n": width},
                     die_dimensions={"m": chip_batch, "n": width},
                     parallel_strategy=strategy,
+                    resource_id=builder.CHIP_VECTOR,
                 )
         builder.add_vector(
             "attn.k_rope", "rope",
@@ -844,8 +882,10 @@ class HardwareMapper:
                 "m": chip_batch, "n": model.qk_rope_head_dim,
             },
             parallel_strategy=strategy,
+            resource_id=builder.CHIP_VECTOR,
         )
-        builder.add_bmm(
+        self._attention_projection(
+            builder,
             "attn.q_rope_projection", "q_rope_projection",
             global_dimensions=self._dims(
                 1, global_batch, model.q_lora_rank,
@@ -855,12 +895,7 @@ class HardwareMapper:
                 1, chip_batch, model.q_lora_rank,
                 model.num_attention_heads * model.qk_rope_head_dim,
             ),
-            die_dimensions=self._dims(
-                1, chip_batch, model.q_lora_rank,
-                local_heads * model.qk_rope_head_dim,
-            ),
-            parallel_strategy=strategy,
-            weight_batches=1,
+            strategy=strategy,
         )
         builder.add_vector(
             "attn.q_rope", "rope",
@@ -873,10 +908,11 @@ class HardwareMapper:
                 "n": model.qk_rope_head_dim,
             },
             die_dimensions={
-                "m": chip_batch * local_heads,
+                "m": chip_batch * model.num_attention_heads,
                 "n": model.qk_rope_head_dim,
             },
             parallel_strategy=strategy,
+            resource_id=builder.CHIP_VECTOR,
         )
         if model.dsa:
             self._build_dsa(builder, chip_batch, strategy)
@@ -888,8 +924,8 @@ class HardwareMapper:
         )
         global_head_batch = global_batch * model.num_attention_heads
         chip_head_batch = chip_batch * model.num_attention_heads
-        die_head_batch = chip_batch * local_heads
-        builder.add_bmm(
+        self._attention_projection(
+            builder,
             "attn.qk_nope_absorb", "qk_nope_absorb_q",
             global_dimensions=self._dims(
                 global_head_batch, 1, model.q_lora_rank, model.kv_lora_rank,
@@ -897,11 +933,8 @@ class HardwareMapper:
             chip_dimensions=self._dims(
                 chip_head_batch, 1, model.q_lora_rank, model.kv_lora_rank,
             ),
-            die_dimensions=self._dims(
-                die_head_batch, 1, model.q_lora_rank, model.kv_lora_rank,
-            ),
-            parallel_strategy=strategy,
-            weight_batches=local_heads,
+            strategy=strategy,
+            weight_batches=model.num_attention_heads,
             batch_axis="B",
         )
         # FlashAttention consumes the concatenated NoPE/RoPE Q and streams
@@ -916,27 +949,32 @@ class HardwareMapper:
             "sv_K": attention_history,
             "sv_N": model.kv_lora_rank,
         }
-        # The compressed KV cache is logically shared by all head-TP dies.
-        # Charge only one ideal striped chip copy: both DRAM->SRAM and
-        # SRAM->SA are streaming traffic, not a full resident-SRAM allocation.
+        # Preserve the previous effective cache stream, now as one chip
+        # command: four representative-die shares at four-port bandwidth.
         builder.add_flash_attention(
             "attn.flash_attention", "flash_attention",
             global_dimensions=flash_dimensions(global_head_batch),
             chip_dimensions=flash_dimensions(chip_head_batch),
-            die_dimensions=flash_dimensions(die_head_batch),
+            die_dimensions=flash_dimensions(chip_head_batch),
             parallel_strategy=strategy,
+            pu_dimensions_override={
+                **flash_dimensions(_exact_div(chip_head_batch, 8, "flash row heads")),
+                "qk_N": _ceil_div(attention_history, 8),
+                "sv_K": _ceil_div(attention_history, 8),
+            },
+            dram_resource_id=builder.CHIP_DRAM,
+            sram_resource_id=builder.CHIP_SRAM,
+            input_group=builder.chip_mesh_row(),
+            output_group=builder.chip_mesh_row(),
             dram_read_bytes_per_token=(
-                _shared_effective_bytes(
+                4 * _shared_effective_bytes(
                     attention_history * fused_qk_width
                     * kv_dtype_bytes,
                     dies,
                 )
             ),
-            dram_read_logical_bytes_per_token=(
-                attention_history * fused_qk_width * kv_dtype_bytes
-            ),
             sram_read_bytes_per_mapped_token=(
-                _shared_effective_bytes(
+                4 * _shared_effective_bytes(
                     (
                         _ceil_div(model.kv_lora_rank, pu_rows)
                         + _ceil_div(model.qk_rope_head_dim, pu_rows)
@@ -946,22 +984,14 @@ class HardwareMapper:
                     dies,
                 )
             ),
-            sram_read_logical_bytes_per_mapped_token=(
-                (
-                    _ceil_div(model.kv_lora_rank, pu_rows)
-                    + _ceil_div(model.qk_rope_head_dim, pu_rows)
-                )
-                * _ceil_div(attention_history, pu_columns)
-                * kv_dtype_bytes
-            ),
-            shared_die_factor=dies,
         )
 
         # O projection contracts both the local-head and latent dimensions.
         # Folding heads into K is algebraically identical to the batched form,
         # keeps the PU FLOPs and weight tile unchanged, and reduces the NoC
         # output from per-head partials to one hidden tile per request.
-        builder.add_bmm(
+        self._attention_projection(
+            builder,
             "attn.vo_absorb", "vo_absorb_head_folded_k",
             global_dimensions=self._dims(
                 1, global_batch,
@@ -973,20 +1003,8 @@ class HardwareMapper:
                 model.num_attention_heads * model.kv_lora_rank,
                 model.hidden_size,
             ),
-            die_dimensions=self._dims(
-                1, chip_batch, local_heads * model.kv_lora_rank,
-                model.hidden_size,
-            ),
-            parallel_strategy=strategy,
-            weight_batches=1,
+            strategy=strategy,
             batch_axis="M",
-        )
-        builder.add_comm(
-            "attn.die_output_reduce", "die_output_reduce",
-            scope="intra_chip", kind="allreduce", group=builder.die_group,
-            size_bytes=chip_batch * model.hidden_size * _ACTIVATION_DTYPE_BYTES,
-            parallel_link_count=builder.die_collective_parallel_link_count,
-            parallel_strategy=strategy,
         )
         for op_id, kind, coefficient in (
             ("attn.residual", "residual", 1),
@@ -1005,6 +1023,7 @@ class HardwareMapper:
                 },
                 parallel_strategy=strategy,
                 flops_per_element=coefficient,
+                resource_id=builder.CHIP_VECTOR,
             )
 
     def _build_dsa(
@@ -1031,36 +1050,8 @@ class HardwareMapper:
             model.indexer_num_heads * model.indexer_head_dim
             + model.indexer_head_dim + model.indexer_num_heads
         )
-        die_width = (
-            local_heads * model.indexer_head_dim
-            + model.indexer_head_dim + local_heads
-        )
-        # Query projections and per-head indexer weights are distinct die
-        # shards. Only the shared 128-wide key projection is normalized.
-        effective_shared_key_width = _ceil_div(
-            model.indexer_head_dim, dies,
-        )
-        effective_die_width = (
-            local_heads * model.indexer_head_dim
-            + effective_shared_key_width + local_heads
-        )
-        logical_weight_bytes = (
-            model.hidden_size * die_width * _WEIGHT_DTYPE_BYTES
-        )
-        effective_weight_bytes = (
-            model.hidden_size * effective_die_width * _WEIGHT_DTYPE_BYTES
-        )
-        logical_load_bytes = (
-            _ceil_div(model.hidden_size, pu_rows)
-            * _ceil_div(die_width, pu_columns)
-            * _WEIGHT_DTYPE_BYTES
-        )
-        effective_load_bytes = (
-            _ceil_div(model.hidden_size, pu_rows)
-            * _ceil_div(effective_die_width, pu_columns)
-            * _WEIGHT_DTYPE_BYTES
-        )
-        builder.add_bmm(
+        self._attention_projection(
+            builder,
             "attn.dsa_qkw", "indexer_qkw_projection",
             global_dimensions=self._dims(
                 1, global_batch, model.hidden_size, chip_width,
@@ -1068,23 +1059,8 @@ class HardwareMapper:
             chip_dimensions=self._dims(
                 1, chip_batch, model.hidden_size, chip_width,
             ),
-            die_dimensions=self._dims(
-                1, chip_batch, model.hidden_size, die_width,
-            ),
-            parallel_strategy=strategy,
-            weight_batches=1,
-            weight_bytes_override=effective_weight_bytes,
-            weight_logical_bytes=logical_weight_bytes,
-            load_bytes_override=effective_load_bytes,
-            load_logical_bytes=logical_load_bytes,
-            shared_die_factor=dies,
+            strategy=strategy,
             dram_write_bytes_per_token=(
-                _shared_effective_bytes(
-                    model.indexer_head_dim * kv_dtype_bytes,
-                    dies,
-                )
-            ),
-            dram_write_logical_bytes_per_token=(
                 model.indexer_head_dim * kv_dtype_bytes
             ),
         )
@@ -1101,14 +1077,15 @@ class HardwareMapper:
 
         if base_global_batch <= 128:
             pu_dimensions = self._dims(
-                chip_batch, old_pu_M, model.indexer_head_dim, old_pu_N,
+                chip_batch, _ceil_div(model.indexer_num_heads, 8),
+                model.indexer_head_dim, _ceil_div(history, 8),
             )
             batch_partition_degree = 1
             output_kind = "reduce"
-            output_group = None
+            output_group = builder.chip_mesh_column()
             output_suffix = "output_reduce"
             output_bytes = (
-                chip_batch * old_pu_N * _ACTIVATION_DTYPE_BYTES
+                chip_batch * pu_dimensions["N"] * _ACTIVATION_DTYPE_BYTES
             )
             main_gemm_override = None
         elif base_global_batch < 1024:
@@ -1123,7 +1100,7 @@ class HardwareMapper:
             )
             batch_partition_degree = local_req
             output_kind = "p2p"
-            output_group = (builder.PU, "chip0.die0.output")
+            output_group = (builder.PU, "chip0.output")
             output_suffix = "output_transfer"
             local_top_k = min(2048, pu_dimensions["N"])
             output_bytes = token_multiplier * local_top_k * 4
@@ -1144,7 +1121,7 @@ class HardwareMapper:
             )
             batch_partition_degree = pu_count
             output_kind = "p2p"
-            output_group = (builder.PU, "chip0.die0.output")
+            output_group = (builder.PU, "chip0.output")
             output_suffix = "output_transfer"
             # Each top-k candidate carries a 2-byte shard-local token ID and
             # a 2-byte score. The source PU identifies the shard origin.
@@ -1162,51 +1139,46 @@ class HardwareMapper:
                 model.indexer_head_dim, history,
             ),
             die_dimensions=self._dims(
-                chip_batch, local_heads,
+                chip_batch, model.indexer_num_heads,
                 model.indexer_head_dim, history,
             ),
             parallel_strategy=strategy,
-            # The indexer key cache is the same on every die. As for MLA KV,
-            # model perfect chip-level sharing and stream one fourth of both
-            # DRAM and SRAM traffic without adding a synthetic NoC transfer.
+            # Retain four former representative-die cache shares as a single
+            # chip command. The existing request/sequence reuse estimate is
+            # intentionally unchanged.
             dram_read_bytes_per_token=(
-                _shared_effective_bytes(
-                    history * model.indexer_head_dim * kv_dtype_bytes,
-                    dies,
+                4 * _shared_effective_bytes(
+                    history * model.indexer_head_dim * kv_dtype_bytes, dies,
                 )
             ),
-            dram_read_logical_bytes_per_token=(
-                history * model.indexer_head_dim * kv_dtype_bytes
-            ),
+            dram_resource_id=builder.CHIP_DRAM,
+            sram_resource_id=builder.CHIP_SRAM,
             batch_axis="B",
             pu_dimensions_override=pu_dimensions,
             fused_indexer_score=True,
             main_gemm_flops_override=main_gemm_override,
             sram_read_bytes_per_mapped_token=(
-                _shared_effective_bytes(
+                4 * _shared_effective_bytes(
                     model.indexer_head_dim * pu_dimensions["N"]
                     * kv_dtype_bytes,
                     dies,
                 )
             ),
-            sram_read_logical_bytes_per_mapped_token=(
-                model.indexer_head_dim * pu_dimensions["N"]
-                * kv_dtype_bytes
-            ),
             sram_read_data_kind="dsa_key",
-            shared_die_factor=dies,
             batch_partition_degree=batch_partition_degree,
             output_kind=output_kind,
             output_group=output_group,
             output_suffix=output_suffix,
             output_bytes_override=output_bytes,
+            input_group=builder.chip_mesh_row(),
         )
         if base_global_batch <= 128:
             builder.add_comm(
-                "attn.dsa_score_reduce", "indexer_score_reduce",
-                scope="intra_chip", kind="allreduce", group=builder.die_group,
-                size_bytes=chip_batch * history * _ACTIVATION_DTYPE_BYTES,
-                parallel_link_count=builder.die_collective_parallel_link_count,
+                "attn.dsa_score_allgather", "indexer_score_allgather",
+                scope="intra_chip", kind="allgather",
+                group=builder.chip_mesh_row(),
+                size_bytes=chip_batch * _ceil_div(history, 8)
+                * _ACTIVATION_DTYPE_BYTES,
                 parallel_strategy=strategy,
             )
 
