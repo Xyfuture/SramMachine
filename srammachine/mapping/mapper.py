@@ -1877,7 +1877,10 @@ class HardwareMapper:
             model.model_name in {
                 "deepseek-v3", "deepseek-v3.2", "glm-5.1",
             }
-            and base_global_batch >= 2048
+            and chips == 16
+            and dies == 4
+            and self.hardware_config.chip.logic_die.pu_mesh_rows == 4
+            and self.hardware_config.chip.logic_die.pu_mesh_columns == 4
         )
         strategy = (
             "moe_ep_hierarchical_die_expert"
