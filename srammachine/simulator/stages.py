@@ -148,6 +148,8 @@ class DramResourceStage(HardwareResourceStage):
             self.hardware_config.chip.logic_die.memory
             .dram_bandwidth_bytes_per_second
         )
+        if self.resource_id == "chip0.dram":
+            bandwidth *= self.hardware_config.chip.logic_die_count
         return _rate_duration_ns(command.size_bytes, bandwidth)
 
 
@@ -161,6 +163,11 @@ class SramResourceStage(HardwareResourceStage):
             logic_die.memory.sram_bandwidth_bytes_per_second,
             logic_die.processing_unit.weight_bandwidth_bytes_per_second,
         )
+        if self.resource_id == "chip0.sram":
+            bandwidth = (
+                self.hardware_config.chip.logic_die_count
+                * logic_die.memory.sram_bandwidth_bytes_per_second
+            )
         return _rate_duration_ns(command.size_bytes, bandwidth)
 
 
@@ -187,6 +194,8 @@ class VectorUnitStage(HardwareResourceStage):
         self._validate_command(command)
         flops = vector_flop_count(command)
         peak_flops = self.hardware_config.chip.logic_die.vector_unit.peak_flops
+        if self.resource_id == "chip0.vector":
+            peak_flops *= self.hardware_config.chip.logic_die_count
         return _rate_duration_ns(flops, peak_flops)
 
 

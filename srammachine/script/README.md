@@ -29,14 +29,17 @@ GraphExecutor + Desim
 
 模拟器支持 MoE TP/EP、MTP1、FP8/FP16 KV cache，以及由模拟退火搜索 SplitTree。TP 与 EP 可以在同一次脚本运行中搜索；模拟退火同时考察单用户吞吐和总吞吐，并保留搜索得到的 Pareto 最优 SplitTree。
 
-MoE 的当前映射规则为：
-
-- TP：小 batch（256-expert 模型 BS≤512、Kimi BS<1536）沿用 TP16。
-  大 batch 使用固定 token-group × chip-TP：256-expert 模型依次为
-  G2×TP8、G4×TP4、G8×TP2，Kimi 的对应阈值为1536、3072、6144。
-  group 间切 token，group 内 chip 沿 intermediate 维做 TP，chip 内4个dies
-  按expert划分。TP2 在权重超过每die SRAM时分两个expert权重波次执行。
-- EP：expert 在 chips 间保持 EP16。DeepSeek-V3、DeepSeek-V3.2 和 GLM-5.1 在 BS≥2048 时使用 hierarchical EP：每 chip 的16个experts连续分给4个dies，每个expert使用一行4个PU；其他情况沿用原 chip 内 die-TP mapping。
+当前 MoE 映射不按 BS 分档：TP 的16个chip仅沿 intermediate N
+切分；每chip视为统一的8×8 PU mesh，直接做 hidden K8 × intermediate N8。
+TP 的 MoE 权重读取、SiLU 以整个chip为资源粒度；Up输入和Down输出
+使用理想的32路NoC并行带宽，并省略Up K partial归约，属于实验假设。
+EP仍由16个chip分别持有所属experts，chip内同样使用统一的8×8 PU mesh
+对每个本地expert做K8×N8张量并行；dispatch/combine仍是EP16 all-to-all。
+两种模式中，每个chip的64个PU对**每个本地expert**做张量并行，
+不按expert给PU分工。activation按FP8（1 byte/元素）计费，
+Fabric为每chip每方向1.6TB/s。切分依据和通信计费见
+[MoE TP/EP映射说明](MOE_PURE_TP_EXPERIMENT.md)。旧策略代码仍在，但
+默认16-chip四模型不再触发。
 - 小 batch 允许只激活部分experts；inactive expert不产生weight或计算命令。
 
 ## 并行 SA 脚本
@@ -98,6 +101,17 @@ python -m srammachine.script.run_sa --models deepseek-v3 deepseek-v3.2 kimi-k2.5
 python -m srammachine.script.run_sa --models deepseek-v3 deepseek-v3.2 kimi-k2.5 glm-5.1 --mtp off on --batch-sizes 256 512 1024 2048 --rounds 50 --input-sequence-length 20000 --output-sequence-length 600 --moe-strategy tp ep
 ```
 
+同一命令也可运行多个 ISL，例如：
+
+```powershell
+python -m srammachine.script.run_sa --models deepseek-v3 deepseek-v3.2 --mtp off on --batch-sizes 512 1024 --rounds 50 --input-sequence-length 20000 36000 --output-sequence-length 600 --moe-strategy tp ep
+```
+
+这条命令包含 `2 × 2 × 2 × 2 × 2 = 32` 个独立 case（模型 × MTP ×
+BS × ISL × MoE 策略）。提交队列按 BS 从大到小、同一 BS 内按 ISL 从大到小；
+并行 worker 的完成顺序及中途 CSV 写入顺序可能不同。最终 CSV 按 BS、ISL
+降序整理。
+
 只运行 DeepSeek V3 的 EP、MTP 关闭场景，并限制为 8 个 worker：
 
 ```powershell
@@ -126,7 +140,7 @@ python -m srammachine.script.run_sa --models deepseek-v3 --mtp off on --batch-si
 | `--mtp` | `off`、`on`，也可以同时指定 |
 | `--batch-sizes` | 一个或多个全局 batch size |
 | `--rounds` | 每次 restart 的正式 SA 轮数 |
-| `--input-sequence-length` | decoding 时使用的历史上下文长度 |
+| `--input-sequence-length` | 一个或多个 decoding 历史上下文长度；单值用法保持兼容 |
 | `--output-sequence-length` | 输出长度元数据 |
 | `--moe-strategy` | 一个或多个MoE并行策略：`tp`、`ep`，也可以同时指定 |
 
@@ -145,20 +159,24 @@ python -m srammachine.script.run_sa --models deepseek-v3 --mtp off on --batch-si
 | `--output-dir` | `best split tree result` | CSV 和 JSON 默认输出目录 |
 | `--output-csv` | 自动命名 | 指定汇总 CSV 的完整路径 |
 
-基础 seed 会结合 model、MoE 策略、batch 和 MTP，确定性地产生每个 case 的独立 seed。因此改变 worker 数量或任务完成顺序不会改变搜索结果。
+基础 seed 会结合 model、MoE 策略、batch 和 MTP，确定性地产生 workload seed。
+对应的不同 ISL case 共用这个 seed，以保持原有单 ISL 运行的搜索轨迹；
+改变 worker 数量或任务完成顺序不会改变搜索结果。
 
 ## 输出结果
 
 一次完整运行会产生：
 
 1. 一份跨模型、MoE策略、batch和MTP的汇总CSV。
-2. 每个 `(model, MoE strategy, MTP)` 一份包含最优SplitTree的JSON；上述全量配置共16份。
+2. 每个 `(model, MoE strategy, MTP, ISL)` 一份包含最优SplitTree的JSON；上述单ISL全量配置共16份。
 3. 每个case选择一棵最优SplitTree重放并导出一份Perfetto trace；上述全量配置共144份。
 4. `case checkpoints/<CSV文件名>/`目录中每个已完成case一份可独立重放的SplitTree JSON；上述全量配置共144份。
 
 CSV在worker启动前就会创建。每个worker完成SA后，会先原子写入该case的SplitTree checkpoint，再生成并原子写入Perfetto trace；两者均成功后才向主进程报告case完成。主进程随后将完整指标、路径和PU利用率写入CSV并强制刷新。因此程序被终止或某个case失败时，已经报告完成的case仍保留CSV、SplitTree和trace。若恰好在某个case的trace重放期间退出，该case尚未记入CSV，但已经写好的SplitTree checkpoint仍会保留。部分CSV的`is_model_global_pareto`字段为空；只有全部case成功后，该文件才会写入最终Pareto标记。
 
 自动文件名以本地时间精确到分钟，并在重名时追加序号，不会覆盖已有结果。
+每个 case 的 trace、SplitTree checkpoint 和最终 SplitTree JSON 文件名都包含
+`isl<长度>`；最终 JSON 的workloads与Pareto front只包含对应ISL。
 
 CSV 的关键字段包括：
 

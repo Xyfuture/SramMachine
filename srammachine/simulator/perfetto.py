@@ -91,6 +91,14 @@ def _trace_payload(result: SimulationResult) -> Mapping[str, Any]:
         result.command_results,
         key=lambda item: (item.start_time_ns, stable_order[item.cmd_id]),
     )
+    chip_mesh_modes = {
+        mode for mode in ("tp", "ep")
+        if any(
+            item.op_id.startswith(f"moe.{mode}")
+            and item.resource_id == "chip0.vector"
+            for item in ordered_results
+        )
+    }
     for item in ordered_results:
         args = {
             "cmd_id": item.cmd_id,
@@ -108,6 +116,19 @@ def _trace_payload(result: SimulationResult) -> Mapping[str, Any]:
             "duration_ns": item.duration_ns,
         }
         args.update(_json_value(item.parameters))
+        if (
+            any(item.op_id.startswith(f"moe.{mode}") for mode in chip_mesh_modes)
+            and item.resource_id in (
+                "chip0.noc_input", "chip0.noc_output", "chip0.vector",
+            )
+        ):
+            args["chip_mesh_model"] = (
+                "ideal 8x8 PU mesh; Up K-partial reduction omitted"
+            )
+            if item.parameters.get("noc_parallel_link_count") == 32:
+                args["noc_parallelism_assumption"] = (
+                    "4 perimeter edges x 8 lanes at 256 GB/s each"
+                )
         event = {
             "name": _event_name(item),
             "cat": item.category.value,

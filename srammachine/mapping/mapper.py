@@ -19,7 +19,7 @@ from .model import ModelConfig, load_model_config
 # Fixed execution precisions for the current hardware path. They are not
 # properties of an inference workload, so InferenceConfig does not store them.
 _WEIGHT_DTYPE_BYTES = 1
-_ACTIVATION_DTYPE_BYTES = 2
+_ACTIVATION_DTYPE_BYTES = 1
 
 
 def _positive_integer(name: str, value: int) -> None:
@@ -186,6 +186,9 @@ class _LayerBuilder:
     VECTOR = "chip0.die0.vector"
     DRAM = "chip0.die0.dram"
     SRAM = "chip0.die0.sram"
+    CHIP_DRAM = "chip0.dram"
+    CHIP_SRAM = "chip0.sram"
+    CHIP_VECTOR = "chip0.vector"
     NOC_INPUT = "chip0.noc_input"
     NOC_OUTPUT = "chip0.noc_output"
     FABRIC = "system.fabric"
@@ -258,6 +261,9 @@ class _LayerBuilder:
             and operator.kind == "p2p"
             else {expected_resource}
         )
+        if (isinstance(operator, VectorOp) and op_id.startswith(("moe.tp", "moe.ep"))
+                and operator.kind in ("silu", "residual")):
+            valid_resources = {self.VECTOR, self.CHIP_VECTOR}
         if mapping.resource_id not in valid_resources:
             raise ValueError("generated operator is bound to the wrong resource")
         self.order.append(op_id)
@@ -313,10 +319,15 @@ class _LayerBuilder:
         output_kind: str = "reduce",
         output_group: Optional[Sequence[Any]] = None,
         output_suffix: str = "output_reduce",
+        input_bytes_override: Optional[int] = None,
         output_bytes_override: Optional[int] = None,
         fused_indexer_score: bool = False,
         main_gemm_flops_override: Optional[int] = None,
         batch_scaling_unit_count: Optional[int] = None,
+        dram_resource_id: Optional[str] = None,
+        sram_resource_id: Optional[str] = None,
+        input_parallel_link_count: int = 1,
+        output_parallel_link_count: int = 1,
     ) -> None:
         for dimensions in (global_dimensions, chip_dimensions, die_dimensions):
             if set(dimensions) != {"B", "M", "K", "N"}:
@@ -359,6 +370,9 @@ class _LayerBuilder:
             pu_dimensions["B"] * pu_dimensions["M"] * pu_dimensions["K"]
             * _ACTIVATION_DTYPE_BYTES
         )
+        if input_bytes_override is not None:
+            _positive_integer("input_bytes_override", input_bytes_override)
+            input_bytes = input_bytes_override
         output_bytes = (
             pu_dimensions["B"] * pu_dimensions["M"] * pu_dimensions["N"]
             * _ACTIVATION_DTYPE_BYTES
@@ -383,6 +397,7 @@ class _LayerBuilder:
             batch_partition_degree=batch_partition_degree,
             noc_direction=input_noc_direction,
             batch_scaling_unit_count=batch_scaling_unit_count,
+            parallel_link_count=input_parallel_link_count,
         )
         operator_type = FusedIndexerScoreOp if fused_indexer_score else BMMOp
         operator_kwargs = dict(pu_dimensions)
@@ -393,11 +408,11 @@ class _LayerBuilder:
         operator = operator_type(op_id, **operator_kwargs)
         mapping = OperatorMapping(
             batch_axis, self.PU,
-            self.DRAM if (
+            (dram_resource_id or self.DRAM) if (
                 weight_bytes or dram_read_bytes_per_token
                 or dram_write_bytes_per_token
             ) else None,
-            self.SRAM if (
+            (sram_resource_id or self.SRAM) if (
                 weight_bytes or load_bytes or sram_read_bytes_per_mapped_token
             ) else None,
             dram_read_once_bytes=weight_bytes,
@@ -453,6 +468,7 @@ class _LayerBuilder:
             parallel_strategy=parallel_strategy,
             batch_partition_degree=batch_partition_degree,
             batch_scaling_unit_count=batch_scaling_unit_count,
+            parallel_link_count=output_parallel_link_count,
         )
 
     def add_vector(
@@ -466,6 +482,7 @@ class _LayerBuilder:
         tokens_per_expert: Optional[int] = None,
         batch_partition_degree: int = 1,
         batch_scaling_unit_count: Optional[int] = None,
+        resource_id: Optional[str] = None,
     ) -> None:
         if set(die_dimensions) != {"m", "n"}:
             raise ValueError("vector dimensions must contain exactly m/n")
@@ -479,7 +496,7 @@ class _LayerBuilder:
         self._record(
             operator,
             OperatorMapping(
-                "m", self.VECTOR,
+                "m", resource_id or self.VECTOR,
                 batch_partition_degree=batch_partition_degree,
                 batch_scaling_unit_count=batch_scaling_unit_count,
             ),
@@ -1734,11 +1751,427 @@ class HardwareMapper:
             flops_per_element=1,
         )
 
+    def _use_pure_moe_mapping(self, builder: _LayerBuilder) -> bool:
+        """The new MoE layout is defined for the default 16-chip 4x4 mesh."""
+        die = self.hardware_config.chip.logic_die
+        return (
+            self.hardware_config.chip_count == 16
+            and self.hardware_config.chip.logic_die_count == 4
+            and die.pu_mesh_rows == 4
+            and die.pu_mesh_columns == 4
+            and builder.model_config.model_name in {
+                "deepseek-v3", "deepseek-v3.2", "kimi-k2.5", "glm-5.1",
+            }
+        )
+
+    def _add_pure_moe_expert_group(
+        self, builder: _LayerBuilder, *, prefix: str,
+        expert_ids: Sequence[int], tokens_per_expert: int,
+        global_expert_count: int, chip_k_degree: int,
+        chip_n_degree: int, die_k_degree: int, pu_k_degree: int,
+        strategy: str,
+    ) -> None:
+        """Each of the chip's 64 PUs holds a shard of every local expert.
+
+        Dies and PUs use fixed K×N factor pairs. Every expert uses all 64
+        PUs without partitioning expert IDs.
+        """
+        model = builder.model_config
+        dies = self.hardware_config.chip.logic_die_count
+        die_n_degree = _exact_div(dies, die_k_degree, "pure MoE die N degree")
+        pu_per_die = self.hardware_config.chip.logic_die.processing_unit_count
+        pu_n_degree = _exact_div(
+            pu_per_die, pu_k_degree, "pure MoE PU N degree",
+        )
+        local_experts = len(expert_ids)
+        chip_intermediate = _exact_div(
+            model.moe_intermediate_size, chip_n_degree,
+            "pure MoE chip intermediate shard",
+        )
+        chip_hidden = _exact_div(
+            model.hidden_size, chip_k_degree, "pure MoE chip hidden shard",
+        )
+        hidden_die = _exact_div(
+            chip_hidden, die_k_degree, "pure MoE hidden die shard",
+        )
+        die_intermediate = _exact_div(
+            chip_intermediate, die_n_degree,
+            "pure MoE intermediate die shard",
+        )
+        hidden_pu = _exact_div(
+            hidden_die, pu_k_degree, "pure MoE PU hidden shard",
+        )
+        intermediate_pu = _exact_div(
+            die_intermediate, pu_n_degree,
+            "pure MoE PU intermediate shard",
+        )
+        up_output_group = tuple(
+            f"chip0.die0.pu{index}" for index in range(pu_k_degree)
+        )
+        down_output_group = tuple(
+            f"chip0.die0.pu{index}" for index in range(pu_n_degree)
+        )
+        suffix = f"tokens{tokens_per_expert}"
+        common = dict(
+            expert_ids=expert_ids,
+            tokens_per_expert=tokens_per_expert,
+            parallel_strategy=strategy,
+            batch_scaling_unit_count=tokens_per_expert,
+        )
+        builder.add_bmm(
+            f"{prefix}.{suffix}.up_gate", "moe_up_gate",
+            global_dimensions=self._dims(
+                global_expert_count, tokens_per_expert,
+                model.hidden_size, 2 * model.moe_intermediate_size,
+            ),
+            chip_dimensions=self._dims(
+                local_experts, tokens_per_expert, chip_hidden,
+                2 * chip_intermediate,
+            ),
+            die_dimensions=self._dims(
+                local_experts, tokens_per_expert, hidden_die,
+                2 * die_intermediate,
+            ),
+            pu_dimensions_override=self._dims(
+                local_experts, tokens_per_expert, hidden_pu,
+                2 * intermediate_pu,
+            ),
+            weight_batches=local_experts, pu_weight_batches=local_experts,
+            input_kind="p2p" if pu_k_degree > 1 else "broadcast",
+            input_suffix=(
+                "input_transfer" if pu_k_degree > 1 else "input_broadcast"
+            ),
+            input_group=(
+                ("chip0.die0.input", builder.PU)
+                if pu_k_degree > 1 else down_output_group
+            ),
+            input_noc_direction="input",
+            input_bytes_override=(
+                local_experts * tokens_per_expert
+                * hidden_die * _ACTIVATION_DTYPE_BYTES
+            ),
+            output_kind="reduce" if pu_k_degree > 1 else "p2p",
+            output_group=(
+                up_output_group if pu_k_degree > 1
+                else (builder.PU, "chip0.die0.output")
+            ),
+            output_suffix=(
+                "output_reduce" if pu_k_degree > 1 else "output_transfer"
+            ),
+            # The NoC output resource carries all 16 channel shards, even
+            # though the representative GEMM describes one PU shard.
+            output_bytes_override=(
+                local_experts * tokens_per_expert
+                * 2 * die_intermediate * _ACTIVATION_DTYPE_BYTES
+            ),
+            **common,
+        )
+        up_bytes = (
+            local_experts * tokens_per_expert
+            * 2 * die_intermediate * _ACTIVATION_DTYPE_BYTES
+        )
+        if die_k_degree > 1:
+            die_k_group = tuple(
+                f"chip0.die{index * die_n_degree}"
+                for index in range(die_k_degree)
+            )
+            builder.add_comm(
+                f"{prefix}.{suffix}.up_die_reduce_scatter",
+                "moe_up_gate_die_reduce_scatter",
+                scope="intra_chip", kind="reduce_scatter",
+                group=die_k_group, size_bytes=up_bytes,
+                parallel_link_count=builder.die_collective_parallel_link_count,
+                parallel_strategy=strategy,
+                batch_scaling_unit_count=tokens_per_expert,
+            )
+            builder.add_comm(
+                f"{prefix}.{suffix}.up_die_allgather",
+                "moe_up_gate_die_allgather",
+                scope="intra_chip", kind="allgather",
+                group=die_k_group,
+                size_bytes=_exact_div(
+                    up_bytes, die_k_degree, "pure MoE Up/Gate scatter",
+                ),
+                parallel_link_count=builder.die_collective_parallel_link_count,
+                parallel_strategy=strategy,
+                batch_scaling_unit_count=tokens_per_expert,
+            )
+        if chip_k_degree > 1:
+            builder.add_comm(
+                f"{prefix}.{suffix}.up_chip_allreduce",
+                "moe_up_gate_chip_allreduce", scope="inter_chip",
+                kind="allreduce",
+                group=tuple(range(0, self.hardware_config.chip_count,
+                                  chip_n_degree)),
+                size_bytes=up_bytes,
+                parallel_strategy=strategy,
+                batch_scaling_unit_count=tokens_per_expert,
+            )
+        builder.add_vector(
+            f"{prefix}.{suffix}.silu", "silu",
+            global_dimensions={
+                "m": global_expert_count * tokens_per_expert,
+                "n": model.moe_intermediate_size,
+            },
+            chip_dimensions={
+                "m": local_experts * tokens_per_expert,
+                "n": chip_intermediate,
+            },
+            die_dimensions={
+                "m": local_experts * tokens_per_expert,
+                "n": die_intermediate,
+            },
+            **common,
+        )
+        builder.add_bmm(
+            f"{prefix}.{suffix}.down", "moe_down",
+            global_dimensions=self._dims(
+                global_expert_count, tokens_per_expert,
+                model.moe_intermediate_size, model.hidden_size,
+            ),
+            chip_dimensions=self._dims(
+                local_experts, tokens_per_expert,
+                chip_intermediate, chip_hidden,
+            ),
+            die_dimensions=self._dims(
+                local_experts, tokens_per_expert,
+                die_intermediate, hidden_die,
+            ),
+            pu_dimensions_override=self._dims(
+                local_experts, tokens_per_expert,
+                intermediate_pu, hidden_pu,
+            ),
+            weight_batches=local_experts, pu_weight_batches=local_experts,
+            input_kind="broadcast" if pu_k_degree > 1 else "p2p",
+            input_suffix=(
+                "input_broadcast" if pu_k_degree > 1 else "input_transfer"
+            ),
+            input_group=(
+                up_output_group if pu_k_degree > 1
+                else ("chip0.die0.input", builder.PU)
+            ),
+            input_noc_direction="input",
+            input_bytes_override=(
+                local_experts * tokens_per_expert
+                * die_intermediate * _ACTIVATION_DTYPE_BYTES
+            ),
+            output_kind="reduce", output_group=down_output_group,
+            output_bytes_override=(
+                local_experts * tokens_per_expert
+                * hidden_die * _ACTIVATION_DTYPE_BYTES
+            ),
+            **common,
+        )
+        if die_n_degree > 1:
+            builder.add_comm(
+                f"{prefix}.{suffix}.down_die_reduce_scatter",
+                "moe_down_die_reduce_scatter",
+                scope="intra_chip", kind="reduce_scatter",
+                group=tuple(
+                    f"chip0.die{index}" for index in range(die_n_degree)
+                ),
+                size_bytes=(
+                    local_experts * tokens_per_expert
+                    * hidden_die * _ACTIVATION_DTYPE_BYTES
+                ),
+                parallel_link_count=builder.die_collective_parallel_link_count,
+                parallel_strategy=strategy,
+                batch_scaling_unit_count=tokens_per_expert,
+            )
+
+    def _add_chip_mesh_moe_expert_group(
+        self, builder: _LayerBuilder, *, expert_ids: Sequence[int],
+        tokens_per_expert: int, global_expert_count: int,
+        chip_tp_degree: int, prefix: str, strategy: str,
+    ) -> None:
+        """Model a TP or EP expert group on one unified 8×8 chip PU mesh.
+
+        Up's K-partial reduction is intentionally omitted in this idealized
+        experiment. The Up output command charges half the fused channel
+        width as requested, before the following chip-level SiLU command.
+        """
+        model = builder.model_config
+        chip = self.hardware_config.chip
+        experts = len(expert_ids)
+        m = tokens_per_expert
+        hidden = model.hidden_size
+        intermediate = _exact_div(
+            model.moe_intermediate_size, chip_tp_degree,
+            "MoE chip intermediate",
+        )
+        rows, columns = chip.noc.mesh_rows, chip.noc.mesh_columns
+        hidden_pu = _exact_div(hidden, rows, "MoE PU hidden")
+        intermediate_pu = _exact_div(intermediate, columns, "MoE PU intermediate")
+        chip_links = 4 * rows  # Four perimeter edges, eight ideal lanes each.
+        suffix = f"tokens{m}"
+        prefix = f"{prefix}.{suffix}"
+        common = dict(
+            expert_ids=expert_ids, tokens_per_expert=m,
+            parallel_strategy=strategy, batch_scaling_unit_count=m,
+        )
+        builder.add_bmm(
+            f"{prefix}.up_gate", "moe_up_gate",
+            global_dimensions=self._dims(
+                global_expert_count, m, hidden, 2 * model.moe_intermediate_size,
+            ),
+            chip_dimensions=self._dims(experts, m, hidden, 2 * intermediate),
+            # This MoE path treats the entire chip as the memory/vector domain.
+            die_dimensions=self._dims(experts, m, hidden, 2 * intermediate),
+            pu_dimensions_override=self._dims(
+                experts, m, hidden_pu, 2 * intermediate_pu,
+            ),
+            weight_batches=experts, pu_weight_batches=experts,
+            load_bytes_override=experts * hidden * 2 * intermediate,
+            dram_resource_id=builder.CHIP_DRAM,
+            sram_resource_id=builder.CHIP_SRAM,
+            input_kind="p2p", input_suffix="input_transfer",
+            input_group=("chip0.input", builder.PU),
+            input_noc_direction="input",
+            input_bytes_override=experts * m * hidden * _ACTIVATION_DTYPE_BYTES,
+            input_parallel_link_count=chip_links,
+            output_kind="p2p", output_suffix="output_transfer",
+            output_group=(builder.PU, "chip0.vector"),
+            output_bytes_override=(
+                experts * m * intermediate_pu * _ACTIVATION_DTYPE_BYTES
+            ),
+            **common,
+        )
+        builder.add_vector(
+            f"{prefix}.silu", "silu",
+            global_dimensions={"m": global_expert_count * m,
+                               "n": model.moe_intermediate_size},
+            chip_dimensions={"m": experts * m, "n": intermediate},
+            die_dimensions={"m": experts * m, "n": intermediate},
+            resource_id=builder.CHIP_VECTOR,
+            **common,
+        )
+        builder.add_bmm(
+            f"{prefix}.down", "moe_down",
+            global_dimensions=self._dims(
+                global_expert_count, m, model.moe_intermediate_size, hidden,
+            ),
+            chip_dimensions=self._dims(experts, m, intermediate, hidden),
+            die_dimensions=self._dims(experts, m, intermediate, hidden),
+            pu_dimensions_override=self._dims(
+                experts, m, intermediate_pu, hidden_pu,
+            ),
+            weight_batches=experts, pu_weight_batches=experts,
+            load_bytes_override=experts * intermediate * hidden,
+            dram_resource_id=builder.CHIP_DRAM,
+            sram_resource_id=builder.CHIP_SRAM,
+            input_kind="p2p", input_suffix="input_transfer",
+            input_group=("chip0.vector", builder.PU),
+            input_noc_direction="input",
+            input_bytes_override=(
+                experts * m * intermediate_pu * _ACTIVATION_DTYPE_BYTES
+            ),
+            output_kind="reduce", output_group=(builder.PU,) + tuple(
+                f"chip0.pu{index}" for index in range(1, rows)
+            ),
+            output_bytes_override=experts * m * hidden * _ACTIVATION_DTYPE_BYTES,
+            output_parallel_link_count=chip_links,
+            **common,
+        )
+
+    def _build_pure_moe_tp(self, builder: _LayerBuilder) -> None:
+        model = builder.model_config
+        inference = builder.request.inference_config
+        chips = self.hardware_config.chip_count
+        global_batch = (
+            inference.global_batch_size * inference.accepted_tokens_per_step
+        )
+        local_batch = _ceil_div(inference.global_batch_size, chips)
+        local_batch *= inference.accepted_tokens_per_step
+        dtype = _ACTIVATION_DTYPE_BYTES
+        chip_k_degree = 1
+        chip_n_degree = chips // chip_k_degree
+        strategy = "moe_tp_chip_mesh_k8_n8_ideal_noc32"
+        entry_shard_bytes = (
+            local_batch * model.hidden_size // chip_k_degree * dtype
+        )
+        builder.add_comm(
+            "moe.tp_input_alltoall", "dp_to_tp_alltoall",
+            scope="inter_chip", kind="alltoall", group=builder.chip_group,
+            transfer_bytes=tuple(
+                tuple(
+                    0 if source == destination else entry_shard_bytes
+                    for destination in range(chips)
+                )
+                for source in range(chips)
+            ),
+            parallel_strategy=strategy,
+        )
+        loads = self._balanced_expert_loads(
+            global_batch, model.top_k, model.num_experts,
+        )
+        builder.expert_token_loads = loads
+        builder.expert_ownership = tuple(
+            tuple(range(model.num_experts)) for _ in range(chips)
+        )
+        for expert_ids, token_count in self._groups_for_experts(
+            range(model.num_experts), loads,
+        ):
+            self._add_chip_mesh_moe_expert_group(
+                builder, expert_ids=expert_ids,
+                tokens_per_expert=token_count,
+                global_expert_count=len(expert_ids),
+                chip_tp_degree=chips, prefix="moe.tp", strategy=strategy,
+            )
+        if chip_n_degree > 1:
+            builder.add_comm(
+                "moe.tp_chip_reduce_scatter", "tp_to_dp_reduce_scatter",
+                scope="inter_chip", kind="reduce_scatter",
+                group=tuple(range(chip_n_degree)),
+                size_bytes=(
+                    global_batch * model.hidden_size // chip_k_degree * dtype
+                ),
+                parallel_strategy=strategy,
+            )
+        # Each N-group now owns BS/N tokens and one K-shard of hidden. The
+        # other K groups exchange their complementary hidden slices while
+        # returning to the original BS/16-token DP layout.
+        if chip_k_degree > 1:
+            exchange_bytes = (
+                local_batch * model.hidden_size // chip_k_degree * dtype
+            )
+            builder.add_comm(
+                "moe.tp_chip_hidden_exchange", "tp_hidden_exchange",
+                scope="inter_chip", kind="alltoall",
+                group=tuple(range(0, chips, chip_n_degree)),
+                transfer_bytes=tuple(
+                    tuple(
+                        0 if source == destination else exchange_bytes
+                        for destination in range(chip_k_degree)
+                    )
+                    for source in range(chip_k_degree)
+                ),
+                parallel_strategy=strategy,
+            )
+            builder.add_comm(
+                "moe.tp_hidden_exchange_die_distribute",
+                "tp_hidden_exchange_die_distribute",
+                scope="intra_chip", kind="p2p",
+                group=("chip0.input", "chip0.die0.input"),
+                size_bytes=(chip_k_degree - 1) * exchange_bytes,
+                noc_direction="input", parallel_strategy=strategy,
+            )
+        builder.add_vector(
+            "moe.tp_residual", "residual",
+            global_dimensions={"m": global_batch, "n": model.hidden_size},
+            chip_dimensions={"m": local_batch, "n": model.hidden_size},
+            die_dimensions={"m": local_batch, "n": model.hidden_size},
+            parallel_strategy=strategy, flops_per_element=1,
+            resource_id=builder.CHIP_VECTOR,
+        )
+
     def _build_moe_tp(self, builder: _LayerBuilder) -> None:
         request = builder.request
         model = builder.model_config
         chips = self.hardware_config.chip_count
         dies = self.hardware_config.chip.logic_die_count
+        if self._use_pure_moe_mapping(builder):
+            self._build_pure_moe_tp(builder)
+            return
         base_global_batch = request.inference_config.global_batch_size
         token_multiplier = request.inference_config.accepted_tokens_per_step
         token_groups, chip_tp_degree = self._hierarchical_moe_tp_degrees(
@@ -1863,11 +2296,79 @@ class HardwareMapper:
             raise ValueError("failed to construct all-to-all transfer matrix")
         return tuple(matrix)
 
+    def _build_pure_moe_ep(self, builder: _LayerBuilder) -> None:
+        model = builder.model_config
+        inference = builder.request.inference_config
+        chips = self.hardware_config.chip_count
+        global_batch = (
+            inference.global_batch_size * inference.accepted_tokens_per_step
+        )
+        local_batch = _ceil_div(inference.global_batch_size, chips)
+        local_batch *= inference.accepted_tokens_per_step
+        dtype = _ACTIVATION_DTYPE_BYTES
+        strategy = "moe_ep_chip_mesh_k8_n8_ideal_noc32"
+        experts_per_chip = _exact_div(
+            model.num_experts, chips, "pure EP experts per chip",
+        )
+        ownership = tuple(
+            tuple(range(chip * experts_per_chip, (chip + 1) * experts_per_chip))
+            for chip in range(chips)
+        )
+        loads = self._balanced_ep_expert_loads(
+            global_batch, model.top_k, model.num_experts, ownership,
+        )
+        builder.expert_token_loads = loads
+        builder.expert_ownership = ownership
+        effective_assignments = sum(loads)
+        row_totals = (effective_assignments // chips,) * chips
+        column_totals = tuple(
+            sum(loads[expert] for expert in ids) for ids in ownership
+        )
+        dispatch = self._transport_matrix(
+            row_totals, column_totals, model.hidden_size * dtype,
+        )
+        builder.add_comm(
+            "moe.ep_dispatch", "expert_dispatch", scope="inter_chip",
+            kind="alltoall", group=builder.chip_group,
+            transfer_bytes=dispatch, parallel_strategy=strategy,
+        )
+        for expert_ids, token_count in self._groups_for_experts(
+            ownership[0], loads,
+        ):
+            self._add_chip_mesh_moe_expert_group(
+                builder, expert_ids=expert_ids,
+                tokens_per_expert=token_count,
+                global_expert_count=sum(
+                    load == token_count for load in loads
+                ),
+                chip_tp_degree=1, prefix="moe.ep", strategy=strategy,
+            )
+        combine = tuple(
+            tuple(dispatch[column][row] for column in range(chips))
+            for row in range(chips)
+        )
+        builder.add_comm(
+            "moe.ep_combine", "expert_combine", scope="inter_chip",
+            kind="alltoall", group=builder.chip_group,
+            transfer_bytes=combine, parallel_strategy=strategy,
+        )
+        builder.add_vector(
+            "moe.ep_residual", "residual",
+            global_dimensions={"m": global_batch, "n": model.hidden_size},
+            chip_dimensions={"m": local_batch, "n": model.hidden_size},
+            die_dimensions={"m": local_batch, "n": model.hidden_size},
+            parallel_strategy=strategy, flops_per_element=1,
+            resource_id=builder.CHIP_VECTOR,
+        )
+
     def _build_moe_ep(self, builder: _LayerBuilder) -> None:
         request = builder.request
         model = builder.model_config
         chips = self.hardware_config.chip_count
         dies = self.hardware_config.chip.logic_die_count
+        if self._use_pure_moe_mapping(builder):
+            self._build_pure_moe_ep(builder)
+            return
         base_global_batch = request.inference_config.global_batch_size
         token_multiplier = request.inference_config.accepted_tokens_per_step
         global_batch = base_global_batch * token_multiplier

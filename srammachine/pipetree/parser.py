@@ -145,14 +145,7 @@ class TreeParser:
             consumer_ranks[command.cmd_id], graph_rank[command.cmd_id],
         ))
 
-        sram_ids = {cmd.sram_resource_id for cmd in prefetches}
-        if len(sram_ids) != 1:
-            raise ValueError(
-                "all weight prefetches must use one representative "
-                "sram_resource_id"
-            )
-
-        capacity = (
+        die_capacity = (
             self.hardware_config.chip.logic_die.memory.sram_capacity_bytes
         )
         release_commands = {}
@@ -178,10 +171,17 @@ class TreeParser:
                 )
             release_commands[prefetch.cmd_id] = tuple(consumers)
 
-        resident = deque()
-        resident_bytes = 0
+        resident_by_resource = {}
+        resident_bytes_by_resource = {}
         capacity_edges = []
         for prefetch in prefetches:
+            sram_id = prefetch.sram_resource_id
+            capacity = (
+                die_capacity * self.hardware_config.chip.logic_die_count
+                if sram_id == "chip0.sram" else die_capacity
+            )
+            resident = resident_by_resource.setdefault(sram_id, deque())
+            resident_bytes = resident_bytes_by_resource.setdefault(sram_id, 0)
             if prefetch.size_bytes > capacity:
                 raise ValueError(
                     f"weight prefetch {prefetch.cmd_id} requires "
@@ -197,6 +197,7 @@ class TreeParser:
                 )
             resident.append(prefetch)
             resident_bytes += prefetch.size_bytes
+            resident_bytes_by_resource[sram_id] = resident_bytes
 
         # Preserve the consumer order even when an early prefetch is blocked by
         # SRAM capacity. Demand reads remain free to use the idle DRAM resource.
@@ -388,7 +389,11 @@ class TreeParser:
             if load_bytes:
                 load = emit(WeightLoadCmd(
                     prefix + ".load", op_id, mapping.sram_resource_id, load_bytes,
-                    self._weight_shape(op, load_bytes),
+                    (
+                        self._prefetch_weight_shape(op, mapping, load_bytes)
+                        if mapping.sram_resource_id == "chip0.sram"
+                        else self._weight_shape(op, load_bytes)
+                    ),
                     logical_size_bytes=(
                         (mapping.weight_load_logical_fixed_bytes or 0)
                         + mapped_batch

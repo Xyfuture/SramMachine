@@ -131,7 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="full deterministic restarts per workload (default: 4)",
     )
     parser.add_argument(
-        "--input-sequence-length", required=True, type=_positive_int,
+        "--input-sequence-length", nargs="+", required=True, type=_positive_int,
     )
     parser.add_argument(
         "--output-sequence-length", required=True, type=_positive_int,
@@ -168,6 +168,8 @@ def _validate_args(
         parser.error("--mtp must not contain duplicates")
     if len(set(args.batch_sizes)) != len(args.batch_sizes):
         parser.error("--batch-sizes must not contain duplicates")
+    if len(set(args.input_sequence_length)) != len(args.input_sequence_length):
+        parser.error("--input-sequence-length must not contain duplicates")
     if len(set(args.moe_strategy)) != len(args.moe_strategy):
         parser.error("--moe-strategy must not contain duplicates")
     if args.final_temperature > args.initial_temperature:
@@ -179,6 +181,7 @@ def _validate_args(
     # Submit the heaviest workloads first.  There is no barrier between batch
     # sizes: each replacement worker immediately takes the next queued case.
     args.batch_sizes = sorted(args.batch_sizes, reverse=True)
+    args.input_sequence_length = sorted(args.input_sequence_length, reverse=True)
     args.mtp = sorted(args.mtp, key=lambda value: value == "on")
     args.moe_strategy = sorted(
         args.moe_strategy, key=lambda value: ("tp", "ep").index(value),
@@ -196,7 +199,7 @@ def _make_cases(args: argparse.Namespace) -> list[SACase]:
             model=model,
             global_batch_size=batch,
             mtp_enabled=mtp == "on",
-            input_sequence_length=args.input_sequence_length,
+            input_sequence_length=input_sequence_length,
             output_sequence_length=args.output_sequence_length,
             moe_strategy=strategy,
             kv_cache_dtype=args.kv_cache_dtype,
@@ -209,6 +212,7 @@ def _make_cases(args: argparse.Namespace) -> list[SACase]:
             base_seed=args.seed,
         )
         for batch in args.batch_sizes
+        for input_sequence_length in args.input_sequence_length
         for model in args.models
         for strategy in args.moe_strategy
         for mtp in args.mtp
@@ -473,7 +477,7 @@ def write_model_json(
     path: Path, model: str, strategy: str, mtp_enabled: bool,
     rows: Sequence[dict[str, Any]],
     *, generated_at: str, detected_cpus: int, worker_count: int,
-    overwrite: bool = False,
+    input_sequence_length: int | None = None, overwrite: bool = False,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and not overwrite:
@@ -484,10 +488,16 @@ def write_model_json(
             row["model"] == model
             and row["moe_strategy"] == strategy
             and row["mtp_enabled"] == mtp_enabled
+            and (
+                input_sequence_length is None
+                or row["input_sequence_length"] == input_sequence_length
+            )
         )
     ]
     if not workloads:
-        raise ValueError("model/strategy/MTP has no workload rows")
+        raise ValueError("model/strategy/MTP/ISL has no workload rows")
+    if len({row["input_sequence_length"] for row in workloads}) != 1:
+        raise ValueError("model JSON requires one input sequence length")
     def tree_records(row: dict[str, Any]) -> list[dict[str, Any]]:
         """Label every tree with the workload that produced it.
 
@@ -607,7 +617,7 @@ def write_case_trace(
     trace_label = (
         f"{_safe_name(row['model'])}_{row['moe_strategy']}_"
         f"mtp_{'on' if row['mtp_enabled'] else 'off'}_"
-        f"bs{row['global_batch_size']}"
+        f"bs{row['global_batch_size']}_isl{row['input_sequence_length']}"
     )
     artifacts = Simulator().run_and_trace(
         graph,
@@ -631,7 +641,8 @@ def _persist_case_artifacts(row: dict[str, Any], case: SACase) -> None:
     case_stem = (
         f"{case.run_stamp}_{_safe_name(row['model'])}_{row['moe_strategy']}_"
         f"mtp_{'on' if row['mtp_enabled'] else 'off'}_"
-        f"bs{row['global_batch_size']}_sa_case_checkpoint"
+        f"bs{row['global_batch_size']}_isl{row['input_sequence_length']}_"
+        "sa_case_checkpoint"
     )
     split_tree_path = _unique_path(checkpoint_dir, case_stem, ".json")
     row["best_split_tree_path"] = str(split_tree_path)
@@ -642,6 +653,7 @@ def _persist_case_artifacts(row: dict[str, Any], case: SACase) -> None:
         generated_at=case.generated_at,
         detected_cpus=case.detected_cpus,
         worker_count=case.worker_count,
+        input_sequence_length=row["input_sequence_length"],
     )
     trace_path, pu_utilization = write_case_trace(
         row, Path(case.artifact_dir),
@@ -656,6 +668,7 @@ def _persist_case_artifacts(row: dict[str, Any], case: SACase) -> None:
         generated_at=case.generated_at,
         detected_cpus=case.detected_cpus,
         worker_count=case.worker_count,
+        input_sequence_length=row["input_sequence_length"],
         overwrite=True,
     )
     print(f"Case SplitTree checkpoint: {split_tree_path}", flush=True)
@@ -690,6 +703,7 @@ def _execute(
                 "completed "
                 f"model={case.model} strategy={case.moe_strategy} "
                 f"batch={case.global_batch_size} "
+                f"isl={case.input_sequence_length} "
                 f"mtp={'on' if case.mtp_enabled else 'off'} "
                 "best="
                 f"{result['pareto_best_total_throughput_tokens_per_second']:.3f} "
@@ -771,8 +785,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         strategy: index for index, strategy in enumerate(args.moe_strategy)
     }
     results.sort(key=lambda row: (
+        -row["global_batch_size"], -row["input_sequence_length"],
         model_rank[row["model"]], strategy_rank[row["moe_strategy"]],
-        -row["global_batch_size"], row["mtp_enabled"],
+        row["mtp_enabled"],
     ))
     results = mark_model_pareto(results)
 
@@ -780,38 +795,45 @@ def main(argv: Sequence[str] | None = None) -> int:
     for model in args.models:
         for strategy in args.moe_strategy:
             for mtp_enabled in (False, True):
-                if not any(
-                    row["model"] == model
-                    and row["moe_strategy"] == strategy
-                    and row["mtp_enabled"] == mtp_enabled
-                    for row in results
-                ):
-                    continue
-                path = _unique_path(
-                    artifact_dir,
-                    (
-                        f"{minute}_{_safe_name(model)}_{strategy}_"
-                        f"mtp_{'on' if mtp_enabled else 'off'}_"
-                        "sa_best_splittrees"
-                    ),
-                    ".json",
-                )
-                for row in results:
-                    if (
+                for input_sequence_length in args.input_sequence_length:
+                    if not any(
                         row["model"] == model
                         and row["moe_strategy"] == strategy
                         and row["mtp_enabled"] == mtp_enabled
+                        and row["input_sequence_length"] == input_sequence_length
+                        for row in results
                     ):
-                        row["best_split_tree_path"] = str(path)
-                        row["selected_split_tree_index"] = 0
-                json_specs.append((path, model, strategy, mtp_enabled))
+                        continue
+                    path = _unique_path(
+                        artifact_dir,
+                        (
+                            f"{minute}_{_safe_name(model)}_{strategy}_"
+                            f"mtp_{'on' if mtp_enabled else 'off'}_"
+                            f"isl{input_sequence_length}_sa_best_splittrees"
+                        ),
+                        ".json",
+                    )
+                    for row in results:
+                        if (
+                            row["model"] == model
+                            and row["moe_strategy"] == strategy
+                            and row["mtp_enabled"] == mtp_enabled
+                            and row["input_sequence_length"] == input_sequence_length
+                        ):
+                            row["best_split_tree_path"] = str(path)
+                            row["selected_split_tree_index"] = 0
+                    json_specs.append((
+                        path, model, strategy, mtp_enabled,
+                        input_sequence_length,
+                    ))
 
     json_paths = []
-    for path, model, strategy, mtp_enabled in json_specs:
+    for path, model, strategy, mtp_enabled, input_sequence_length in json_specs:
         write_model_json(
             path, model, strategy, mtp_enabled, results,
             generated_at=generated_at, detected_cpus=detected,
             worker_count=workers,
+            input_sequence_length=input_sequence_length,
         )
         json_paths.append(path)
 

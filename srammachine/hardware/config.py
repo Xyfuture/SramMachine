@@ -328,7 +328,7 @@ class InterChipFabricConfig:
     """Per-chip interface to a full-mesh switched inter-chip fabric."""
 
     topology: str = "full_mesh_switch_fabric"
-    per_chip_directional_bandwidth_bytes_per_second: int = 800 * _GB
+    per_chip_directional_bandwidth_bytes_per_second: int = 1600 * _GB
     full_duplex: bool = True
 
     def __post_init__(self) -> None:
