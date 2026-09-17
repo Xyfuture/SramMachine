@@ -465,7 +465,7 @@ class TreeParser:
 
         # A dynamic right operand is a demand read, not a look-ahead weight
         # load.  Open it at the same BMM-block boundary as the explicit input
-        # broadcast so the two resources can run in parallel.  The GEMM waits
+        # communication so the two resources can run in parallel.  The GEMM waits
         # for both through their independent edges.
         order_index = {
             op_id: index for index, op_id in enumerate(tree.operator_order)
@@ -473,10 +473,13 @@ class TreeParser:
         for instance_index, sram_read in demand_sram_reads.items():
             instance = instances[instance_index]
             position = order_index[instance.op_id]
-            broadcast_id = f"{instance.op_id}.input_broadcast"
-            if position == 0 or tree.operator_order[position - 1] != broadcast_id:
+            input_ids = (
+                f"{instance.op_id}.input_broadcast",
+                f"{instance.op_id}.input_transfer",
+            )
+            if position == 0 or tree.operator_order[position - 1] not in input_ids:
                 raise ValueError(
-                    f"dynamic SRAM BMM is missing its input broadcast: "
+                    f"dynamic SRAM BMM is missing its input communication: "
                     f"{instance.op_id}"
                 )
             if position < 2:

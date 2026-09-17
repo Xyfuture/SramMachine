@@ -948,35 +948,42 @@ class HardwareMapper:
             weight_batches=model.num_attention_heads,
             batch_axis="B",
         )
-        # FlashAttention consumes the concatenated NoPE/RoPE Q and streams
-        # the corresponding KV tile once.  Scores are never materialized on
-        # the NoC; QK and SV are charged as one PU command.
+        # The unfused path materializes scores after QK, normalizes across
+        # the complete sequence, then distributes probabilities for SV.
+        # Eight independent request/head rows run in parallel; each row's
+        # eight PUs own distinct sequence shards.
         fused_qk_width = model.kv_lora_rank + model.qk_rope_head_dim
-        flash_dimensions = lambda head_batch: {
-            "B": head_batch,
-            "M": 1,
-            "qk_K": fused_qk_width,
-            "qk_N": attention_history,
-            "sv_K": attention_history,
-            "sv_N": model.kv_lora_rank,
-        }
-        # Preserve the previous effective cache stream, now as one chip
-        # command: four representative-die shares at four-port bandwidth.
-        builder.add_flash_attention(
-            "attn.flash_attention", "flash_attention",
-            global_dimensions=flash_dimensions(global_head_batch),
-            chip_dimensions=flash_dimensions(chip_head_batch),
-            die_dimensions=flash_dimensions(chip_head_batch),
+        row_head_batch = _exact_div(
+            chip_head_batch, 8, "attention row head batch",
+        )
+        sequence_shard = _ceil_div(attention_history, 8)
+        chip_score_bytes = (
+            chip_head_batch * attention_history * _ACTIVATION_DTYPE_BYTES
+        )
+        builder.add_bmm(
+            "attn.qk_fused", "qk_fused",
+            global_dimensions=self._dims(
+                global_head_batch, 1, fused_qk_width, attention_history,
+            ),
+            chip_dimensions=self._dims(
+                chip_head_batch, 1, fused_qk_width, attention_history,
+            ),
+            die_dimensions=self._dims(
+                chip_head_batch, 1, fused_qk_width, attention_history,
+            ),
+            pu_dimensions_override=self._dims(
+                row_head_batch, 1, fused_qk_width, sequence_shard,
+            ),
             parallel_strategy=strategy,
-            pu_dimensions_override={
-                **flash_dimensions(_exact_div(chip_head_batch, 8, "flash row heads")),
-                "qk_N": _ceil_div(attention_history, 8),
-                "sv_K": _ceil_div(attention_history, 8),
-            },
             dram_resource_id=builder.CHIP_DRAM,
             sram_resource_id=builder.CHIP_SRAM,
             input_group=builder.chip_mesh_row(),
-            output_group=builder.chip_mesh_row(),
+            output_kind="p2p",
+            output_suffix="output_transfer",
+            output_group=(builder.PU, builder.CHIP_VECTOR),
+            output_bytes_override=chip_score_bytes,
+            output_parallel_link_count=8,
+            batch_axis="B",
             dram_read_bytes_per_token=(
                 4 * _shared_effective_bytes(
                     attention_history * fused_qk_width
@@ -995,6 +1002,58 @@ class HardwareMapper:
                     dies,
                 )
             ),
+            sram_read_data_kind="kv_fused",
+        )
+        builder.add_vector(
+            "attn.softmax", "softmax",
+            global_dimensions={"m": global_head_batch,
+                               "n": attention_history},
+            chip_dimensions={"m": chip_head_batch,
+                             "n": attention_history},
+            die_dimensions={"m": chip_head_batch,
+                            "n": attention_history},
+            parallel_strategy=strategy,
+            resource_id=builder.CHIP_VECTOR,
+        )
+        builder.add_bmm(
+            "attn.sv_latent", "sv_latent",
+            global_dimensions=self._dims(
+                global_head_batch, 1, attention_history, model.kv_lora_rank,
+            ),
+            chip_dimensions=self._dims(
+                chip_head_batch, 1, attention_history, model.kv_lora_rank,
+            ),
+            die_dimensions=self._dims(
+                chip_head_batch, 1, attention_history, model.kv_lora_rank,
+            ),
+            pu_dimensions_override=self._dims(
+                row_head_batch, 1, sequence_shard, model.kv_lora_rank,
+            ),
+            parallel_strategy=strategy,
+            dram_resource_id=builder.CHIP_DRAM,
+            sram_resource_id=builder.CHIP_SRAM,
+            input_kind="p2p",
+            input_suffix="input_transfer",
+            input_group=(builder.CHIP_VECTOR, builder.PU),
+            input_noc_direction="input",
+            input_bytes_override=chip_score_bytes,
+            input_parallel_link_count=8,
+            output_group=builder.chip_mesh_row(),
+            batch_axis="B",
+            dram_read_bytes_per_token=(
+                4 * _shared_effective_bytes(
+                    attention_history * model.kv_lora_rank
+                    * kv_dtype_bytes, dies,
+                )
+            ),
+            sram_read_bytes_per_mapped_token=(
+                4 * _shared_effective_bytes(
+                    _ceil_div(attention_history, pu_rows)
+                    * _ceil_div(model.kv_lora_rank, pu_columns)
+                    * kv_dtype_bytes, dies,
+                )
+            ),
+            sram_read_data_kind="kv_value",
         )
 
         # O projection contracts both the local-head and latent dimensions.
