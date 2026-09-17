@@ -13,13 +13,13 @@ sequence and local top-k rules. At low BS, score merge uses the PU mesh rather
 than a die collective. The 2-byte ID plus 2-byte score candidate format is
 unchanged.
 
-Attention weights, KV/indexer cache streams and vector work now use chip
-resources. The previous effective cache traffic is multiplied by four when
-converted from a representative-die command, and the cache SRAM-to-PU stream
-retains four times the previous port-limited bandwidth. This preserves the
-old cache-read timing; it does **not** revise head reuse or KV sharing. Weight
-loads use the full chip SRAM bandwidth. Existing MoE and Fabric mapping are
-unchanged.
+Attention weights, cache streams and vector work use chip resources. The
+FlashAttention KV stream keeps its previous effective cache bytes and
+port-limited timing; this does **not** revise head reuse or KV sharing. DSA
+indexer-key traffic instead includes every chip-local request and every
+sequence shard. DSA SRAM demand reads and weight loads use the full chip SRAM
+bandwidth. DSA query input and top-k candidate output aggregate all active
+PUs onto eight chip NoC paths. Existing MoE and Fabric mapping are unchanged.
 
 The four light baseline Perfetto traces for BS1024, ISL32000, MTP off and TP
 are generated under `test result/attention chip 8x8/` (an ignored output

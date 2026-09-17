@@ -44,6 +44,9 @@ class OperatorMapping:
     # TreeParser distributes these units across microbatches with quotient /
     # remainder partitioning, so adjacent instances differ by at most one.
     batch_scaling_unit_count: Optional[int] = None
+    # Demand cache traffic can cover every chip-local request while the
+    # representative PU core covers only one request partition.
+    demand_batch_partition_degree: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.batch_axis not in ("B", "M", "m", "size_bytes"):
@@ -95,6 +98,9 @@ class OperatorMapping:
                 "shared_die_factor greater than one requires a logical size"
             )
         integer("batch_partition_degree", self.batch_partition_degree, 1)
+        if self.demand_batch_partition_degree is not None:
+            integer("demand_batch_partition_degree",
+                    self.demand_batch_partition_degree, 1)
         if self.batch_scaling_unit_count is not None:
             integer("batch_scaling_unit_count", self.batch_scaling_unit_count, 1)
             if self.batch_partition_degree != 1:

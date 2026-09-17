@@ -319,6 +319,8 @@ class _LayerBuilder:
         tokens_per_expert: Optional[int] = None,
         batch_axis: str = "M",
         batch_partition_degree: int = 1,
+        demand_batch_partition_degree: Optional[int] = None,
+        traffic_batch_partition_degree: Optional[int] = None,
         sram_read_bytes_per_mapped_token: int = 0,
         sram_read_logical_bytes_per_mapped_token: Optional[int] = None,
         sram_read_data_kind: Optional[str] = None,
@@ -406,7 +408,11 @@ class _LayerBuilder:
             root=self.PU if input_kind == "broadcast" else None,
             size_bytes=input_bytes,
             parallel_strategy=parallel_strategy,
-            batch_partition_degree=batch_partition_degree,
+            batch_partition_degree=(
+                traffic_batch_partition_degree
+                if traffic_batch_partition_degree is not None
+                else batch_partition_degree
+            ),
             noc_direction=input_noc_direction,
             batch_scaling_unit_count=batch_scaling_unit_count,
             parallel_link_count=input_parallel_link_count,
@@ -445,6 +451,7 @@ class _LayerBuilder:
                 if weight_batches else None
             ),
             batch_partition_degree=batch_partition_degree,
+            demand_batch_partition_degree=demand_batch_partition_degree,
             sram_read_bytes_per_mapped_token=(
                 sram_read_bytes_per_mapped_token
             ),
@@ -478,7 +485,11 @@ class _LayerBuilder:
             size_bytes=output_bytes,
             reduce_kind="sum",
             parallel_strategy=parallel_strategy,
-            batch_partition_degree=batch_partition_degree,
+            batch_partition_degree=(
+                traffic_batch_partition_degree
+                if traffic_batch_partition_degree is not None
+                else batch_partition_degree
+            ),
             batch_scaling_unit_count=batch_scaling_unit_count,
             parallel_link_count=output_parallel_link_count,
         )
@@ -1087,6 +1098,8 @@ class HardwareMapper:
             output_bytes = (
                 chip_batch * pu_dimensions["N"] * _ACTIVATION_DTYPE_BYTES
             )
+            sequence_partitions = 8
+            output_links = 1
             main_gemm_override = None
         elif base_global_batch < 1024:
             # Use the largest equal per-request PU allocation and leave any
@@ -1103,7 +1116,11 @@ class HardwareMapper:
             output_group = (builder.PU, "chip0.output")
             output_suffix = "output_transfer"
             local_top_k = min(2048, pu_dimensions["N"])
-            output_bytes = token_multiplier * local_top_k * 4
+            output_bytes = (
+                local_req * pu_per_req * token_multiplier * local_top_k * 4
+            )
+            sequence_partitions = pu_per_req
+            output_links = 8
             main_gemm_override = old_main_gemm_flops
         else:
             # At BS=1024 on a 32-chip system there are only 32 local
@@ -1125,7 +1142,9 @@ class HardwareMapper:
             output_suffix = "output_transfer"
             # Each top-k candidate carries a 2-byte shard-local token ID and
             # a 2-byte score. The source PU identifies the shard origin.
-            output_bytes = req_per_pu * token_multiplier * top_k * 4
+            output_bytes = local_req * token_multiplier * top_k * 4
+            sequence_partitions = 1
+            output_links = 8
             main_gemm_override = old_main_gemm_flops
 
         builder.add_bmm(
@@ -1158,7 +1177,7 @@ class HardwareMapper:
             fused_indexer_score=True,
             main_gemm_flops_override=main_gemm_override,
             sram_read_bytes_per_mapped_token=(
-                4 * _shared_effective_bytes(
+                sequence_partitions * 4 * _shared_effective_bytes(
                     model.indexer_head_dim * pu_dimensions["N"]
                     * kv_dtype_bytes,
                     dies,
@@ -1166,10 +1185,18 @@ class HardwareMapper:
             ),
             sram_read_data_kind="dsa_key",
             batch_partition_degree=batch_partition_degree,
+            demand_batch_partition_degree=1,
+            traffic_batch_partition_degree=1,
+            input_bytes_override=(
+                chip_batch * model.indexer_num_heads
+                * model.indexer_head_dim * _ACTIVATION_DTYPE_BYTES
+            ),
+            input_parallel_link_count=8,
             output_kind=output_kind,
             output_group=output_group,
             output_suffix=output_suffix,
             output_bytes_override=output_bytes,
+            output_parallel_link_count=output_links,
             input_group=builder.chip_mesh_row(),
         )
         if base_global_batch <= 128:

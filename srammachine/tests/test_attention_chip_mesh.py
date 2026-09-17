@@ -100,8 +100,8 @@ class AttentionChipMeshTests(unittest.TestCase):
         for op_id, kind, size, duration in (
             ("attn.flash_attention", "DramReadCmd", 75497472, 1180),
             ("attn.flash_attention", "SramReadCmd", 4718592, 288),
-            ("attn.dsa_qk_score", "DramReadCmd", 4096000, 64),
-            ("attn.dsa_qk_score", "SramReadCmd", 4096000, 250),
+            ("attn.dsa_qk_score", "DramReadCmd", 262144000, 4096),
+            ("attn.dsa_qk_score", "SramReadCmd", 262144000, 1024),
         ):
             command = by_command[(op_id, kind)]
             self.assertEqual(command.parameters["size_bytes"], size)
@@ -116,6 +116,60 @@ class AttentionChipMeshTests(unittest.TestCase):
             current.operators["attn.flash_attention.output_reduce"].parallel_link_count,
             1,
         )
+        for suffix in ("input_broadcast", "output_transfer"):
+            command = by_command[("attn.dsa_qk_score." + suffix, "NoCCmd")]
+            self.assertEqual(command.parameters["size_bytes"], 524288)
+            self.assertEqual(command.parameters["noc_parallel_link_count"], 8)
+            self.assertEqual(command.duration_ns, 256)
+
+    def test_dsa_chip_traffic_scales_with_requests_and_microbatches(self):
+        for name in ("deepseek-v3.2", "glm-5.1"):
+            for batch in (32, 128, 256, 512, 1024, 2048):
+                for mtp in (False, True):
+                    with self.subTest(name=name, batch=batch, mtp=mtp):
+                        current = mapped(name, batch, MoEParallelStrategy.TP, mtp)
+                        result = Simulator().run(TreeParser().parse(
+                            current.root_node, current.operators,
+                            current.operator_mappings, layer_count=1,
+                        ))
+                        local_requests = batch // 16
+                        expected_cache = (
+                            local_requests * 32000
+                            * current.model_config.indexer_head_dim
+                        )
+                        for kind in ("DramReadCmd", "SramReadCmd"):
+                            command = next(c for c in result.command_results
+                                           if c.op_id == "attn.dsa_qk_score"
+                                           and c.command_type == kind)
+                            self.assertEqual(
+                                command.parameters["size_bytes"], expected_cache,
+                            )
+
+        current = mapped("deepseek-v3.2", 1024, MoEParallelStrategy.TP)
+        attention, moe = current.root_node.root.children
+        children = list(attention.children)
+        score_index = next(index for index, child in enumerate(children)
+                           if isinstance(child, GroupNode)
+                           and any(getattr(leaf, "op_id", None) == "attn.dsa_qk_score"
+                                   for leaf in child.children))
+        children[score_index] = GroupNode(children[score_index].children, split=2)
+        tree = PipeTree(current.root_node.batch_size,
+                        current.root_node.operator_order,
+                        GroupNode((GroupNode(tuple(children)), moe)))
+        result = Simulator().run(TreeParser().parse(
+            tree, current.operators, current.operator_mappings, layer_count=1,
+        ))
+        for op_id, kind, expected in (
+            ("attn.dsa_qk_score", "DramReadCmd", 262144000),
+            ("attn.dsa_qk_score", "SramReadCmd", 262144000),
+            ("attn.dsa_qk_score.input_broadcast", "NoCCmd", 524288),
+            ("attn.dsa_qk_score.output_transfer", "NoCCmd", 524288),
+        ):
+            commands = [c for c in result.command_results
+                        if c.op_id == op_id and c.command_type == kind]
+            self.assertEqual(len(commands), 2)
+            self.assertEqual(sum(c.parameters["size_bytes"] for c in commands),
+                             expected)
 
     def test_projection_atomic_group_microbatch_scales_bytes_once(self):
         current = mapped("deepseek-v3", 1024, MoEParallelStrategy.TP)

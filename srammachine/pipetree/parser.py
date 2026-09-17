@@ -369,15 +369,20 @@ class TreeParser:
             mapped_batch = self._mapped_batch_size(
                 batch, mapping.batch_partition_degree,
             )
+            demand_batch = self._mapped_batch_size(
+                batch,
+                mapping.demand_batch_partition_degree
+                or mapping.batch_partition_degree,
+            )
             readiness = []
             if op_id in prefetched:
                 readiness.append(prefetched[op_id])
             if mapping.dram_read_bytes_per_token:
                 readiness.append(emit(DramReadCmd(
                     prefix + ".read", op_id, mapping.dram_resource_id,
-                    mapped_batch * mapping.dram_read_bytes_per_token,
+                    demand_batch * mapping.dram_read_bytes_per_token,
                     logical_size_bytes=(
-                        mapped_batch
+                        demand_batch
                         * mapping.dram_read_logical_bytes_per_token
                         if mapping.dram_read_logical_bytes_per_token is not None
                         else None
@@ -411,10 +416,10 @@ class TreeParser:
             if mapping.sram_read_bytes_per_mapped_token:
                 sram_read = emit(SramReadCmd(
                     prefix + ".sram_read", op_id, mapping.sram_resource_id,
-                    mapped_batch * mapping.sram_read_bytes_per_mapped_token,
+                    demand_batch * mapping.sram_read_bytes_per_mapped_token,
                     mapping.sram_read_data_kind,
                     logical_size_bytes=(
-                        mapped_batch
+                        demand_batch
                         * mapping.sram_read_logical_bytes_per_mapped_token
                         if mapping.sram_read_logical_bytes_per_mapped_token
                         is not None else None

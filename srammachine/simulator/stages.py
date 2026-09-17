@@ -164,9 +164,7 @@ class SramResourceStage(HardwareResourceStage):
             logic_die.processing_unit.weight_bandwidth_bytes_per_second,
         )
         if self.resource_id == "chip0.sram":
-            if isinstance(command, SramReadCmd) and command.data_kind in (
-                "flash_kv", "dsa_key",
-            ):
+            if isinstance(command, SramReadCmd) and command.data_kind == "flash_kv":
                 # Cache traffic retains the prior per-PU SRAM port limit.
                 # Four representative dies stream in parallel on the chip.
                 bandwidth *= self.hardware_config.chip.logic_die_count
