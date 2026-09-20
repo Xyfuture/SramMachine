@@ -122,6 +122,10 @@ class HardwareResourceStage(SimModule, ABC):
                 return
             start_time_ns = SimSession.sim_time.cycle
             duration_ns = self.latency_ns(command)
+            if command.op_id.startswith("moe."):
+                duration_ns = math.ceil(
+                    duration_ns * self.hardware_config.moe_time_multiplier
+                )
             if type(duration_ns) is not int or duration_ns < 0:
                 raise ValueError("latency_ns must return a nonnegative integer")
             SimModule.wait_time(SimTime(duration_ns))

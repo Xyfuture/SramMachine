@@ -13,6 +13,7 @@ from .config import (
     SystolicArrayConfig,
     VectorUnitConfig,
 )
+from .atlas_config import ATLAS_HARDWARE_CONFIG
 
 __all__ = [
     "HardwareConfig",
@@ -26,5 +27,5 @@ __all__ = [
     "InterChipFabricConfig",
     "NoCBandwidthPreset",
     "DEFAULT_HARDWARE_CONFIG",
+    "ATLAS_HARDWARE_CONFIG",
 ]
-

@@ -354,6 +354,7 @@ class HardwareConfig:
     """Top-level system hardware configuration."""
 
     chip_count: int = 16
+    moe_time_multiplier: float = 1.0
     chip: ChipConfig = field(default_factory=ChipConfig)
     inter_chip_fabric: InterChipFabricConfig = field(
         default_factory=InterChipFabricConfig
@@ -362,6 +363,7 @@ class HardwareConfig:
     def __post_init__(self) -> None:
         if type(self.chip_count) is not int or self.chip_count not in (16, 32):
             raise ValueError("chip_count must be either 16 or 32")
+        _positive_real("moe_time_multiplier", self.moe_time_multiplier)
         if not isinstance(self.chip, ChipConfig):
             raise ValueError("chip must be a ChipConfig")
         if not isinstance(self.inter_chip_fabric, InterChipFabricConfig):
