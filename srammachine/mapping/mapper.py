@@ -1056,21 +1056,50 @@ class HardwareMapper:
             sram_read_data_kind="kv_value",
         )
 
-        # O projection contracts both the local-head and latent dimensions.
-        # Folding heads into K is algebraically identical to the batched form,
-        # keeps the PU FLOPs and weight tile unchanged, and reduces the NoC
-        # output from per-head partials to one hidden tile per request.
+        # Value up-projection and output projection are kept as two steps.  The
+        # absorbed form folds W_UV and W_O into one [heads*kv_lora_rank, hidden]
+        # matrix, which is algebraically identical but deletes the v_head_dim
+        # bottleneck between them, so it multiplies both the FLOPs and the
+        # resident weight bytes by
+        #
+        #     (d_c * d_h) / (d_c * d_v + d_v * d_h)
+        #
+        # For DeepSeek-V3 (d_c=512, d_v=128, d_h=7168) that is 3.73x: 470 MB of
+        # weights instead of 126 MB, and 940 MFLOP instead of 252 MFLOP per
+        # token.  Weight bytes matter most -- attention is weight-bandwidth
+        # bound in decode and every token re-reads the whole matrix, so the fold
+        # alone would be 78% of the layer's weights.  Its only saving is the NoC
+        # tile, one hidden tile per request rather than per-head partials, which
+        # is ~0.6 MB at BS1024 against the 344 MB of extra weight traffic.
+        #
+        # v_up: per head, project the latent attention output back to v_head_dim.
         self._attention_projection(
             builder,
-            "attn.vo_absorb", "vo_absorb_head_folded_k",
+            "attn.v_up", "v_up_per_head",
+            global_dimensions=self._dims(
+                global_head_batch, 1,
+                model.kv_lora_rank, model.v_head_dim,
+            ),
+            chip_dimensions=self._dims(
+                chip_head_batch, 1,
+                model.kv_lora_rank, model.v_head_dim,
+            ),
+            strategy=strategy,
+            weight_batches=model.num_attention_heads,
+            batch_axis="B",
+        )
+        # o_proj: contract heads*v_head_dim onto hidden.
+        self._attention_projection(
+            builder,
+            "attn.o_proj", "o_proj",
             global_dimensions=self._dims(
                 1, global_batch,
-                model.num_attention_heads * model.kv_lora_rank,
+                model.num_attention_heads * model.v_head_dim,
                 model.hidden_size,
             ),
             chip_dimensions=self._dims(
                 1, chip_batch,
-                model.num_attention_heads * model.kv_lora_rank,
+                model.num_attention_heads * model.v_head_dim,
                 model.hidden_size,
             ),
             strategy=strategy,

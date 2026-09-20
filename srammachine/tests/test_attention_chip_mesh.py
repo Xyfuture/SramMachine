@@ -12,7 +12,7 @@ from srammachine.simulator import Simulator
 MODELS = ("deepseek-v3", "deepseek-v3.2", "kimi-k2.5", "glm-5.1")
 PROJECTIONS = (
     "attn.latent_down", "attn.q_rope_projection",
-    "attn.qk_nope_absorb", "attn.vo_absorb",
+    "attn.qk_nope_absorb", "attn.v_up", "attn.o_proj",
 )
 
 
