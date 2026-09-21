@@ -649,7 +649,9 @@ class SplitTreeOptimizer:
         )
         baseline_evaluation = materialize(baseline_score)
         initial_evaluation = materialize(start_score)
-        best_evaluations = tuple(materialize(item) for item in best_scores)
+        best_evaluations = self._materialize_tied_bests(
+            best_scores, materialize,
+        )
 
         self._total_candidate_simulations += candidate_simulations
         self._total_materializations += materializations
@@ -672,6 +674,53 @@ class SplitTreeOptimizer:
             random_seed=seed,
             restart_results=tuple(restart_results),
         )
+
+    @staticmethod
+    def _materialize_tied_bests(best_scores, materialize):
+        """Materialize one tied best tree and reuse it for its siblings.
+
+        Every entry in ``best_scores`` shares the same objective point, which
+        for a fixed workload means the same ``latency_ns`` -- the two objectives
+        are collinear (``total = single_user * global_batch_size``).  A full
+        ``Simulator.run`` per sibling therefore rebuilds a result whose every
+        derived field is already known to match, and the tie count is not small:
+        on a 400-round x 16-restart sweep the archive accumulates all trees
+        whose latency equals the best, which observed runs put anywhere from a
+        handful up to several thousand.  Holding that many ``SimulationResult``
+        objects was the dominant per-case memory cost.
+
+        The siblings still appear individually in the output -- each keeps its
+        own ``split_tree`` and ``first_seen_iteration`` -- so the emitted tree
+        list, its order and every published metric are unchanged.  What changes
+        is that they share the first sibling's ``simulation_result``; nothing
+        downstream reads that attribute for a tied evaluation, and the guard
+        below refuses to reuse unless the objective points and latencies really
+        are equal, falling back to a real simulation otherwise.
+
+        ``materialization_simulation_count`` necessarily drops, since fewer
+        simulations are actually run.
+        """
+        evaluations = []
+        shared = None
+        for score in best_scores:
+            if shared is not None and (
+                score.objective_point != shared.objective_point
+                or score.latency_ns != shared.latency_ns
+            ):
+                raise RuntimeError(
+                    "tied best trees disagree on the objective; refusing to "
+                    "share a materialized result"
+                )
+            if shared is None:
+                shared = materialize(score)
+                evaluations.append(shared)
+            else:
+                evaluations.append(replace(
+                    shared,
+                    split_tree=score.split_tree,
+                    first_seen_iteration=score.first_seen_iteration,
+                ))
+        return tuple(evaluations)
 
     @staticmethod
     def _update_archive(archive: list, candidate):
