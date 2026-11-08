@@ -1,0 +1,16 @@
+[project]
+name = "srammachine"
+version = "0.1.0"
+description = "SRAM-centric AI accelerator simulator"
+requires-python = ">=3.10"
+dependencies = [
+    "desim",
+    "perf-tracer",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+desim = { path = "local files/Desim", editable = true }
+perf-tracer = { path = "local files/PerfTracer", editable = true }

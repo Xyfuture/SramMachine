@@ -170,10 +170,12 @@ def _command_parameters(
             )
             parameters.update({
                 "noc_direction": (
-                    "input" if command.resource_id.endswith("noc_input")
-                    else "output" if command.resource_id.endswith("noc_output")
+                    "both" if len(command.resource_ids) > 1
+                    else "horizotal" if command.resource_id.endswith("noc_horizotal")
+                    else "vertical" if command.resource_id.endswith("noc_vertical")
                     else "unspecified"
                 ),
+                "resource_ids": command.resource_ids,
                 "noc_parallel_link_count": command.parallel_link_count,
                 "noc_link_bandwidth_bytes_per_second": link_bandwidth,
                 "noc_effective_bandwidth_bytes_per_second": (
@@ -264,6 +266,11 @@ class CommandResult:
         object.__setattr__(
             self, "parameters", _freeze_parameters(self.parameters),
         )
+
+    @property
+    def resource_ids(self) -> Tuple[str, ...]:
+        """All occupied resources, including both directions of a NoC transfer."""
+        return tuple(self.parameters.get("resource_ids", (self.resource_id,)))
 
     @property
     def duration_ns(self) -> int:

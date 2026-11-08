@@ -64,7 +64,8 @@ def _trace_path(
 
 def _trace_payload(result: SimulationResult) -> Mapping[str, Any]:
     resource_ids = tuple(dict.fromkeys(
-        item.resource_id for item in result.command_results
+        resource_id for item in result.command_results
+        for resource_id in item.resource_ids
     ))
     thread_ids = {
         resource_id: index
@@ -119,7 +120,7 @@ def _trace_payload(result: SimulationResult) -> Mapping[str, Any]:
         if (
             any(item.op_id.startswith(f"moe.{mode}") for mode in chip_mesh_modes)
             and item.resource_id in (
-                "chip0.noc_input", "chip0.noc_output", "chip0.vector",
+                "chip0.noc_horizotal", "chip0.noc_vertical", "chip0.vector",
             )
         ):
             args["chip_mesh_model"] = (
@@ -151,7 +152,8 @@ def _trace_payload(result: SimulationResult) -> Mapping[str, Any]:
             event.update({"ph": "X", "dur": item.duration_ns / 1_000})
         else:
             event.update({"ph": "i", "s": "t"})
-        events.append(event)
+        for resource_id in item.resource_ids:
+            events.append({**event, "tid": thread_ids[resource_id]})
 
     return {
         "traceEvents": events,

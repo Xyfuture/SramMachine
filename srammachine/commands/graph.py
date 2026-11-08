@@ -98,7 +98,8 @@ class CommandGraph:
         })
         resources = {}
         for cmd in self.commands:
-            resources.setdefault(cmd.resource_id, []).append(cmd.cmd_id)
+            for resource_id in cmd.resource_ids:
+                resources.setdefault(resource_id, []).append(cmd.cmd_id)
         self.resource_order = MappingProxyType({k: tuple(v) for k, v in resources.items()})
         self.topological_order()
 

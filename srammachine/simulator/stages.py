@@ -13,6 +13,7 @@ from srammachine.commands import (
     SramReadCmd, WeightLoadCmd,
 )
 from srammachine.hardware import HardwareConfig
+from srammachine.systolic_cost import systolic_gemm_duration_ns
 from .records import CommandExecution
 from .vector_costs import vector_flop_count
 
@@ -130,6 +131,7 @@ class HardwareResourceStage(SimModule, ABC):
                 command.resource_id,
                 start_time_ns,
                 SimSession.sim_time.cycle,
+                additional_resource_ids=command.resource_ids[1:],
             )
             self._outstanding = False
             self.completion_fifo.write(execution)
@@ -181,15 +183,26 @@ class ProcessingUnitStage(HardwareResourceStage):
 
     def latency_ns(self, command: GemmCmd | FlashAttentionCmd) -> int:
         self._validate_command(command)
-        flops = (
-            command.total_flops
-            if isinstance(command, (FlashAttentionCmd, FusedIndexerScoreCmd))
-            else 2 * command.B * command.M * command.K * command.N
+        if type(command) is GemmCmd:
+            compute_ns = systolic_gemm_duration_ns(command, self.hardware_config)
+        else:
+            flops = (
+                command.total_flops
+                if isinstance(command, (FlashAttentionCmd, FusedIndexerScoreCmd))
+                else 2 * command.B * command.M * command.K * command.N
+            )
+            peak_flops = (
+                self.hardware_config.chip.logic_die.processing_unit.peak_flops
+            )
+            compute_ns = _rate_duration_ns(flops, peak_flops)
+        dram_bandwidth = (
+            self.hardware_config.chip.logic_die.memory
+            .dram_bandwidth_bytes_per_second
         )
-        peak_flops = (
-            self.hardware_config.chip.logic_die.processing_unit.peak_flops
-        )
-        return _rate_duration_ns(flops, peak_flops)
+        if command.memory_bytes:
+            dram_bandwidth *= self.hardware_config.chip.logic_die_count
+        memory_ns = _rate_duration_ns(command.memory_bytes, dram_bandwidth)
+        return max(compute_ns, memory_ns)
 
 
 class VectorUnitStage(HardwareResourceStage):

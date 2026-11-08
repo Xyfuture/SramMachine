@@ -21,14 +21,26 @@ class CommandExecution:
     resource_id: str
     start_time_ns: int
     end_time_ns: int
+    additional_resource_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         nonempty("cmd_id", self.cmd_id)
         nonempty("resource_id", self.resource_id)
+        additional = tuple(self.additional_resource_ids)
+        for resource_id in additional:
+            nonempty("additional resource ID", resource_id)
+        if len(set((self.resource_id,) + additional)) != 1 + len(additional):
+            raise ValueError("resource IDs must be unique")
+        object.__setattr__(self, "additional_resource_ids", additional)
         integer("start_time_ns", self.start_time_ns)
         integer("end_time_ns", self.end_time_ns)
         if self.end_time_ns < self.start_time_ns:
             raise ValueError("end_time_ns must not precede start_time_ns")
+
+    @property
+    def resource_ids(self) -> tuple[str, ...]:
+        """All resources occupied during this execution interval."""
+        return (self.resource_id,) + self.additional_resource_ids
 
     @property
     def duration_ns(self) -> int:

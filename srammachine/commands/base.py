@@ -18,6 +18,11 @@ class Command:
     op_id: str
     resource_id: str
 
+    @property
+    def resource_ids(self) -> tuple[str, ...]:
+        """All resources occupied for the full duration of this command."""
+        return (self.resource_id,)
+
     def __post_init__(self) -> None:
         for name in ("cmd_id", "op_id", "resource_id"):
             nonempty(name, getattr(self, name))

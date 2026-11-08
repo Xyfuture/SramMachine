@@ -103,27 +103,27 @@ def _candidate(model_name, strategy, batch, multiplier, chip_k, die_k, pu_k):
         hidden_die_bytes = em * h // (chip_k * die_k) * byte
         up_bytes = em * 2 * intermediate // (chip_n * die_n) * byte
         down_input_bytes = em * intermediate // (chip_n * die_n) * byte
-        add(f"{label}.up_input", "noc_input", hidden_die_bytes,
+        add(f"{label}.up_input", "noc_horizotal", hidden_die_bytes,
             hidden_die_bytes, participants=2 if pu_k > 1 else pu_count)
-        add(f"{label}.up_output", "noc_output", up_bytes,
+        add(f"{label}.up_output", "noc_vertical", up_bytes,
             up_bytes, participants=2 if pu_k == 1 else pu_k)
         if die_k > 1:
-            add(f"{label}.up_die_reduce_scatter", "noc_output", up_bytes,
+            add(f"{label}.up_die_reduce_scatter", "noc_vertical", up_bytes,
                 Fraction(die_k - 1, die_k) * up_bytes,
                 links=4, participants=die_k)
-            add(f"{label}.up_die_allgather", "noc_input", up_bytes // die_k,
+            add(f"{label}.up_die_allgather", "noc_horizotal", up_bytes // die_k,
                 (die_k - 1) * (up_bytes // die_k),
                 links=4, participants=die_k)
         if chip_k > 1:
             add(f"{label}.up_chip_allreduce", "fabric", up_bytes,
                 Fraction(2 * (chip_k - 1), chip_k) * up_bytes,
                 participants=chip_k)
-        add(f"{label}.down_input", "noc_input", down_input_bytes,
+        add(f"{label}.down_input", "noc_horizotal", down_input_bytes,
             down_input_bytes, participants=2 if pu_k == 1 else pu_k)
-        add(f"{label}.down_output", "noc_output", hidden_die_bytes,
+        add(f"{label}.down_output", "noc_vertical", hidden_die_bytes,
             hidden_die_bytes, participants=2 if pu_n == 1 else pu_n)
         if die_n > 1:
-            add(f"{label}.down_die_reduce_scatter", "noc_output",
+            add(f"{label}.down_die_reduce_scatter", "noc_vertical",
                 hidden_die_bytes,
                 Fraction(die_n - 1, die_n) * hidden_die_bytes,
                 links=4, participants=die_n)
@@ -138,17 +138,17 @@ def _candidate(model_name, strategy, batch, multiplier, chip_k, die_k, pu_k):
             exchanged = (chip_k - 1) * shard
             add("exit_chip_hidden_exchange", "fabric", shard,
                 exchanged, participants=chip_k)
-            add("exit_die_distribute", "noc_input", exchanged,
+            add("exit_die_distribute", "noc_horizotal", exchanged,
                 exchanged, participants=2)
     else:
         add("ep_combine", "fabric", sum(map(sum, matrix)),
             _critical_alltoall(matrix), participants=chips)
     final_shard = local_batch * h // dies * byte
-    add("final_die_allgather", "noc_input", final_shard,
+    add("final_die_allgather", "noc_horizotal", final_shard,
         (dies - 1) * final_shard, links=4, participants=dies)
     totals = {key: sum(stage["duration_ns"] for stage in stages
                        if stage["direction"] == key)
-              for key in ("fabric", "noc_input", "noc_output")}
+              for key in ("fabric", "noc_horizotal", "noc_vertical")}
     return {
         "model": model_name, "strategy": strategy, "batch_size": batch,
         "mtp": "on" if multiplier == 2 else "off",
@@ -171,8 +171,8 @@ def _candidate(model_name, strategy, batch, multiplier, chip_k, die_k, pu_k):
             * (h // die_k)
         ),
         "fabric_ns": totals["fabric"],
-        "noc_input_ns": totals["noc_input"],
-        "noc_output_ns": totals["noc_output"],
+        "noc_horizotal_ns": totals["noc_horizotal"],
+        "noc_vertical_ns": totals["noc_vertical"],
         "total_ns": sum(totals.values()),
         "collective_count": len(stages),
         "stages_json": json.dumps(stages, separators=(",", ":")),

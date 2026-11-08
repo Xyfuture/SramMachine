@@ -4,14 +4,13 @@ V1 assumes a token-preserving linear operator flow. It does not infer residual
 branches, expert routing, cross-request dependencies or physical memory layout.
 One representative stack models the identical SRAM pressure of every stack.
 """
-from collections import deque
 from copy import deepcopy
 from dataclasses import replace
 from typing import Iterator, Mapping, Tuple
 
 from srammachine.commands import (
-    CommandGraph, CommandTrace, DramCmd, DramReadCmd, DramWriteCmd,
-    SramReadCmd, WeightLoadCmd, WeightPrefetchCmd, FlashAttentionCmd,
+    CommandGraph, CommandTrace, DramReadCmd, DramWriteCmd,
+    FlashAttentionCmd,
     FusedIndexerScoreCmd, GemmCmd,
     VectorCmd, NoCCmd, InterChipCmd,
 )
@@ -49,7 +48,7 @@ class TreeParser:
         integer("layer_count", layer_count, 1)
         single = self._parse_one_layer(tree, operators, mappings)
         if layer_count == 1:
-            return self._apply_weight_constraints(single)
+            return single
 
         # 原设计流程图要求复制单层 CommandGraph，模拟连续四层。
         # 保留原 op_id 以查询模型算子，使用 layer_index 区分不同层。
@@ -85,223 +84,13 @@ class TreeParser:
             edges.extend((prefix + source, prefix + target) for source, target in single.edges)
             if layer:
                 # 仅连接前层输出到后层对应 token 的计算，不能把所有图根节点
-                # 都串起来；后层 DRAM 预取和 WeightLoad 仍允许提前执行。
+                # 都串起来；后层 DRAM 读取仍允许提前执行。
                 # KV 写回也不构成整层屏障，竞争由共享硬件资源处理。
                 previous = f"layer{layer - 1}."
                 edges.extend((previous + source, prefix + target)
                              for source, target in boundary_edges)
         graph = CommandGraph(commands, edges, traces=traces)
-        return self._apply_weight_constraints(graph)
-
-    def _apply_weight_constraints(self, graph: CommandGraph) -> CommandGraph:
-        consumer_ranks = self._dram_consumer_ranks(graph)
-        graph = self._apply_sram_prefetch_constraints(graph, consumer_ranks)
-        graph = self._apply_sa_weight_load_constraints(graph)
-        return self._apply_dram_scheduling_priorities(graph, consumer_ranks)
-
-    @staticmethod
-    def _dram_consumer_ranks(graph: CommandGraph) -> Mapping[str, int]:
-        """Rank DRAM traffic by its earliest core consumer in this PipeTree."""
-        topological_order = graph.topological_order()
-        topological_rank = {
-            cmd_id: rank for rank, cmd_id in enumerate(topological_order)
-        }
-        background_rank = len(topological_order)
-        result = {}
-        for command in graph.commands:
-            if not isinstance(command, DramCmd):
-                continue
-            pending = list(graph.successors(command.cmd_id))
-            visited = set()
-            consumers = []
-            while pending:
-                cmd_id = pending.pop()
-                if cmd_id in visited:
-                    continue
-                visited.add(cmd_id)
-                if cmd_id.endswith(".core"):
-                    consumers.append(topological_rank[cmd_id])
-                    continue
-                pending.extend(graph.successors(cmd_id))
-            result[command.cmd_id] = (
-                min(consumers) if consumers
-                else background_rank + topological_rank[command.cmd_id]
-            )
-        return result
-
-    def _apply_sram_prefetch_constraints(
-        self, graph: CommandGraph, consumer_ranks: Mapping[str, int],
-    ) -> CommandGraph:
-        """Order prefetches by demand and add SRAM-capacity backpressure."""
-        graph_rank = {
-            command.cmd_id: rank for rank, command in enumerate(graph.commands)
-        }
-        prefetches = [
-            cmd for cmd in graph.commands if isinstance(cmd, WeightPrefetchCmd)
-        ]
-        if not prefetches:
-            return graph
-        prefetches.sort(key=lambda command: (
-            consumer_ranks[command.cmd_id], graph_rank[command.cmd_id],
-        ))
-
-        die_capacity = (
-            self.hardware_config.chip.logic_die.memory.sram_capacity_bytes
-        )
-        release_commands = {}
-        for prefetch in prefetches:
-            prefetch_trace = graph.traces[prefetch.cmd_id]
-            same_weight = [
-                cmd for cmd in graph.commands
-                if cmd.op_id == prefetch.op_id
-                and graph.traces[cmd.cmd_id].layer_index
-                == prefetch_trace.layer_index
-            ]
-            loads = [
-                cmd.cmd_id for cmd in same_weight
-                if isinstance(cmd, WeightLoadCmd)
-            ]
-            consumers = loads or [
-                cmd.cmd_id for cmd in same_weight
-                if cmd.cmd_id.endswith(".core")
-            ]
-            if not consumers:
-                raise ValueError(
-                    f"weight prefetch has no consumer: {prefetch.cmd_id}"
-                )
-            release_commands[prefetch.cmd_id] = tuple(consumers)
-
-        resident_by_resource = {}
-        resident_bytes_by_resource = {}
-        capacity_edges = []
-        for prefetch in prefetches:
-            sram_id = prefetch.sram_resource_id
-            capacity = (
-                die_capacity * self.hardware_config.chip.logic_die_count
-                if sram_id == "chip0.sram" else die_capacity
-            )
-            resident = resident_by_resource.setdefault(sram_id, deque())
-            resident_bytes = resident_bytes_by_resource.setdefault(sram_id, 0)
-            if prefetch.size_bytes > capacity:
-                raise ValueError(
-                    f"weight prefetch {prefetch.cmd_id} requires "
-                    f"{prefetch.size_bytes} bytes but representative SRAM "
-                    f"capacity is {capacity} bytes"
-                )
-            while resident_bytes + prefetch.size_bytes > capacity:
-                evicted = resident.popleft()
-                resident_bytes -= evicted.size_bytes
-                capacity_edges.extend(
-                    (consumer, prefetch.cmd_id)
-                    for consumer in release_commands[evicted.cmd_id]
-                )
-            resident.append(prefetch)
-            resident_bytes += prefetch.size_bytes
-            resident_bytes_by_resource[sram_id] = resident_bytes
-
-        # Preserve the consumer order even when an early prefetch is blocked by
-        # SRAM capacity. Demand reads remain free to use the idle DRAM resource.
-        prefetch_chains = {}
-        for prefetch in prefetches:
-            prefetch_chains.setdefault(prefetch.resource_id, []).append(
-                prefetch.cmd_id
-            )
-        order_edges = [
-            (previous, current)
-            for chain in prefetch_chains.values()
-            for previous, current in zip(chain, chain[1:])
-        ]
-        return CommandGraph(
-            graph.commands,
-            tuple(graph.edges) + tuple(capacity_edges) + tuple(order_edges),
-            graph.start_edges,
-            graph.traces,
-            graph.scheduling_priorities,
-        )
-
-    @staticmethod
-    def _apply_sa_weight_load_constraints(
-        graph: CommandGraph,
-    ) -> CommandGraph:
-        """Release the next static weight load when the previous GEMM is ready.
-
-        The window is defined by the complete GEMM stream, including dynamic
-        right-operand operations such as FlashAttention.  A load waits on the
-        immediately preceding GEMM's readiness predecessors, not on that GEMM's
-        completion, so SRAM weight loading can overlap the current SA compute
-        as expected from the double weight-register design.
-        """
-        load_by_core = {}
-        for command in graph.commands:
-            if not isinstance(command, WeightLoadCmd):
-                continue
-            consumers = [
-                graph.command(successor)
-                for successor in graph.successors(command.cmd_id)
-                if isinstance(
-                    graph.command(successor), (GemmCmd, FlashAttentionCmd),
-                )
-            ]
-            if len(consumers) != 1:
-                raise ValueError(
-                    f"weight load {command.cmd_id} must directly feed "
-                    "exactly one PU compute command"
-                )
-            core = consumers[0]
-            if core.cmd_id in load_by_core:
-                raise ValueError(
-                    f"GEMM {core.cmd_id} has more than one WeightLoadCmd"
-                )
-            load_by_core[core.cmd_id] = command.cmd_id
-
-        gemms_by_pu = {}
-        for command in graph.commands:
-            if isinstance(command, (GemmCmd, FlashAttentionCmd)):
-                gemms_by_pu.setdefault(command.resource_id, []).append(
-                    command.cmd_id
-                )
-
-        buffer_edges = []
-        buffer_start_edges = []
-        for cores in gemms_by_pu.values():
-            loads = [
-                load_by_core[core]
-                for core in cores
-                if core in load_by_core
-            ]
-            for index in range(1, len(cores)):
-                load_id = load_by_core.get(cores[index])
-                if load_id is None:
-                    continue
-                previous_core = cores[index - 1]
-                buffer_start_edges.append((previous_core, load_id))
-            buffer_edges.extend(
-                (previous, current)
-                for previous, current in zip(loads, loads[1:])
-            )
-        if not buffer_edges and not buffer_start_edges:
-            return graph
-        return CommandGraph(
-            graph.commands,
-            tuple(graph.edges) + tuple(buffer_edges),
-            tuple(graph.start_edges) + tuple(buffer_start_edges),
-            graph.traces,
-            graph.scheduling_priorities,
-        )
-
-    @staticmethod
-    def _apply_dram_scheduling_priorities(
-        graph: CommandGraph, consumer_ranks: Mapping[str, int],
-    ) -> CommandGraph:
-        priorities = dict(graph.scheduling_priorities)
-        priorities.update(consumer_ranks)
-        return CommandGraph(
-            graph.commands,
-            graph.edges,
-            graph.start_edges,
-            traces=graph.traces,
-            scheduling_priorities=priorities,
-        )
+        return graph
 
     def _parse_one_layer(
         self, tree: PipeTree, operators: Mapping[str, Operator],
@@ -320,6 +109,10 @@ class TreeParser:
                 raise ValueError(f"operator key does not match op_id: {op_id}")
             if not isinstance(mapping, OperatorMapping):
                 raise TypeError(f"expected OperatorMapping for {op_id}")
+            if mapping.additional_resource_ids and not (
+                isinstance(op, CommOp) and op.scope == "intra_chip"
+            ):
+                raise ValueError("additional resources require intra-chip NoC")
             # Snapshot and revalidate mutable model operators without changing them.
             op = replace(op)
             axes = (("B", "M") if isinstance(op, (BMMOp, FlashAttentionOp)) else
@@ -333,8 +126,6 @@ class TreeParser:
         for instance in instances:
             by_op[instance.op_id].append(instance)
         commands, edges, traces = [], [], {}
-        prefetched = {}
-
         def emit(cmd, instance, once=False):
             commands.append(cmd)
             traces[cmd.cmd_id] = CommandTrace(
@@ -345,23 +136,8 @@ class TreeParser:
             )
             return cmd.cmd_id
 
-        # Independent one-time prefetches are deliberately emitted first.
-        for op_index, op_id in enumerate(tree.operator_order):
-            op = checked[op_id]
-            mapping = mappings[op_id]
-            if mapping.dram_read_once_bytes:
-                prefetched[op_id] = emit(WeightPrefetchCmd(
-                    f"op{op_index}.prefetch", op_id, mapping.dram_resource_id,
-                    mapping.dram_read_once_bytes, mapping.sram_resource_id,
-                    self._prefetch_weight_shape(
-                        op, mapping, mapping.dram_read_once_bytes,
-                    ),
-                    logical_size_bytes=mapping.dram_read_once_logical_bytes,
-                    shared_die_factor=mapping.shared_die_factor,
-                ), by_op[op_id][0], once=True)
-
         core_ids = {}
-        demand_sram_reads = {}
+        dynamic_dram_reads = {}
         for instance in instances:
             op_id, batch = instance.op_id, instance.batch_size
             op, mapping = checked[op_id], mappings[op_id]
@@ -374,11 +150,16 @@ class TreeParser:
                 mapping.demand_batch_partition_degree
                 or mapping.batch_partition_degree,
             )
-            readiness = []
-            if op_id in prefetched:
-                readiness.append(prefetched[op_id])
+            memory_bytes = mapping.dram_read_once_bytes
+            if mapping.dram_read_once_bytes:
+                emit(DramReadCmd(
+                    prefix + ".weight_read", op_id, mapping.dram_resource_id,
+                    mapping.dram_read_once_bytes,
+                    logical_size_bytes=mapping.dram_read_once_logical_bytes,
+                    shared_die_factor=mapping.shared_die_factor,
+                ), instance)
             if mapping.dram_read_bytes_per_token:
-                readiness.append(emit(DramReadCmd(
+                read_id = emit(DramReadCmd(
                     prefix + ".read", op_id, mapping.dram_resource_id,
                     demand_batch * mapping.dram_read_bytes_per_token,
                     logical_size_bytes=(
@@ -388,17 +169,14 @@ class TreeParser:
                         else None
                     ),
                     shared_die_factor=mapping.shared_die_factor,
-                ), instance))
+                ), instance)
+                dynamic_dram_reads[instance.index] = read_id
+                memory_bytes += demand_batch * mapping.dram_read_bytes_per_token
             load_bytes = (mapping.weight_load_fixed_bytes
                           + mapped_batch * mapping.weight_load_bytes_per_token)
             if load_bytes:
-                load = emit(WeightLoadCmd(
-                    prefix + ".load", op_id, mapping.sram_resource_id, load_bytes,
-                    (
-                        self._prefetch_weight_shape(op, mapping, load_bytes)
-                        if mapping.sram_resource_id == "chip0.sram"
-                        else self._weight_shape(op, load_bytes)
-                    ),
+                emit(DramReadCmd(
+                    prefix + ".load", op_id, mapping.dram_resource_id, load_bytes,
                     logical_size_bytes=(
                         (mapping.weight_load_logical_fixed_bytes or 0)
                         + mapped_batch
@@ -411,13 +189,11 @@ class TreeParser:
                     ),
                     shared_die_factor=mapping.shared_die_factor,
                 ), instance)
-                edges.extend((source, load) for source in readiness)
-                readiness = [load]
+                memory_bytes += load_bytes
             if mapping.sram_read_bytes_per_mapped_token:
-                sram_read = emit(SramReadCmd(
-                    prefix + ".sram_read", op_id, mapping.sram_resource_id,
+                sram_read = emit(DramReadCmd(
+                    prefix + ".sram_read", op_id, mapping.dram_resource_id,
                     demand_batch * mapping.sram_read_bytes_per_mapped_token,
-                    mapping.sram_read_data_kind,
                     logical_size_bytes=(
                         demand_batch
                         * mapping.sram_read_logical_bytes_per_mapped_token
@@ -426,15 +202,14 @@ class TreeParser:
                     ),
                     shared_die_factor=mapping.shared_die_factor,
                 ), instance)
-                edges.extend((source, sram_read) for source in readiness)
-                readiness = [sram_read]
-                demand_sram_reads[instance.index] = sram_read
+                dynamic_dram_reads[instance.index] = sram_read
+                memory_bytes += demand_batch * mapping.sram_read_bytes_per_mapped_token
 
             core = self._core_command(
                 prefix + ".core", op, mapping, instance, tree.batch_size,
+                memory_bytes=memory_bytes,
             )
             core_ids[instance.index] = emit(core, instance)
-            edges.extend((source, core.cmd_id) for source in readiness)
             if mapping.dram_write_bytes_per_token:
                 write = emit(DramWriteCmd(
                     prefix + ".write", op_id, mapping.dram_resource_id,
@@ -470,13 +245,13 @@ class TreeParser:
         order_index = {
             op_id: index for index, op_id in enumerate(tree.operator_order)
         }
-        for instance_index, sram_read in demand_sram_reads.items():
+        for instance_index, dram_read in dynamic_dram_reads.items():
             instance = instances[instance_index]
             position = order_index[instance.op_id]
             broadcast_id = f"{instance.op_id}.input_broadcast"
             if position == 0 or tree.operator_order[position - 1] != broadcast_id:
                 raise ValueError(
-                    f"dynamic SRAM BMM is missing its input broadcast: "
+                    f"dynamic DRAM BMM is missing its input broadcast: "
                     f"{instance.op_id}"
                 )
             if position < 2:
@@ -486,7 +261,7 @@ class TreeParser:
                 if max(source.token_start, instance.token_start) < min(
                     source.token_stop, instance.token_stop,
                 ):
-                    edges.append((core_ids[source.index], sram_read))
+                    edges.append((core_ids[source.index], dram_read))
 
         return CommandGraph(commands, edges, traces=traces)
 
@@ -512,7 +287,7 @@ class TreeParser:
         return dict(mapping.weight_shape, size_bytes=size_bytes)
 
     @staticmethod
-    def _core_command(cmd_id, op, mapping, instance, full_batch):
+    def _core_command(cmd_id, op, mapping, instance, full_batch, *, memory_bytes=0):
         def scale(value):
             unit_count = mapping.batch_scaling_unit_count
             if unit_count is not None:
@@ -572,7 +347,7 @@ class TreeParser:
                     if op.main_gemm_flops_override is None
                     else scale(op.main_gemm_flops_override)
                 )
-            return command_type(**common, **dimensions)
+            return command_type(**common, memory_bytes=memory_bytes, **dimensions)
         if isinstance(op, FlashAttentionOp):
             dimensions = {
                 name: getattr(op, name)
@@ -581,9 +356,9 @@ class TreeParser:
             dimensions[mapping.batch_axis] = scale(
                 dimensions[mapping.batch_axis]
             )
-            return FlashAttentionCmd(**common, **dimensions)
+            return FlashAttentionCmd(**common, memory_bytes=memory_bytes, **dimensions)
         if isinstance(op, VectorOp):
-            return VectorCmd(**common, kind=op.kind, m=scale(op.m), n=op.n, params=op.params)
+            return VectorCmd(**common, memory_bytes=memory_bytes, kind=op.kind, m=scale(op.m), n=op.n, params=op.params)
         cls = NoCCmd if op.scope == "intra_chip" else InterChipCmd
         matrix = (None if op.transfer_bytes is None else
                   tuple(tuple(scale(value) for value in row) for row in op.transfer_bytes))
@@ -592,6 +367,8 @@ class TreeParser:
             size_bytes=None if op.size_bytes is None else scale(op.size_bytes),
             root=op.root, reduce_kind=op.reduce_kind, transfer_bytes=matrix,
             parallel_link_count=op.parallel_link_count,
+            **({"additional_resource_ids": mapping.additional_resource_ids}
+               if cls is NoCCmd else {}),
         )
 
     def iter_instances(self, tree: PipeTree) -> Iterator[OpInstance]:

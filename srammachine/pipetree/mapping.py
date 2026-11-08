@@ -47,11 +47,21 @@ class OperatorMapping:
     # Demand cache traffic can cover every chip-local request while the
     # representative PU core covers only one request partition.
     demand_batch_partition_degree: Optional[int] = None
+    # Extra NoC directions occupied by the same communication command.
+    additional_resource_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.batch_axis not in ("B", "M", "m", "size_bytes"):
             raise ValueError("batch_axis must be B, M, m or size_bytes")
         nonempty("resource_id", self.resource_id)
+        if isinstance(self.additional_resource_ids, str):
+            raise ValueError("additional_resource_ids must be a sequence of IDs")
+        additional = tuple(self.additional_resource_ids)
+        for resource_id in additional:
+            nonempty("additional resource ID", resource_id)
+        if len(set((self.resource_id,) + additional)) != 1 + len(additional):
+            raise ValueError("resource IDs must be unique")
+        object.__setattr__(self, "additional_resource_ids", additional)
         for name in ("dram_resource_id", "sram_resource_id"):
             value = getattr(self, name)
             if value is not None:
@@ -110,8 +120,9 @@ class OperatorMapping:
         if (self.dram_read_once_bytes or self.dram_read_bytes_per_token
                 or self.dram_write_bytes_per_token) and self.dram_resource_id is None:
             raise ValueError("DRAM traffic requires dram_resource_id")
-        if self.dram_read_once_bytes and self.sram_resource_id is None:
-            raise ValueError("weight prefetch requires sram_resource_id")
+        # Resident weights are fetched directly from DRAM by the PU.  Keep the
+        # optional SRAM identifier for backwards-compatible mapping data, but
+        # do not require or use it for direct transfers.
         if (self.weight_load_fixed_bytes or self.weight_load_bytes_per_token
                 ) and self.sram_resource_id is None:
             raise ValueError("weight loading requires sram_resource_id")

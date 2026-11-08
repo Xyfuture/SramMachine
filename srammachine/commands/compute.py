@@ -10,11 +10,15 @@ class GemmCmd(Command):
     M: int
     K: int
     N: int
+    # DRAM traffic overlapped with this PU operation.  The PU occupies the
+    # longer of compute time and this transfer time.
+    memory_bytes: int = field(default=0, kw_only=True)
 
     def __post_init__(self) -> None:
         super().__post_init__()
         for name in ("B", "M", "K", "N"):
             integer(name, getattr(self, name), 1)
+        integer("memory_bytes", self.memory_bytes)
 
 
 @dataclass(frozen=True)
@@ -69,11 +73,13 @@ class FlashAttentionCmd(Command):
     qk_N: int
     sv_K: int
     sv_N: int
+    memory_bytes: int = field(default=0, kw_only=True)
 
     def __post_init__(self) -> None:
         super().__post_init__()
         for name in ("B", "M", "qk_K", "qk_N", "sv_K", "sv_N"):
             integer(name, getattr(self, name), 1)
+        integer("memory_bytes", self.memory_bytes)
 
     @property
     def qk_flops(self) -> int:
@@ -94,12 +100,14 @@ class VectorCmd(Command):
     m: int
     n: int
     params: Dict[str, Any] = field(default_factory=dict)
+    memory_bytes: int = field(default=0, kw_only=True)
 
     def __post_init__(self) -> None:
         super().__post_init__()
         nonempty("kind", self.kind)
         integer("m", self.m, 1)
         integer("n", self.n, 1)
+        integer("memory_bytes", self.memory_bytes)
         if not isinstance(self.params, dict):
             raise ValueError("params must be a dictionary")
         object.__setattr__(self, "params", self.params.copy())

@@ -44,6 +44,17 @@ Fabric为每chip每方向1.6TB/s。切分依据和通信计费见
 
 ## 并行 SA 脚本
 
+NoC 使用两个独立资源：`chip0.noc_horizotal`（横向，原 input）和
+`chip0.noc_vertical`（竖向，原 output）。两方向可同时执行不同指令。
+特殊通信可在 `OperatorMapping` 或 `NoCCmd` 中设置
+`resource_id="chip0.noc_horizotal"`、
+`additional_resource_ids=("chip0.noc_vertical",)`，使同一指令从开始到结束
+同时占用两个资源；调度器等待全部资源空闲后一次性占用，并一起释放。
+`resource_ids` 返回完整资源集合，Perfetto 在两个方向轨道上显示相同通信。
+Mapper 中未拆分的片内 `allreduce` / `alltoall` 默认占用两方向，
+也可用 `noc_direction="both"` 显式指定；拆分的 reduce-scatter/allgather
+分别占用竖向/横向。资源数量不改变通信字节数、带宽或单条指令延迟。
+
 入口为：
 
 ```text

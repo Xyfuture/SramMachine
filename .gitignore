@@ -2,3 +2,6 @@
 .DS_Store
 /test result/
 /best split tree result/
+.venv/
+__pycache__/
+*.py[cod]
