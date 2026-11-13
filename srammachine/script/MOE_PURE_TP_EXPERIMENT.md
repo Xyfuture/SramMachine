@@ -1,3 +1,5 @@
+> NoC 更新：以下并行链路带宽描述为历史实验假设。当前仿真使用显式发送量 / 方向带宽，IO 输入输出共用横向资源；详见 `srammachine/script/README.md`。
+
 # Chip-level 8×8 PU mesh MoE TP/EP experiment
 
 The default 16-chip path for DeepSeek-V3, DeepSeek-V3.2,

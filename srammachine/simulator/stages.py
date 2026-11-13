@@ -222,17 +222,10 @@ class NoCResourceStage(HardwareResourceStage):
 
     def latency_ns(self, command: NoCCmd) -> int:
         self._validate_command(command)
-        numerator, denominator = _communication_volume_ratio(command)
-        if numerator == 0:
-            return 0
-        noc = self.hardware_config.chip.noc
-        transfer_time_ns = _rate_duration_ns(
-            numerator,
-            denominator * noc.link_bandwidth_bytes_per_second
-            * command.parallel_link_count,
+        return _rate_duration_ns(
+            command.size_bytes,
+            self.hardware_config.chip.noc.bandwidth_for(command.operation),
         )
-        fixed_time_ns = math.ceil(noc.link_latency_ns)
-        return transfer_time_ns + fixed_time_ns
 
 
 class InterChipFabricStage(HardwareResourceStage):

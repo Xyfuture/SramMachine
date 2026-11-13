@@ -16,7 +16,7 @@ from srammachine.commands import (
 )
 from srammachine.commands.base import integer
 from srammachine.frontend.modules import (
-    BMMOp, CommOp, FlashAttentionOp, FusedIndexerScoreOp, Operator, VectorOp,
+    BMMOp, FabricOp, FlashAttentionOp, FusedIndexerScoreOp, NoCOp, Operator, VectorOp,
 )
 from srammachine.hardware import DEFAULT_HARDWARE_CONFIG, HardwareConfig
 from .mapping import OperatorMapping
@@ -103,14 +103,14 @@ class TreeParser:
         checked = {}
         for op_id in tree.operator_order:
             op, mapping = operators[op_id], mappings[op_id]
-            if not isinstance(op, (BMMOp, FlashAttentionOp, VectorOp, CommOp)):
+            if not isinstance(op, (BMMOp, FlashAttentionOp, VectorOp, NoCOp, FabricOp)):
                 raise TypeError(f"unsupported operator: {op_id}")
             if op.op_id != op_id:
                 raise ValueError(f"operator key does not match op_id: {op_id}")
             if not isinstance(mapping, OperatorMapping):
                 raise TypeError(f"expected OperatorMapping for {op_id}")
             if mapping.additional_resource_ids and not (
-                isinstance(op, CommOp) and op.scope == "intra_chip"
+                isinstance(op, NoCOp) and op.scope == "intra_chip"
             ):
                 raise ValueError("additional resources require intra-chip NoC")
             # Snapshot and revalidate mutable model operators without changing them.
@@ -359,16 +359,18 @@ class TreeParser:
             return FlashAttentionCmd(**common, memory_bytes=memory_bytes, **dimensions)
         if isinstance(op, VectorOp):
             return VectorCmd(**common, memory_bytes=memory_bytes, kind=op.kind, m=scale(op.m), n=op.n, params=op.params)
-        cls = NoCCmd if op.scope == "intra_chip" else InterChipCmd
+        if isinstance(op, NoCOp):
+            return NoCCmd(
+                **common, operation=op.operation, size_bytes=scale(op.size_bytes),
+                kind=op.kind, group=op.group,
+                additional_resource_ids=mapping.additional_resource_ids,
+            )
         matrix = (None if op.transfer_bytes is None else
                   tuple(tuple(scale(value) for value in row) for row in op.transfer_bytes))
-        return cls(
+        return InterChipCmd(
             **common, kind=op.kind, group=op.group,
             size_bytes=None if op.size_bytes is None else scale(op.size_bytes),
             root=op.root, reduce_kind=op.reduce_kind, transfer_bytes=matrix,
-            parallel_link_count=op.parallel_link_count,
-            **({"additional_resource_ids": mapping.additional_resource_ids}
-               if cls is NoCCmd else {}),
         )
 
     def iter_instances(self, tree: PipeTree) -> Iterator[OpInstance]:

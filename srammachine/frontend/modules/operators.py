@@ -126,32 +126,21 @@ class VectorOp(Operator):
 
 
 @dataclass
-class CommOp(Operator):
-    """Communication demand, without bandwidth, topology or timing.
+class FabricOp(Operator):
+    """Inter-chip collective demand; size_bytes is each chip's input payload.
 
-    group contains PU IDs for intra_chip and chip IDs for inter_chip.
-    size_bytes is each participant's input size, not aggregate link traffic.
-    For p2p, group is (sender, receiver) and size_bytes is the send size.
-    For broadcast, size_bytes describes the root's payload. For reduce,
-    size_bytes describes each participant's partial result and root receives
-    the reduced result.
-    For nonuniform alltoall, transfer_bytes[i][j] is the byte count sent from
-    group[i] to group[j], replacing size_bytes. Diagonal entries are allowed
-    and describe locally retained data rather than network traffic.
-    reduce_kind applies to reduce, allreduce and reduce_scatter.
-    parallel_link_count is the number of physical NoC links striping one
-    logical participant-to-participant transfer.  It defaults to one for a
-    PU row/column path; current die-level collectives use four boundary links.
+    Nonuniform alltoall uses transfer_bytes[i][j] for sender i to receiver j;
+    diagonal entries represent locally retained data. Fabric collective
+    algorithms and timing remain separate from explicit NoC send volumes.
     """
 
     kind: str
-    scope: str
+    scope: str = field(default="inter_chip", init=False)
     group: Tuple[ParticipantId, ...]
     size_bytes: Optional[int] = None
     root: Optional[ParticipantId] = None
     reduce_kind: str = "sum"
     transfer_bytes: Optional[Tuple[Tuple[int, ...], ...]] = None
-    parallel_link_count: int = 1
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -160,13 +149,6 @@ class CommOp(Operator):
             "reduce_scatter", "alltoall",
         ):
             raise ValueError("unsupported communication kind")
-        if self.scope not in ("intra_chip", "inter_chip"):
-            raise ValueError("scope must be intra_chip or inter_chip")
-        _integer("parallel_link_count", self.parallel_link_count, 1)
-        if self.scope == "inter_chip" and self.parallel_link_count != 1:
-            raise ValueError(
-                "parallel_link_count is only configurable for intra_chip NoC"
-            )
         if not isinstance(self.group, (tuple, list)) or not self.group:
             raise ValueError("group must be a nonempty sequence of participant IDs")
         self.group = tuple(self.group)
@@ -184,8 +166,8 @@ class CommOp(Operator):
                 raise ValueError(f"{self.kind} root must be a member of group")
         elif self.root is not None:
             raise ValueError("root is only used by broadcast or reduce")
-        if self.kind == "reduce" and self.scope != "intra_chip":
-            raise ValueError("reduce is only supported for intra_chip NoC")
+        if self.kind == "reduce":
+            raise ValueError("reduce is not supported by Fabric")
         if self.reduce_kind not in ("sum", "max", "min"):
             raise ValueError("reduce_kind must be sum, max or min")
         if (self.size_bytes is None) == (self.transfer_bytes is None):
@@ -205,3 +187,54 @@ class CommOp(Operator):
                 for size in row:
                     _integer("transfer_bytes entry", size, 0)
             self.transfer_bytes = tuple(tuple(row) for row in matrix)
+
+
+NOC_OPERATION_RESOURCES = {
+    "ToIOdie": ("noc_horizontal",),
+    "FromIOdie": ("noc_horizontal",),
+    "PUVertical": ("noc_vertical",),
+    "PUHorizontal": ("noc_horizontal",),
+    "PUMesh": ("noc_horizontal", "noc_vertical"),
+}
+
+
+@dataclass
+class NoCOp(Operator):
+    """Explicit NoC send demand; collective kind is descriptive only.
+
+    size_bytes is the total traffic at IO-connected PUs for IO transfers,
+    or the largest sending PU's traffic for PU communication. It is already
+    the traffic to charge, not a collective input payload.
+    """
+
+    operation: str
+    size_bytes: int
+    kind: Optional[str] = None
+    group: Tuple[ParticipantId, ...] = ()
+    scope: str = field(default="intra_chip", init=False)
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.operation not in NOC_OPERATION_RESOURCES:
+            raise ValueError("unsupported NoC operation")
+        _integer("size_bytes", self.size_bytes, 0)
+        if self.kind is not None and self.kind not in (
+            "p2p", "broadcast", "reduce", "allreduce", "allgather",
+            "reduce_scatter", "alltoall",
+        ):
+            raise ValueError("unsupported communication kind")
+        if self.operation.startswith("PU") and self.kind is None:
+            raise ValueError("PU communication requires a collective kind")
+        self.group = tuple(self.group)
+        for participant in self.group:
+            if type(participant) is int:
+                _integer("participant ID", participant, 0)
+            else:
+                _name("participant ID", participant)
+        if len(set(self.group)) != len(self.group):
+            raise ValueError("group must not contain duplicate participants")
+
+    def resource_ids(self, chip_id: str = "chip0") -> Tuple[str, ...]:
+        """Return all directional resources required by this operation."""
+        return tuple(f"{chip_id}.{name}"
+                     for name in NOC_OPERATION_RESOURCES[self.operation])

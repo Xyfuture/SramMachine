@@ -180,10 +180,12 @@ class LogicDieConfig:
 
 @dataclass(frozen=True)
 class NoCConfig:
-    """Unified chip-level PU mesh.
+    """Chip-level horizontal and vertical NoC bandwidth resources.
 
-    A link is full duplex: ``link_bandwidth_bytes_per_second`` is the capacity
-    of one direction and the reverse direction has an independent equal lane.
+    Directional overrides default to link_bandwidth_bytes_per_second.
+    The coarse simulator reserves an entire axis, including both IO transfer
+    directions. Physical link latency/full-duplex flags remain topology
+    metadata and do not add latency or extra resources to this model.
     """
 
     mesh_rows: int = 8
@@ -195,8 +197,30 @@ class NoCConfig:
     full_duplex: bool = True
     seamless_across_logic_dies: bool = True
     supports_in_network_reduction: bool = True
+    horizontal_bandwidth_bytes_per_second: float | None = None
+    vertical_bandwidth_bytes_per_second: float | None = None
+
+    def bandwidth_for(self, operation: str) -> float:
+        """Directional capacity; a mesh transfer is limited by the slower axis."""
+        horizontal = (self.horizontal_bandwidth_bytes_per_second
+                      if self.horizontal_bandwidth_bytes_per_second is not None
+                      else self.link_bandwidth_bytes_per_second)
+        vertical = (self.vertical_bandwidth_bytes_per_second
+                    if self.vertical_bandwidth_bytes_per_second is not None
+                    else self.link_bandwidth_bytes_per_second)
+        if operation in ("ToIOdie", "FromIOdie", "PUHorizontal"):
+            return horizontal
+        if operation == "PUVertical":
+            return vertical
+        if operation == "PUMesh":
+            return min(horizontal, vertical)
+        raise ValueError("unsupported NoC operation")
 
     def __post_init__(self) -> None:
+        for name in ("horizontal_bandwidth_bytes_per_second",
+                     "vertical_bandwidth_bytes_per_second"):
+            if getattr(self, name) is not None:
+                _positive_real(name, getattr(self, name))
         _positive_integer("mesh_rows", self.mesh_rows)
         _positive_integer("mesh_columns", self.mesh_columns)
         _positive_real(

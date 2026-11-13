@@ -32,7 +32,7 @@ GraphExecutor + Desim
 当前 MoE 映射不按 BS 分档：TP 的16个chip仅沿 intermediate N
 切分；每chip视为统一的8×8 PU mesh，直接做 hidden K8 × intermediate N8。
 TP 的 MoE 权重读取、SiLU 以整个chip为资源粒度；Up输入和Down输出
-使用理想的32路NoC并行带宽，并省略Up K partial归约，属于实验假设。
+使用显式总字节数和横向NoC带宽计时。当前仍省略Up K partial归约，属于实验假设。
 EP仍由16个chip分别持有所属experts，chip内同样使用统一的8×8 PU mesh
 对每个本地expert做K8×N8张量并行；dispatch/combine仍是EP16 all-to-all。
 两种模式中，每个chip的64个PU对**每个本地expert**做张量并行，
@@ -44,16 +44,39 @@ Fabric为每chip每方向1.6TB/s。切分依据和通信计费见
 
 ## 并行 SA 脚本
 
-NoC 使用两个独立资源：`chip0.noc_horizotal`（横向，原 input）和
-`chip0.noc_vertical`（竖向，原 output）。两方向可同时执行不同指令。
-特殊通信可在 `OperatorMapping` 或 `NoCCmd` 中设置
-`resource_id="chip0.noc_horizotal"`、
-`additional_resource_ids=("chip0.noc_vertical",)`，使同一指令从开始到结束
-同时占用两个资源；调度器等待全部资源空闲后一次性占用，并一起释放。
-`resource_ids` 返回完整资源集合，Perfetto 在两个方向轨道上显示相同通信。
-Mapper 中未拆分的片内 `allreduce` / `alltoall` 默认占用两方向，
-也可用 `noc_direction="both"` 显式指定；拆分的 reduce-scatter/allgather
-分别占用竖向/横向。资源数量不改变通信字节数、带宽或单条指令延迟。
+通信算子分为 `NoCOp`（片内）和 `FabricOp`（片间）；原 `CommOp` 已移除。
+NoC 使用两个独立带宽资源：NocHorizontal (`chip0.noc_horizontal`) 和
+NocVertical (`chip0.noc_vertical`)，横向资源 ID 的旧拼写 `noc_horizotal` 不再使用。
+
+| NoCOp.operation | 占用资源 | size_bytes 的含义 |
+| --- | --- | --- |
+| `ToIOdie` | 横向 | IO 相连 PU 向 IO die 发送的总字节数 |
+| `FromIOdie` | 横向 | IO die 向相连 PU 发送的总字节数 |
+| `PUVertical` | 纵向 | 发送量最大的 PU 的发送字节数 |
+| `PUHorizontal` | 横向 | 发送量最大的 PU 的发送字节数 |
+| `PUMesh` | 横向、纵向 | 发送量最大的 PU 的发送字节数 |
+
+`NoCOp(op_id, operation, size_bytes, kind=None, group=())` 中，PU 通信必须提供
+集合通信标记 `kind`；标记和参与者数量均不参与仿真延迟计算。IO 通信可省略标记。
+`NoCCmd` 根据 `operation` 自动补齐资源；错误方向和跨 chip 的资源组合会被拒绝。
+`PUMesh` 等待两个资源均空闲后原子占用，一起释放；两方向上的单独指令可以重叠。
+IO 输入、输出竞争同一个横向资源。
+
+延迟为 `ceil(size_bytes / bandwidth_bytes_per_second * 1e9)` 纳秒，不再乘集合
+通信系数或并行链路数，也不加 `link_latency_ns`。
+`NoCConfig.horizontal_bandwidth_bytes_per_second` 和
+`vertical_bandwidth_bytes_per_second` 可分别设置；省略时均沿用
+`link_bandwidth_bytes_per_second`。Mesh 使用两方向带宽的较小值，且只计一次延迟。
+
+现有模型 Mapper 的 BMM/FlashAttention 输入输出分别生成 `FromIOdie`/`ToIOdie`，
+保留原映射的输入输出字节总量，移除原 8/32 路带宽放大假设。
+PU 集合通信的旧输入 payload 在映射阶段按现有集合通信算法转换为发送量；die
+级 payload 按 `sender_partition_count` 均分到发送 PU。非均匀 alltoall 取发送矩阵
+非对角行和的最大值，不取接收量最大值。转换后的 `NoCOp.size_bytes` 是最终发送量，
+TreeParser 只按 microbatch 缩放一次。Fabric 仍使用原集合通信计时逻辑。
+
+Trace 记录 `operation`、`size_bytes`、`volume_semantics`、带宽和完整 `resource_ids`。
+Perfetto 在 Mesh 的两个方向轨道上显示相同通信。
 
 入口为：
 

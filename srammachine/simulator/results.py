@@ -164,24 +164,25 @@ def _command_parameters(
             "communication_critical_path_bytes_denominator": critical_den,
             "communication_critical_path_bytes": critical_num / critical_den,
         }
-        if isinstance(command, NoCCmd):
-            link_bandwidth = (
-                hardware_config.chip.noc.link_bandwidth_bytes_per_second
-            )
-            parameters.update({
-                "noc_direction": (
-                    "both" if len(command.resource_ids) > 1
-                    else "horizotal" if command.resource_id.endswith("noc_horizotal")
-                    else "vertical" if command.resource_id.endswith("noc_vertical")
-                    else "unspecified"
-                ),
-                "resource_ids": command.resource_ids,
-                "noc_parallel_link_count": command.parallel_link_count,
-                "noc_link_bandwidth_bytes_per_second": link_bandwidth,
-                "noc_effective_bandwidth_bytes_per_second": (
-                    link_bandwidth * command.parallel_link_count
-                ),
-            })
+    elif isinstance(command, NoCCmd):
+        parameters = {
+            "operation": command.operation,
+            "communication_scope": command.scope,
+            "kind": command.kind,
+            "communication_kind": command.kind,
+            "scope": command.scope,
+            "group": command.group,
+            "size_bytes": command.size_bytes,
+            "communication_size_bytes": command.size_bytes,
+            "communication_critical_path_bytes": command.size_bytes,
+            "volume_semantics": ("io_connected_pus_total" if command.operation in
+                                 ("ToIOdie", "FromIOdie") else "max_pu_send"),
+            "resource_ids": command.resource_ids,
+            "noc_direction": ("both" if len(command.resource_ids) > 1 else
+                              "horizontal" if command.resource_id.endswith("noc_horizontal")
+                              else "vertical"),
+            "noc_bandwidth_bytes_per_second": hardware_config.chip.noc.bandwidth_for(command.operation),
+        }
     else:
         raise TypeError(f"unsupported command type: {type(command).__name__}")
     if (

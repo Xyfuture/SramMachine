@@ -5,7 +5,7 @@ from types import MappingProxyType
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
 from srammachine.frontend.modules import (
-    BMMOp, CommOp, FlashAttentionOp, FusedIndexerScoreOp, Operator, VectorOp,
+    BMMOp, FabricOp, FlashAttentionOp, FusedIndexerScoreOp, NoCOp, Operator, VectorOp,
 )
 from srammachine.hardware import DEFAULT_HARDWARE_CONFIG, HardwareConfig
 from srammachine.inference import InferenceConfig, MoEParallelStrategy
@@ -187,7 +187,7 @@ class _LayerBuilder:
     CHIP_DRAM = "chip0.dram"
     CHIP_SRAM = "chip0.sram"
     CHIP_VECTOR = "chip0.vector"
-    NOC_HORIZOTAL = "chip0.noc_horizotal"
+    NOC_HORIZONTAL = "chip0.noc_horizontal"
     NOC_VERTICAL = "chip0.noc_vertical"
     FABRIC = "system.fabric"
 
@@ -242,8 +242,8 @@ class _LayerBuilder:
         )
 
     @property
-    def die_collective_parallel_link_count(self) -> int:
-        """Physical NoC links striping one adjacent-die logical edge."""
+    def die_collective_sender_partition_count(self) -> int:
+        """PU senders sharing one die-level collective payload."""
         chip = self.hardware_config.chip
         return min(
             chip.horizontal_logic_die_boundary_link_count,
@@ -260,14 +260,13 @@ class _LayerBuilder:
         expected_resource = (
             self.PU if isinstance(operator, (BMMOp, FlashAttentionOp))
             else self.VECTOR if isinstance(operator, VectorOp)
-            else self._noc_resource(operator.kind)
-            if operator.scope == "intra_chip"
+            else operator.resource_ids()[0]
+            if isinstance(operator, NoCOp)
             else self.FABRIC
         )
         valid_resources = (
-            {self.NOC_HORIZOTAL, self.NOC_VERTICAL}
-            if isinstance(operator, CommOp)
-            and operator.scope == "intra_chip"
+            set(operator.resource_ids())
+            if isinstance(operator, NoCOp)
             else {expected_resource}
         )
         if (isinstance(operator, VectorOp) and op_id.startswith(("moe.tp", "moe.ep"))
@@ -281,14 +280,6 @@ class _LayerBuilder:
         self.operators[op_id] = operator
         self.mappings[op_id] = mapping
         self.hardware_mappings[op_id] = hardware_mapping
-
-    @classmethod
-    def _noc_resource(cls, kind: str) -> str:
-        return (
-            cls.NOC_HORIZOTAL
-            if kind in ("broadcast", "allgather")
-            else cls.NOC_VERTICAL
-        )
 
     def _pu_dimensions(self, die_dimensions: Mapping[str, int]) -> Mapping[str, int]:
         dimensions = dict(die_dimensions)
@@ -339,8 +330,6 @@ class _LayerBuilder:
         batch_scaling_unit_count: Optional[int] = None,
         dram_resource_id: Optional[str] = None,
         sram_resource_id: Optional[str] = None,
-        input_parallel_link_count: int = 1,
-        output_parallel_link_count: int = 1,
     ) -> None:
         for dimensions in (global_dimensions, chip_dimensions, die_dimensions):
             if set(dimensions) != {"B", "M", "K", "N"}:
@@ -399,7 +388,7 @@ class _LayerBuilder:
             )
         self.add_comm(
             f"{op_id}.{input_suffix}", f"{op_kind}_{input_suffix}",
-            scope="intra_chip", kind=input_kind,
+            scope="intra_chip", kind=input_kind, noc_operation="FromIOdie",
             group=(
                 self.representative_pu_row
                 if input_group is None else tuple(input_group)
@@ -414,7 +403,6 @@ class _LayerBuilder:
             ),
             noc_direction=input_noc_direction,
             batch_scaling_unit_count=batch_scaling_unit_count,
-            parallel_link_count=input_parallel_link_count,
         )
         operator_type = FusedIndexerScoreOp if fused_indexer_score else BMMOp
         operator_kwargs = dict(pu_dimensions)
@@ -475,7 +463,7 @@ class _LayerBuilder:
         ))
         self.add_comm(
             f"{op_id}.{output_suffix}", f"{op_kind}_{output_suffix}",
-            scope="intra_chip", kind=output_kind,
+            scope="intra_chip", kind=output_kind, noc_operation="ToIOdie",
             group=(
                 self.representative_pu_column
                 if output_group is None else tuple(output_group)
@@ -490,7 +478,6 @@ class _LayerBuilder:
                 else batch_partition_degree
             ),
             batch_scaling_unit_count=batch_scaling_unit_count,
-            parallel_link_count=output_parallel_link_count,
         )
 
     def add_vector(
@@ -582,7 +569,7 @@ class _LayerBuilder:
         )
         self.add_comm(
             f"{op_id}.input_broadcast", f"{op_kind}_input_broadcast",
-            scope="intra_chip", kind="broadcast",
+            scope="intra_chip", kind="broadcast", noc_operation="FromIOdie",
             group=self.representative_pu_row if input_group is None else tuple(input_group), root=self.PU,
             size_bytes=input_bytes, parallel_strategy=parallel_strategy,
         )
@@ -614,7 +601,7 @@ class _LayerBuilder:
         ))
         self.add_comm(
             f"{op_id}.output_reduce", f"{op_kind}_output_reduce",
-            scope="intra_chip", kind="reduce",
+            scope="intra_chip", kind="reduce", noc_operation="ToIOdie",
             group=self.representative_pu_column if output_group is None else tuple(output_group), root=self.PU,
             size_bytes=output_bytes, reduce_kind="sum",
             parallel_strategy=parallel_strategy,
@@ -627,42 +614,76 @@ class _LayerBuilder:
         transfer_bytes: Optional[Sequence[Sequence[int]]] = None,
         root: Optional[Any] = None,
         reduce_kind: str = "sum",
-        parallel_link_count: int = 1,
+        sender_partition_count: int = 1,
         batch_partition_degree: int = 1,
         dram_write_bytes_per_token: int = 0,
         dram_write_logical_bytes_per_token: Optional[int] = None,
         shared_die_factor: int = 1,
         noc_direction: Optional[str] = None,
+        noc_operation: Optional[str] = None,
         batch_scaling_unit_count: Optional[int] = None,
     ) -> None:
+        """Lower existing mapping payloads into explicit NoC or Fabric demand.
+
+        IO size_bytes is aggregate traffic. PU size_bytes is a collective
+        input payload here, converted once to maximum per-PU sending traffic;
+        NoCOp and NoCCmd themselves always carry the final send count.
+        """
         matrix = None
         if transfer_bytes is not None:
             matrix = tuple(tuple(row) for row in transfer_bytes)
-        operator = CommOp(
-            op_id, kind, scope, tuple(group), size_bytes=size_bytes,
-            root=root, reduce_kind=reduce_kind, transfer_bytes=matrix,
-            parallel_link_count=parallel_link_count,
-        )
-        if noc_direction not in (None, "horizotal", "vertical", "both"):
-            raise ValueError("noc_direction must be horizotal, vertical or both")
-        if scope == "inter_chip" and noc_direction is not None:
-            raise ValueError("noc_direction applies only to intra-chip NoC")
-        resource = self.FABRIC
-        if scope == "intra_chip":
-            resource = (
-                self.NOC_HORIZOTAL if noc_direction == "horizotal"
-                else self.NOC_VERTICAL if noc_direction == "vertical"
-                else self._noc_resource(kind)
-            )
+        if scope not in ("intra_chip", "inter_chip"):
+            raise ValueError("unsupported communication scope")
+        if noc_direction not in (None, "horizontal", "vertical", "both"):
+            raise ValueError("invalid NoC direction")
         additional_resources = ()
-        if scope == "intra_chip" and (
-            noc_direction == "both"
-            or (noc_direction is None and kind in ("allreduce", "alltoall"))
-        ):
-            additional_resources = tuple(
-                item for item in (self.NOC_HORIZOTAL, self.NOC_VERTICAL)
-                if item != resource
+        if scope == "intra_chip":
+            if noc_operation is None:
+                direction = noc_direction or (
+                    "both" if kind in ("allreduce", "alltoall") else
+                    "horizontal" if kind in ("broadcast", "allgather") else "vertical"
+                )
+                noc_operation = {"horizontal": "PUHorizontal",
+                                 "vertical": "PUVertical", "both": "PUMesh"}[direction]
+            if (size_bytes is None) == (matrix is None):
+                raise ValueError("provide exactly one of size_bytes and transfer_bytes")
+            # Nonuniform traffic records the largest sender, excluding local data.
+            if matrix is not None:
+                FabricOp(op_id, kind, tuple(group), transfer_bytes=matrix)
+                size_bytes = max((sum(value for j, value in enumerate(row) if i != j)
+                                  for i, row in enumerate(matrix)), default=0)
+            if type(size_bytes) is not int or size_bytes < 0:
+                raise ValueError("NoC byte count must be a nonnegative integer")
+            if noc_operation in ("ToIOdie", "FromIOdie") and matrix is not None:
+                raise ValueError("IO transfers require an explicit aggregate size_bytes")
+            if noc_operation.startswith("PU"):
+                if type(sender_partition_count) is not int or sender_partition_count < 1:
+                    raise ValueError("sender_partition_count must be a positive integer")
+                # Resolve payload semantics here; the simulator receives only
+                # the explicit maximum sending PU traffic, independent of kind.
+                count = len(group)
+                if not count:
+                    raise ValueError("mapped PU collective requires participants")
+                numerator, denominator = size_bytes, 1
+                if matrix is None:
+                    if kind == "allreduce":
+                        numerator, denominator = 2 * (count - 1) * size_bytes, count
+                    elif kind == "allgather":
+                        numerator = (count - 1) * size_bytes
+                    elif kind in ("reduce_scatter", "alltoall"):
+                        numerator, denominator = (count - 1) * size_bytes, count
+                size_bytes = _ceil_div(numerator, denominator * sender_partition_count)
+            operator = NoCOp(op_id, noc_operation, size_bytes, kind, tuple(group))
+            resource, *extra = operator.resource_ids()
+            additional_resources = tuple(extra)
+        else:
+            if noc_direction is not None or noc_operation is not None:
+                raise ValueError("NoC options require intra-chip communication")
+            operator = FabricOp(
+                op_id, kind, tuple(group), size_bytes=size_bytes, root=root,
+                reduce_kind=reduce_kind, transfer_bytes=matrix,
             )
+            resource = self.FABRIC
         if size_bytes is not None:
             dimensions = {"size_bytes": max(size_bytes, 1)}
         else:
@@ -831,8 +852,6 @@ class HardwareMapper:
             ),
             input_group=builder.chip_mesh_row(),
             output_group=builder.chip_mesh_column(),
-            input_parallel_link_count=8,
-            output_parallel_link_count=8,
         )
 
     def _build_attention(self, builder: _LayerBuilder) -> None:
@@ -1108,7 +1127,6 @@ class HardwareMapper:
                 chip_batch * pu_dimensions["N"] * _ACTIVATION_DTYPE_BYTES
             )
             sequence_partitions = 8
-            output_links = 1
             main_gemm_override = None
         elif base_global_batch < 1024:
             # Use the largest equal per-request PU allocation and leave any
@@ -1129,7 +1147,6 @@ class HardwareMapper:
                 local_req * pu_per_req * token_multiplier * local_top_k * 4
             )
             sequence_partitions = pu_per_req
-            output_links = 8
             main_gemm_override = old_main_gemm_flops
         else:
             # At BS=1024 on a 32-chip system there are only 32 local
@@ -1153,7 +1170,6 @@ class HardwareMapper:
             # a 2-byte score. The source PU identifies the shard origin.
             output_bytes = local_req * token_multiplier * top_k * 4
             sequence_partitions = 1
-            output_links = 8
             main_gemm_override = old_main_gemm_flops
 
         builder.add_bmm(
@@ -1200,12 +1216,10 @@ class HardwareMapper:
                 chip_batch * model.indexer_num_heads
                 * model.indexer_head_dim * _ACTIVATION_DTYPE_BYTES
             ),
-            input_parallel_link_count=8,
             output_kind=output_kind,
             output_group=output_group,
             output_suffix=output_suffix,
             output_bytes_override=output_bytes,
-            output_parallel_link_count=output_links,
             input_group=builder.chip_mesh_row(),
         )
         if base_global_batch <= 128:
@@ -1355,7 +1369,7 @@ class HardwareMapper:
                 "input_kind": "p2p",
                 "input_suffix": "input_transfer",
                 "input_group": ("chip0.die0.input", builder.PU),
-                "input_noc_direction": "horizotal",
+                "input_noc_direction": "horizontal",
                 "output_kind": "p2p",
                 "output_group": (builder.PU, "chip0.die0.output"),
                 "output_suffix": "output_transfer",
@@ -1378,7 +1392,7 @@ class HardwareMapper:
         if is_tp:
             # The four K-sharded dies produce partial Up/Gate outputs.  Model
             # allreduce explicitly as reduce-scatter on noc_vertical followed
-            # by allgather on noc_horizotal.  The end-to-end bytes/time are the
+            # by allgather on noc_horizontal.  The end-to-end bytes/time are the
             # same, while the two full-duplex directions can be independently
             # pipelined across microbatches.
             up_output_bytes = (
@@ -1391,8 +1405,8 @@ class HardwareMapper:
                 scope="intra_chip", kind="reduce_scatter",
                 group=builder.die_group,
                 size_bytes=up_output_bytes,
-                parallel_link_count=(
-                    builder.die_collective_parallel_link_count
+                sender_partition_count=(
+                    builder.die_collective_sender_partition_count
                 ),
                 parallel_strategy=parallel_strategy,
                 batch_scaling_unit_count=tokens_per_expert,
@@ -1406,8 +1420,8 @@ class HardwareMapper:
                     up_output_bytes, len(builder.die_group),
                     "TP Up/Gate reduce-scatter output",
                 ),
-                parallel_link_count=(
-                    builder.die_collective_parallel_link_count
+                sender_partition_count=(
+                    builder.die_collective_sender_partition_count
                 ),
                 parallel_strategy=parallel_strategy,
                 batch_scaling_unit_count=tokens_per_expert,
@@ -1441,8 +1455,8 @@ class HardwareMapper:
                     expert_count * tokens_per_expert * local_intermediate
                     * _ACTIVATION_DTYPE_BYTES
                 ),
-                parallel_link_count=(
-                    builder.die_collective_parallel_link_count
+                sender_partition_count=(
+                    builder.die_collective_sender_partition_count
                 ),
                 parallel_strategy=parallel_strategy,
                 batch_scaling_unit_count=tokens_per_expert,
@@ -1497,7 +1511,7 @@ class HardwareMapper:
                 "input_kind": "p2p",
                 "input_suffix": "input_transfer",
                 "input_group": ("chip0.die0.input", builder.PU),
-                "input_noc_direction": "horizotal",
+                "input_noc_direction": "horizontal",
                 "output_kind": "p2p",
                 "output_group": (
                     builder.PU, "chip0.die0.output",
@@ -1599,7 +1613,7 @@ class HardwareMapper:
                 weight_batches=die_experts, pu_weight_batches=pu_experts,
                 input_kind="p2p", input_suffix="input_transfer",
                 input_group=("chip0.die0.input", builder.PU),
-                input_noc_direction="horizotal", output_kind="p2p",
+                input_noc_direction="horizontal", output_kind="p2p",
                 output_group=(builder.PU, "chip0.die0.output"),
                 output_suffix="output_transfer", **common,
             )
@@ -1646,7 +1660,7 @@ class HardwareMapper:
             weight_batches=die_experts, pu_weight_batches=pu_experts,
             input_kind="p2p", input_suffix="input_transfer",
             input_group=("chip0.die0.input", builder.PU),
-            input_noc_direction="horizotal", output_kind="p2p",
+            input_noc_direction="horizontal", output_kind="p2p",
             output_group=(builder.PU, "chip0.die0.output"),
             output_suffix="output_transfer", **common,
         )
@@ -1730,7 +1744,7 @@ class HardwareMapper:
             scope="intra_chip", kind="reduce_scatter",
             group=builder.die_group,
             size_bytes=group_batch * model.hidden_size * dtype,
-            parallel_link_count=builder.die_collective_parallel_link_count,
+            sender_partition_count=builder.die_collective_sender_partition_count,
             parallel_strategy=strategy,
         )
         builder.add_comm(
@@ -1747,7 +1761,7 @@ class HardwareMapper:
                 * _exact_div(model.hidden_size, dies, "TP output hidden shard")
                 * dtype
             ),
-            parallel_link_count=builder.die_collective_parallel_link_count,
+            sender_partition_count=builder.die_collective_sender_partition_count,
             parallel_strategy=strategy,
         )
         builder.add_vector(
@@ -1853,7 +1867,7 @@ class HardwareMapper:
                 ("chip0.die0.input", builder.PU)
                 if pu_k_degree > 1 else down_output_group
             ),
-            input_noc_direction="horizotal",
+            input_noc_direction="horizontal",
             input_bytes_override=(
                 local_experts * tokens_per_expert
                 * hidden_die * _ACTIVATION_DTYPE_BYTES
@@ -1888,7 +1902,7 @@ class HardwareMapper:
                 "moe_up_gate_die_reduce_scatter",
                 scope="intra_chip", kind="reduce_scatter",
                 group=die_k_group, size_bytes=up_bytes,
-                parallel_link_count=builder.die_collective_parallel_link_count,
+                sender_partition_count=builder.die_collective_sender_partition_count,
                 parallel_strategy=strategy,
                 batch_scaling_unit_count=tokens_per_expert,
             )
@@ -1900,7 +1914,7 @@ class HardwareMapper:
                 size_bytes=_exact_div(
                     up_bytes, die_k_degree, "pure MoE Up/Gate scatter",
                 ),
-                parallel_link_count=builder.die_collective_parallel_link_count,
+                sender_partition_count=builder.die_collective_sender_partition_count,
                 parallel_strategy=strategy,
                 batch_scaling_unit_count=tokens_per_expert,
             )
@@ -1958,7 +1972,7 @@ class HardwareMapper:
                 up_output_group if pu_k_degree > 1
                 else ("chip0.die0.input", builder.PU)
             ),
-            input_noc_direction="horizotal",
+            input_noc_direction="horizontal",
             input_bytes_override=(
                 local_experts * tokens_per_expert
                 * die_intermediate * _ACTIVATION_DTYPE_BYTES
@@ -1982,7 +1996,7 @@ class HardwareMapper:
                     local_experts * tokens_per_expert
                     * hidden_die * _ACTIVATION_DTYPE_BYTES
                 ),
-                parallel_link_count=builder.die_collective_parallel_link_count,
+                sender_partition_count=builder.die_collective_sender_partition_count,
                 parallel_strategy=strategy,
                 batch_scaling_unit_count=tokens_per_expert,
             )
@@ -2010,7 +2024,6 @@ class HardwareMapper:
         rows, columns = chip.noc.mesh_rows, chip.noc.mesh_columns
         hidden_pu = _exact_div(hidden, rows, "MoE PU hidden")
         intermediate_pu = _exact_div(intermediate, columns, "MoE PU intermediate")
-        chip_links = 4 * rows  # Four perimeter edges, eight ideal lanes each.
         suffix = f"tokens{m}"
         prefix = f"{prefix}.{suffix}"
         common = dict(
@@ -2034,9 +2047,8 @@ class HardwareMapper:
             sram_resource_id=builder.CHIP_SRAM,
             input_kind="p2p", input_suffix="input_transfer",
             input_group=("chip0.input", builder.PU),
-            input_noc_direction="horizotal",
+            input_noc_direction="horizontal",
             input_bytes_override=experts * m * hidden * _ACTIVATION_DTYPE_BYTES,
-            input_parallel_link_count=chip_links,
             output_kind="p2p", output_suffix="output_transfer",
             output_group=(builder.PU, "chip0.vector"),
             output_bytes_override=(
@@ -2069,7 +2081,7 @@ class HardwareMapper:
             sram_resource_id=builder.CHIP_SRAM,
             input_kind="p2p", input_suffix="input_transfer",
             input_group=("chip0.vector", builder.PU),
-            input_noc_direction="horizotal",
+            input_noc_direction="horizontal",
             input_bytes_override=(
                 experts * m * intermediate_pu * _ACTIVATION_DTYPE_BYTES
             ),
@@ -2077,7 +2089,6 @@ class HardwareMapper:
                 f"chip0.pu{index}" for index in range(1, rows)
             ),
             output_bytes_override=experts * m * hidden * _ACTIVATION_DTYPE_BYTES,
-            output_parallel_link_count=chip_links,
             **common,
         )
 
@@ -2161,7 +2172,7 @@ class HardwareMapper:
                 scope="intra_chip", kind="p2p",
                 group=("chip0.input", "chip0.die0.input"),
                 size_bytes=(chip_k_degree - 1) * exchange_bytes,
-                noc_direction="horizotal", parallel_strategy=strategy,
+                noc_direction="horizontal", parallel_strategy=strategy,
             )
         builder.add_vector(
             "moe.tp_residual", "residual",
@@ -2238,7 +2249,7 @@ class HardwareMapper:
                 )
                 * dtype
             ),
-            parallel_link_count=builder.die_collective_parallel_link_count,
+            sender_partition_count=builder.die_collective_sender_partition_count,
             parallel_strategy=strategy,
         )
         builder.add_vector(
@@ -2474,8 +2485,8 @@ class HardwareMapper:
                 scope="intra_chip", kind="reduce_scatter",
                 group=builder.die_group,
                 size_bytes=local_batch * model.hidden_size * dtype,
-                parallel_link_count=(
-                    builder.die_collective_parallel_link_count
+                sender_partition_count=(
+                    builder.die_collective_sender_partition_count
                 ),
                 parallel_strategy=strategy,
             )
@@ -2489,7 +2500,7 @@ class HardwareMapper:
                 )
                 * dtype
             ),
-            parallel_link_count=builder.die_collective_parallel_link_count,
+            sender_partition_count=builder.die_collective_sender_partition_count,
             parallel_strategy=strategy,
         )
         builder.add_vector(
@@ -2589,7 +2600,7 @@ class HardwareMapper:
             weight_batches=4, pu_weight_batches=1,
             input_kind="p2p", input_suffix="input_transfer",
             input_group=("chip0.die0.input", builder.PU),
-            input_noc_direction="horizotal",
+            input_noc_direction="horizontal",
             output_kind="reduce",
             output_group=builder.representative_pu_row,
             output_suffix="output_reduce",

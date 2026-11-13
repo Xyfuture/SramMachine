@@ -59,7 +59,7 @@ class AttentionChipMeshTests(unittest.TestCase):
                                 for suffix in ("input_broadcast", "output_reduce"):
                                     comm = current.operators[op_id + "." + suffix]
                                     self.assertEqual(len(comm.group), 8)
-                                    self.assertEqual(comm.parallel_link_count, 8)
+                                    self.assertEqual(comm.operation, "FromIOdie" if suffix == "input_broadcast" else "ToIOdie")
                             for op_id, operator in current.operators.items():
                                 if op_id.startswith("attn.") and operator.__class__.__name__ == "VectorOp":
                                     self.assertEqual(

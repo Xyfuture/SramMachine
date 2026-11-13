@@ -120,26 +120,18 @@ def _trace_payload(result: SimulationResult) -> Mapping[str, Any]:
         if (
             any(item.op_id.startswith(f"moe.{mode}") for mode in chip_mesh_modes)
             and item.resource_id in (
-                "chip0.noc_horizotal", "chip0.noc_vertical", "chip0.vector",
+                "chip0.noc_horizontal", "chip0.noc_vertical", "chip0.vector",
             )
         ):
             args["chip_mesh_model"] = (
                 "ideal 8x8 PU mesh; Up K-partial reduction omitted"
             )
-            if item.parameters.get("noc_parallel_link_count") == 32:
-                args["noc_parallelism_assumption"] = (
-                    "4 perimeter edges x 8 lanes at 256 GB/s each"
-                )
         if item.op_id.startswith("attn."):
             args["attention_mesh_model"] = (
                 "chip 8x8 PU mesh; 8-way input sharing/output reduction "
                 "for projections; FlashAttention rows are independent; "
                 "KV cache sharing follows the prior effective traffic model"
             )
-            if item.parameters.get("noc_parallel_link_count") == 8:
-                args["noc_parallelism_assumption"] = (
-                    "8 parallel 256 GB/s PU paths"
-                )
         event = {
             "name": _event_name(item),
             "cat": item.category.value,
@@ -205,6 +197,8 @@ def _event_name(item) -> str:
             f"{parameters['communication_scope']} "
             f"{parameters['communication_kind']}"
         )
+        if "operation" in parameters:
+            suffix += f" {parameters['operation']}"
         if size is not None:
             suffix += f" size={_format_bytes(size)}"
         suffix += f" critical={_format_bytes(critical)}"

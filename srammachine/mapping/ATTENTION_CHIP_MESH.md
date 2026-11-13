@@ -1,3 +1,5 @@
+> NoC 更新：以下并行链路带宽描述为历史实验假设。当前仿真使用显式发送量 / 方向带宽，IO 输入输出共用横向资源；详见 `srammachine/script/README.md`。
+
 # Attention chip-level 8×8 mesh
 
 All four models use one Attention mapping regardless of MoE TP/EP. Projection
