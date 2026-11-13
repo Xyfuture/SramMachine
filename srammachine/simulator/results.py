@@ -111,6 +111,8 @@ def _command_parameters(
             "head_reduce_flops": command.head_reduce_flops,
             "total_flops": command.total_flops,
             "fused_indexer_score": True,
+            "top_k": command.top_k,
+            "output_candidates": command.output_candidates,
         }
     elif isinstance(command, GemmCmd):
         parameters = {
@@ -175,7 +177,9 @@ def _command_parameters(
             "size_bytes": command.size_bytes,
             "communication_size_bytes": command.size_bytes,
             "communication_critical_path_bytes": command.size_bytes,
-            "volume_semantics": ("io_connected_pus_total" if command.operation in
+            "io_bytes_per_row": command.io_bytes_per_row,
+            "volume_semantics": ("max_io_row" if command.io_bytes_per_row else
+                                 "io_connected_pus_total" if command.operation in
                                  ("ToIOdie", "FromIOdie") else "max_pu_send"),
             "resource_ids": command.resource_ids,
             "noc_direction": ("both" if len(command.resource_ids) > 1 else
@@ -185,6 +189,20 @@ def _command_parameters(
         }
     else:
         raise TypeError(f"unsupported command type: {type(command).__name__}")
+    if isinstance(command, NoCCmd) and command.attention_complete_batches_per_row:
+        parameters.update({
+            "attention_reduction": "row_local_online_softmax_merge",
+            "attention_complete_batches_per_row": command.attention_complete_batches_per_row,
+            "attention_partial_batches_per_row": command.attention_partial_batches_per_row,
+            "attention_partial_payload": "m_l_unnormalized_u",
+        })
+    if isinstance(command, NoCCmd) and command.top_k is not None:
+        parameters.update({
+            "top_k": command.top_k,
+            "topk_candidates_per_row": command.topk_candidates_per_row,
+            "output_reduction": "per_batch_topk_merge",
+            "output_payload": "score_and_global_sequence_index",
+        })
     if (
         isinstance(command, (DramCmd, WeightLoadCmd, SramReadCmd))
         and command.logical_size_bytes is not None
@@ -194,6 +212,8 @@ def _command_parameters(
             "effective_size_bytes": command.size_bytes,
             "shared_die_factor": command.shared_die_factor,
         })
+    if isinstance(command, GemmCmd):
+        parameters["weight_load_bytes"] = command.weight_load_bytes
     return _freeze_parameters(parameters)
 
 

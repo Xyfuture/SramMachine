@@ -410,7 +410,12 @@ class _LayerBuilder:
             operator_kwargs["main_gemm_flops_override"] = (
                 main_gemm_flops_override
             )
-        operator = operator_type(op_id, **operator_kwargs)
+        # Legacy mapper emits explicit communication nodes and prepartitions
+        # dimensions. Opt out of implicit IO/load lowering for these instances.
+        operator = operator_type(
+            op_id, **operator_kwargs, input_source="none",
+            output_destination="none", auto_weight_load=False,
+        )
         mapping = OperatorMapping(
             batch_axis, self.PU,
             (dram_resource_id or self.DRAM) if (

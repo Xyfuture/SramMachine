@@ -262,3 +262,166 @@ Pareto front 只在固定配置内部计算。分组字段包括模型、MoE策�
 - 显式指定的 `--output-csv` 如果已经存在，脚本会拒绝覆盖。
 - 每个case搜索完成后，脚本立即保存独立SplitTree checkpoint、重放该树并生成Perfetto trace和稳态PU利用率；trace阶段不增加SA搜索轮数。
 - 中断后，已完成case的CSV、独立SplitTree checkpoint和trace均保留；正在运行的case仍需重新搜索，脚本暂不自动续跑。
+
+### PartitionChain 驱动的 BMM lowering
+
+`BMMOp` 的 `B/M/K/N` 可以描述切分前的完整逻辑计算，`partition_chain`
+记录该计算到参与 PU 网格的有序映射。空链表示单 PU。示例：
+
+```python
+from srammachine.frontend.modules import BMMOp, PartitionChain
+
+op = BMMOp(
+    "projection", B=8, M=16, K=1024, N=4096,
+    partition_chain=PartitionChain((
+        ("B", "p", 4), ("N", "p", 2),
+        ("K", "p", 4), ("N", "q", 64),
+    )),
+    input_source="io_die",
+    output_destination="io_die",
+)
+assert op.partition_chain.grid_shape == (32, 64)
+print(op.partition_chain.tile_ranges(
+    {"B": op.B, "M": op.M, "K": op.K, "N": op.N}, p=0, q=0,
+))
+print(op.communication_volumes())
+```
+
+切分按顺序逐级向上取整，坐标按各物理维度的混合进制解码；有效范围同时裁剪到
+父 tile 和原始 tensor 范围。零元素 PU 不贡献通信量。完整 shape 先按 PipeTree
+microbatch 缩放，再进行 PU 切分。计算命令取最大有效 PU tile，沿用
+`systolic_gemm_duration_ns` 的阵列数量因子搜索。
+
+- Input：`io_die`（默认）或 `none`。逐行对有效 B/M/K 范围取并集；N 切分的
+  broadcast 不重复计数，B/M/K 切分的 scatter 累加不重叠部分。
+- Output：`io_die`（默认）、`none` 或 `pu_vertical`。IO 路径逐行对有效
+  B/M/N 范围取并集；K 切分在行内 reduce，不增加输出量，其余切分进行 gather。
+  不同行的 K 部分和送到 IO die，PU 横向通信不承担跨行归约。
+- `pu_vertical`：同列中相同 B/M/N 输出分片的 K 部分和向最上方参与 PU 做
+  reduce，沿途合并部分和。无 K 纵向切分时无需通信。不同归约组交错映射时，
+  共享纵向链路的字节数相加，最终取最大发送链路负载；不包含横向通信或 all-reduce。
+
+IO 命令的 `io_bytes_per_row` 保留各行有效字节数，`size_bytes` 为最大行字节数，
+按单条横向链路带宽计时（各行并行）。非整除时各行可能不同。显式 `NoCOp`
+没有该字段时保留原来的 `size_bytes` 语义，trace 用 `volume_semantics` 区分。
+
+lower 生成 `.input -> .core -> .output`，`none` 或零通信量时省略对应通信节点。
+相邻算子和跨层依赖均从输出完成连接到下一个输入开始。`GemmCmd.weight_load_bytes`
+自动取本 PU 的 B×K×N×weight_dtype_bytes，`shared_weight=True` 时不乘 B。
+默认权重 1 byte、输入输出各 2 bytes，可分别配置。权重端口传输与计算重叠，
+耗时取较大值；已有 mapping 内存流量时沿用显式流量，避免重复计费。
+
+兼容边界：现有模型 `HardwareMapper` 仍提供预切分的单 PU shape 和独立通信
+节点，因此它创建的 BMM 显式选择 `none/none`、空链，并关闭自动权重加载。
+这些历史模型策略的通信公式尚未迁移为 PartitionChain；新完整逻辑 BMM 使用上面
+的接口直接交给 `TreeParser`。从旧策略迁移时应同时提供完整 shape、真实切分链，
+并删除对应的显式输入输出通信节点，避免双重切分或重复通信。
+
+### PartitionChain 驱动的 FlashAttention lowering
+
+`FlashAttentionOp` 接收完整逻辑 shape，只允许对 batch `B` 和 KV sequence
+length `S` 进行 PU 切分。`S = qk_N = sv_K` 必须相等；`M`、`qk_K` 和
+`sv_N` 保持完整。空链表示单 PU，microbatch 缩放先于 PU 切分。
+
+```python
+from srammachine.frontend.modules import FlashAttentionOp, PartitionChain
+
+op = FlashAttentionOp(
+    "attention", B=5, M=2, qk_K=7, qk_N=9, sv_K=9, sv_N=3,
+    partition_chain=PartitionChain((("B", "p", 2), ("S", "q", 4))),
+)
+assert op.communication_volumes()["input_bytes_per_row"] == (84, 56)
+assert op.communication_volumes()["output_bytes_per_row"] == (36, 24)
+```
+
+该例两行的 B 范围为 `[0, 3)` 和 `[3, 5)`；每行四列的 S 范围为
+`[0, 3)`、`[3, 6)`、`[6, 9)`、`[9, 9)`，最后一列为空。
+代表 PU 的两个 GEMM 使用 `B=3, M=2, qk_K=7, qk_N=sv_K=3, sv_N=3`。
+
+- 输入是 Q `[B, M, qk_K]`：同一行对有效 B 范围取并集，B 切分 scatter，
+  S 切分 broadcast。空 PU 不贡献输入量，不同行不去重。
+- 输出是 O `[B, M, sv_N]`：同一行的不同 B 分片 gather，相同 B 的 S 分片
+  先做 online-softmax 状态合并，再从该行向 IO die 发送一次。
+- 对每个有效 B 区间，若该行覆盖全部 S，则发送最终 O；若只覆盖部分 S，
+  则发送 `(m, l, u)`，由 IO die 继续合并并归一化。这里 m 是 score 最大值，
+  l 是 `sum(exp(score-m))`，u 是 `sum(exp(score-m)*V)`，最终 O 为 `u/l`。
+  不能对局部归一化 O 直接求和。合并状态 1/2 时取 `m=max(m1,m2)`，
+  再分别以 `exp(m1-m)`、`exp(m2-m)` 加权相加 l 和 u。
+
+Q 和最终 O 默认各 2 bytes；状态 u 向量及 m/l 标量默认各 4 bytes，分别通过
+`input_dtype_bytes`、`output_dtype_bytes`、`state_dtype_bytes` 配置。
+每行的完整 batch 数 c 和部分 batch 数 t 对应：
+
+```text
+input_bytes  = (c+t) * M * qk_K * input_dtype_bytes
+output_bytes = M * (c * sv_N * output_dtype_bytes
+                   + t * (sv_N+2) * state_dtype_bytes)
+```
+
+例如改为 `(("S", "p", 2), ("B", "q", 2))`，两行分别覆盖 S `[0,5)`、
+`[5,9)`，每行 gather 两个 batch 分片并发送 5 个 batch 的状态。
+输入为 `(140, 140)` bytes，输出为 `(200, 200)` bytes。
+同一行增加更多 S 分片不会重复发送同一 batch 的状态。
+
+默认生成 `.input -> .core -> .output`；`input_source` 和
+`output_destination` 均支持 `io_die`（默认）或 `none`，本次不提供纵向归约。
+`none` 仅省略通信，部分状态仍需由调用者负责合并。
+IO 命令保留每行字节数，以最大行字节数按单条横向链路带宽计时。
+输出 trace 记录完整/部分 batch 数和 Attention 状态合并语义。
+
+本模型计算归约后的 IO 载荷，不单独模拟行内合并和 IO die 合并的算术延迟。
+KV 加载仍由显式 OperatorMapping 提供，FlashAttention 计算计时保持现有模型。
+HardwareMapper 尚未迁移：其预切分 shape、独立通信节点不能直接与新默认自动
+通信叠加使用，后续重构需同时迁移完整 shape、切分链和显式通信。
+
+### PartitionChain 驱动的 FusedIndexerScore top-k 输出
+
+`FusedIndexerScoreOp` 保留 `B/M/K/N` 构造参数，其中 B 是 batch，M 是
+indexer head 数，K 是 head dimension，N 是 sequence length。
+切分链只接受 `B/S`，其中 `S` 映射到 N；不允许切分 M/K，也不用 N 作为
+切分链维度名。每个 PU 执行完整的 head reduction 后，独立对每个 batch
+取 top-k。`top_k` 默认 2048，可显式配置。
+
+```python
+from srammachine.frontend.modules import FusedIndexerScoreOp, PartitionChain
+
+op = FusedIndexerScoreOp(
+    "indexer", B=5, M=3, K=7, N=9, top_k=2,
+    partition_chain=PartitionChain((("B", "p", 2), ("S", "q", 4))),
+)
+assert op.communication_volumes()["input_bytes_per_row"] == (126, 84)
+assert op.communication_volumes()["topk_candidates_per_row"] == (6, 4)
+assert op.communication_volumes()["output_bytes_per_row"] == (36, 24)
+```
+
+输入按行对 Q 的 B 范围去重：S 切分 broadcast，B 切分 scatter，输入大小为
+有效 batch 数乘 `M*K*input_dtype_bytes`。每个 PU 输出的候选数量为
+`local_B * min(top_k, local_S)`，而不是对该 PU 的所有 batch 一起取 k 个。
+
+同一行相同 batch 的候选先合并并再次截断，再向 IO die 发送。对该行每个
+有效 B 区间，设 batch 数为 b、S 范围并集的元素数为 s，则：
+
+```text
+row_candidates += b * min(top_k, s)
+row_output_bytes = row_candidates * (output_dtype_bytes + index_dtype_bytes)
+```
+
+这里不能把每个 PU 的候选数量直接相加，也不能把不同 batch 一起截断到 k。
+当每个 PU 的局部 S 少于 k 时，合并后的数量可以增长，但每个 batch 最多 k 个。
+输出已完成 head reduction，因此不乘 M。空 tile 不贡献候选或输入通信。
+
+候选携带 score 和全局 sequence index，默认分别为 2 bytes 和 4 bytes；
+可通过 `output_dtype_bytes` 和 `index_dtype_bytes` 配置，索引宽度必须足够
+表示 `[0, N)`。即使某行覆盖完整 S，当前接口也统一发送 score/index 对。
+跨行序列分片由 IO die 继续做相同的 top-k merge，每个 batch 最终仍最多 k 个。
+逐级合并需使用一致的排序规则，例如 score 降序、全局 index 升序处理同分。
+
+默认生成 `.input -> .core -> .output`，支持 `io_die` 和 `none` 路由。
+沿用每行并行、以最大行字节数计时的 IO 模型，trace 记录 `top_k`、每行
+候选数及 `per_batch_topk_merge` 语义。`none` 将后续候选合并交由调用者负责。
+
+本次建模 top-k 的候选量和截断效应，不单独计入选择或合并的计算延迟。
+原有 GEMM/ReLU/head reduction 计时与加载策略保持不变。
+`main_gemm_flops_override` 仅保留用于空切分链；非空切分链必须由局部 shape
+推导 FLOPs，避免把旧的单 PU 覆盖值应用到新的完整逻辑 shape。
+HardwareMapper 的预切分及独立通信路径暂未迁移。

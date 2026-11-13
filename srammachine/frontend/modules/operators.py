@@ -5,7 +5,10 @@ no automatic conversion from PipeTree batch ranges is performed.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, Optional, Tuple, Union
+from enum import Enum
+
+from .partition import PartitionChain
 
 
 ParticipantId = Union[str, int]
@@ -32,35 +35,146 @@ class Operator:
         _name("op_id", self.op_id)
 
 
+class BMMInputSource(str, Enum):
+    """Location supplying the left operand."""
+
+    IO_DIE = "io_die"
+    NONE = "none"
+
+
+class BMMOutputDestination(str, Enum):
+    """Destination of the computed (possibly partial) output."""
+
+    IO_DIE = "io_die"
+    NONE = "none"
+    PU_VERTICAL = "pu_vertical"
+
+
 @dataclass
 class BMMOp(Operator):
-    """B matrix products of [M, K] by [K, N], allowing shared operands."""
+    """Logical B products of [M, K] by [K, N] before PU partitioning.
+
+    Empty partition_chain denotes a single PU. IO routes default to IO die;
+    NONE means communication is unnecessary or supplied by explicit nodes.
+    Element widths default to two-byte activations and one-byte weights.
+    """
+
+    PARTITION_AXES: ClassVar[Tuple[str, ...]] = ("B", "M", "K", "N")
 
     B: int
     M: int
     K: int
     N: int
+    partition_chain: PartitionChain = field(default_factory=PartitionChain, kw_only=True)
+    input_source: BMMInputSource = field(default=BMMInputSource.IO_DIE, kw_only=True)
+    output_destination: BMMOutputDestination = field(
+        default=BMMOutputDestination.IO_DIE, kw_only=True,
+    )
+    input_dtype_bytes: int = field(default=2, kw_only=True)
+    output_dtype_bytes: int = field(default=2, kw_only=True)
+    weight_dtype_bytes: int = field(default=1, kw_only=True)
+    shared_weight: bool = field(default=False, kw_only=True)
+    # Compatibility for callers whose mapping already supplies operand loads.
+    auto_weight_load: bool = field(default=True, kw_only=True)
 
     def __post_init__(self) -> None:
         super().__post_init__()
         for name in ("B", "M", "K", "N"):
             _integer(name, getattr(self, name), 1)
+        if not isinstance(self.partition_chain, PartitionChain):
+            raise TypeError("partition_chain must be a PartitionChain")
+        if any(step.dimension not in self.PARTITION_AXES
+               for step in self.partition_chain.steps):
+            raise ValueError(f"{type(self).__name__} partitions only support {self.PARTITION_AXES}")
+        self.input_source = BMMInputSource(self.input_source)
+        self.output_destination = BMMOutputDestination(self.output_destination)
+        for name in ("input_dtype_bytes", "output_dtype_bytes", "weight_dtype_bytes"):
+            _integer(name, getattr(self, name), 1)
+        for name in ("shared_weight", "auto_weight_load"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a bool")
+
+    def communication_volumes(self, shape=None) -> dict:
+        """Return exact per-row bytes and the critical vertical send volume."""
+        shape = shape or {axis: getattr(self, axis) for axis in ("B", "M", "K", "N")}
+        chain = self.partition_chain
+        return {
+            "input_bytes_per_row": tuple(
+                size * self.input_dtype_bytes
+                for size in chain.io_elements_per_row(shape, output=False)
+            ) if self.input_source == BMMInputSource.IO_DIE else (),
+            "output_bytes_per_row": tuple(
+                size * self.output_dtype_bytes
+                for size in chain.io_elements_per_row(shape, output=True)
+            ) if self.output_destination == BMMOutputDestination.IO_DIE else (),
+            "vertical_reduce_bytes": (
+                chain.vertical_reduce_elements(shape) * self.output_dtype_bytes
+                if self.output_destination == BMMOutputDestination.PU_VERTICAL else 0
+            ),
+        }
 
 
 @dataclass
 class FusedIndexerScoreOp(BMMOp):
-    """Full-K indexer QK with row-local ReLU and weighted head reduction."""
+    """Full-head QK/ReLU/head reduction and per-batch top-k selection.
+
+    Only B and S (= N) can be partitioned. Local and row-merged candidates
+    are capped at top_k independently for each batch, not across batches.
+    IO candidates carry scores and global sequence indices for further merging.
+    """
+
+    PARTITION_AXES: ClassVar[Tuple[str, ...]] = ("B", "S")
 
     main_gemm_flops_override: Optional[int] = None
+    top_k: int = field(default=2048, kw_only=True)
+    index_dtype_bytes: int = field(default=4, kw_only=True)
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        _integer("top_k", self.top_k, 1)
+        _integer("index_dtype_bytes", self.index_dtype_bytes, 1)
+        if self.N > 1 << (8 * self.index_dtype_bytes):
+            raise ValueError("index_dtype_bytes cannot represent global sequence indices")
+        if self.output_destination == BMMOutputDestination.PU_VERTICAL:
+            raise ValueError("FusedIndexerScore output_destination must be io_die or none")
         if self.main_gemm_flops_override is not None:
+            if self.partition_chain.steps:
+                raise ValueError("main_gemm_flops_override requires an unpartitioned indexer")
             _integer(
                 "main_gemm_flops_override",
                 self.main_gemm_flops_override,
                 1,
             )
+
+    def communication_volumes(self, shape: Optional[Dict[str, int]] = None) -> dict:
+        """Return Q input bytes and row-merged top-k (score, index) bytes.
+
+        shape uses the existing B/M/K/N fields after microbatch scaling.
+        M heads are reduced before top-k, so output has no M multiplier.
+        """
+        shape = shape if shape is not None else {
+            axis: getattr(self, axis) for axis in ("B", "M", "K", "N")
+        }
+        for axis in ("B", "M", "K", "N"):
+            _integer(axis, shape[axis], 1)
+        coverage = self.partition_chain.sequence_coverage_per_row(
+            {"B": shape["B"], "S": shape["N"]},
+        )
+        candidates = tuple(sum((stop - start) * min(self.top_k, count)
+                               for start, stop, count in row) for row in coverage)
+        return {
+            "input_bytes_per_row": tuple(
+                sum(stop - start for start, stop, _ in row)
+                * shape["M"] * shape["K"] * self.input_dtype_bytes
+                for row in coverage
+            ) if self.input_source == BMMInputSource.IO_DIE else (),
+            "output_bytes_per_row": tuple(
+                count * (self.output_dtype_bytes + self.index_dtype_bytes)
+                for count in candidates
+            ) if self.output_destination == BMMOutputDestination.IO_DIE else (),
+            "topk_candidates_per_row": candidates,
+            "vertical_reduce_bytes": 0,
+        }
 
     @property
     def qk_flops(self) -> int:
@@ -87,7 +201,13 @@ class FusedIndexerScoreOp(BMMOp):
 
 @dataclass
 class FlashAttentionOp(Operator):
-    """Fused QK/online-softmax/SV with two explicit GEMM shapes."""
+    """Full fused Attention, partitionable along batch B and KV sequence S.
+
+    Q is the NoC input; KV storage traffic remains explicitly mapped.
+    Row-local S shards merge before IO. Rows with incomplete S coverage send
+    unnormalized (m, l, u) states for final merging on the IO die, not sums
+    of normalized outputs. NONE leaves communication to the caller.
+    """
 
     B: int
     M: int
@@ -95,11 +215,57 @@ class FlashAttentionOp(Operator):
     qk_N: int
     sv_K: int
     sv_N: int
+    partition_chain: PartitionChain = field(default_factory=PartitionChain, kw_only=True)
+    input_source: str = field(default="io_die", kw_only=True)
+    output_destination: str = field(default="io_die", kw_only=True)
+    input_dtype_bytes: int = field(default=2, kw_only=True)
+    output_dtype_bytes: int = field(default=2, kw_only=True)
+    state_dtype_bytes: int = field(default=4, kw_only=True)
 
     def __post_init__(self) -> None:
         super().__post_init__()
         for name in ("B", "M", "qk_K", "qk_N", "sv_K", "sv_N"):
             _integer(name, getattr(self, name), 1)
+        if self.qk_N != self.sv_K:
+            raise ValueError("qk_N and sv_K must describe the same sequence length")
+        if not isinstance(self.partition_chain, PartitionChain):
+            raise TypeError("partition_chain must be a PartitionChain")
+        if any(step.dimension not in ("B", "S") for step in self.partition_chain.steps):
+            raise ValueError("FlashAttention partitions only support B/S")
+        if self.input_source not in ("io_die", "none"):
+            raise ValueError("FlashAttention input_source must be io_die or none")
+        if self.output_destination not in ("io_die", "none"):
+            raise ValueError("FlashAttention output_destination must be io_die or none")
+        for name in ("input_dtype_bytes", "output_dtype_bytes", "state_dtype_bytes"):
+            _integer(name, getattr(self, name), 1)
+
+    def communication_volumes(self, shape=None) -> dict:
+        """Return IO bytes after broadcast deduplication and row-local merging.
+
+        shape optionally supplies the microbatch-scaled B/S/M dimensions.
+        State vectors u and scalars m/l use state_dtype_bytes. Merge and
+        normalization arithmetic are not charged by this communication model.
+        """
+        shape = shape if shape is not None else dict(B=self.B, S=self.qk_N, M=self.M)
+        batches = self.partition_chain.attention_batches_per_row(
+            {axis: shape[axis] for axis in ("B", "S")},
+        )
+        m = shape["M"]
+        _integer("M", m, 1)
+        return {
+            "input_bytes_per_row": tuple(
+                (complete + partial) * m * self.qk_K * self.input_dtype_bytes
+                for complete, partial in batches
+            ) if self.input_source == "io_die" else (),
+            "output_bytes_per_row": tuple(
+                m * (complete * self.sv_N * self.output_dtype_bytes
+                     + partial * (self.sv_N + 2) * self.state_dtype_bytes)
+                for complete, partial in batches
+            ) if self.output_destination == "io_die" else (),
+            "complete_batches_per_row": tuple(complete for complete, _ in batches),
+            "partial_batches_per_row": tuple(partial for _, partial in batches),
+            "vertical_reduce_bytes": 0,
+        }
 
 
 @dataclass

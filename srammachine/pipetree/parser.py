@@ -16,7 +16,7 @@ from srammachine.commands import (
 )
 from srammachine.commands.base import integer
 from srammachine.frontend.modules import (
-    BMMOp, FabricOp, FlashAttentionOp, FusedIndexerScoreOp, NoCOp, Operator, VectorOp,
+    BMMOp, BMMOutputDestination, FabricOp, FlashAttentionOp, FusedIndexerScoreOp, NoCOp, Operator, VectorOp,
 )
 from srammachine.hardware import DEFAULT_HARDWARE_CONFIG, HardwareConfig
 from .mapping import OperatorMapping
@@ -56,11 +56,17 @@ class TreeParser:
         first = [item for item in instances if item.op_id == tree.operator_order[0]]
         last = [item for item in instances if item.op_id == tree.operator_order[-1]]
         boundary_edges = []
+        command_ids = {cmd.cmd_id for cmd in single.commands}
         i = j = 0
         while i < len(last) and j < len(first):
             source, target = last[i], first[j]
             if max(source.token_start, target.token_start) < min(source.token_stop, target.token_stop):
-                boundary_edges.append((f"i{source.index}.core", f"i{target.index}.core"))
+                source_id = f"i{source.index}.output"
+                target_id = f"i{target.index}.input"
+                boundary_edges.append((
+                    source_id if source_id in command_ids else f"i{source.index}.core",
+                    target_id if target_id in command_ids else f"i{target.index}.core",
+                ))
             if source.token_stop <= target.token_stop:
                 i += 1
             if target.token_stop <= source.token_stop:
@@ -137,6 +143,8 @@ class TreeParser:
             return cmd.cmd_id
 
         core_ids = {}
+        entry_ids = {}
+        exit_ids = {}
         dynamic_dram_reads = {}
         for instance in instances:
             op_id, batch = instance.op_id, instance.batch_size
@@ -210,6 +218,58 @@ class TreeParser:
                 memory_bytes=memory_bytes,
             )
             core_ids[instance.index] = emit(core, instance)
+            entry_ids[instance.index] = core.cmd_id
+            exit_ids[instance.index] = core.cmd_id
+            if isinstance(op, (BMMOp, FlashAttentionOp)):
+                # Scale the logical invocation before partitioning onto PUs.
+                logical = self._core_command(
+                    prefix + ".logical", op, mapping, instance, tree.batch_size,
+                    partition=False,
+                )
+                logical_shape = ({"B": logical.B, "S": logical.qk_N, "M": logical.M}
+                                 if isinstance(op, FlashAttentionOp) else {
+                    axis: getattr(logical, axis) for axis in ("B", "M", "K", "N")
+                })
+                volumes = op.communication_volumes(logical_shape)
+                chip_id = mapping.resource_id.split(".")[0]
+                for suffix, operation, rows, size, kind in (
+                    ("input", "FromIOdie", volumes["input_bytes_per_row"],
+                     max(volumes["input_bytes_per_row"], default=0), None),
+                    ("output", "PUVertical" if op.output_destination ==
+                     BMMOutputDestination.PU_VERTICAL else "ToIOdie",
+                     volumes["output_bytes_per_row"],
+                     volumes["vertical_reduce_bytes"] or
+                     max(volumes["output_bytes_per_row"], default=0),
+                     "reduce" if op.output_destination ==
+                     BMMOutputDestination.PU_VERTICAL else None),
+                ):
+                    if not size:
+                        continue
+                    direction = "vertical" if operation == "PUVertical" else "horizontal"
+                    comm_id = emit(NoCCmd(
+                        prefix + "." + suffix, op_id, f"{chip_id}.noc_{direction}",
+                        operation, size, kind, io_bytes_per_row=rows,
+                        attention_complete_batches_per_row=(
+                            volumes["complete_batches_per_row"]
+                            if isinstance(op, FlashAttentionOp) and suffix == "output" else ()
+                        ),
+                        attention_partial_batches_per_row=(
+                            volumes["partial_batches_per_row"]
+                            if isinstance(op, FlashAttentionOp) and suffix == "output" else ()
+                        ),
+                        top_k=(op.top_k if isinstance(op, FusedIndexerScoreOp)
+                               and suffix == "output" else None),
+                        topk_candidates_per_row=(
+                            volumes["topk_candidates_per_row"]
+                            if isinstance(op, FusedIndexerScoreOp) and suffix == "output" else ()
+                        ),
+                    ), instance)
+                    if suffix == "input":
+                        entry_ids[instance.index] = comm_id
+                        edges.append((comm_id, core.cmd_id))
+                    else:
+                        exit_ids[instance.index] = comm_id
+                        edges.append((core.cmd_id, comm_id))
             if mapping.dram_write_bytes_per_token:
                 write = emit(DramWriteCmd(
                     prefix + ".write", op_id, mapping.dram_resource_id,
@@ -232,7 +292,7 @@ class TreeParser:
             while i < len(sources) and j < len(targets):
                 source, target = sources[i], targets[j]
                 if max(source.token_start, target.token_start) < min(source.token_stop, target.token_stop):
-                    edges.append((core_ids[source.index], core_ids[target.index]))
+                    edges.append((exit_ids[source.index], entry_ids[target.index]))
                 if source.token_stop <= target.token_stop:
                     i += 1
                 if target.token_stop <= source.token_stop:
@@ -249,6 +309,19 @@ class TreeParser:
             instance = instances[instance_index]
             position = order_index[instance.op_id]
             broadcast_id = f"{instance.op_id}.input_broadcast"
+            if isinstance(checked[instance.op_id], FlashAttentionOp) or (
+                isinstance(checked[instance.op_id], BMMOp) and (
+                    entry_ids[instance_index] != core_ids[instance_index]
+                    or checked[instance.op_id].auto_weight_load
+                )
+            ):
+                if position:
+                    for source in by_op[tree.operator_order[position - 1]]:
+                        if max(source.token_start, instance.token_start) < min(
+                            source.token_stop, instance.token_stop,
+                        ):
+                            edges.append((exit_ids[source.index], dram_read))
+                continue
             if position == 0 or tree.operator_order[position - 1] != broadcast_id:
                 raise ValueError(
                     f"dynamic DRAM BMM is missing its input broadcast: "
@@ -287,7 +360,7 @@ class TreeParser:
         return dict(mapping.weight_shape, size_bytes=size_bytes)
 
     @staticmethod
-    def _core_command(cmd_id, op, mapping, instance, full_batch, *, memory_bytes=0):
+    def _core_command(cmd_id, op, mapping, instance, full_batch, *, memory_bytes=0, partition=True):
         def scale(value):
             unit_count = mapping.batch_scaling_unit_count
             if unit_count is not None:
@@ -337,17 +410,33 @@ class TreeParser:
         if isinstance(op, BMMOp):
             dimensions = {name: getattr(op, name) for name in ("B", "M", "K", "N")}
             dimensions[mapping.batch_axis] = scale(dimensions[mapping.batch_axis])
+            if partition:
+                if isinstance(op, FusedIndexerScoreOp):
+                    local = op.partition_chain.compute_shape(
+                        {"B": dimensions["B"], "S": dimensions["N"]},
+                    )
+                    dimensions.update(B=local["B"], N=local["S"])
+                else:
+                    dimensions = op.partition_chain.compute_shape(dimensions)
+            weight_load_bytes = 0
+            if partition and op.auto_weight_load and not memory_bytes:
+                weight_load_bytes = (
+                    (1 if op.shared_weight else dimensions["B"])
+                    * dimensions["K"] * dimensions["N"] * op.weight_dtype_bytes
+                )
             command_type = (
                 FusedIndexerScoreCmd
                 if isinstance(op, FusedIndexerScoreOp) else GemmCmd
             )
             if isinstance(op, FusedIndexerScoreOp):
+                dimensions["top_k"] = op.top_k
                 dimensions["main_gemm_flops_override"] = (
                     None
                     if op.main_gemm_flops_override is None
                     else scale(op.main_gemm_flops_override)
                 )
-            return command_type(**common, memory_bytes=memory_bytes, **dimensions)
+            return command_type(**common, memory_bytes=memory_bytes,
+                                weight_load_bytes=weight_load_bytes, **dimensions)
         if isinstance(op, FlashAttentionOp):
             dimensions = {
                 name: getattr(op, name)
@@ -356,6 +445,11 @@ class TreeParser:
             dimensions[mapping.batch_axis] = scale(
                 dimensions[mapping.batch_axis]
             )
+            if partition:
+                local = op.partition_chain.compute_shape(
+                    {"B": dimensions["B"], "S": dimensions["qk_N"]},
+                )
+                dimensions.update(B=local["B"], qk_N=local["S"], sv_K=local["S"])
             return FlashAttentionCmd(**common, memory_bytes=memory_bytes, **dimensions)
         if isinstance(op, VectorOp):
             return VectorCmd(**common, memory_bytes=memory_bytes, kind=op.kind, m=scale(op.m), n=op.n, params=op.params)

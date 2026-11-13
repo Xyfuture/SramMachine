@@ -202,7 +202,11 @@ class ProcessingUnitStage(HardwareResourceStage):
         if command.memory_bytes:
             dram_bandwidth *= self.hardware_config.chip.logic_die_count
         memory_ns = _rate_duration_ns(command.memory_bytes, dram_bandwidth)
-        return max(compute_ns, memory_ns)
+        weight_ns = _rate_duration_ns(
+            getattr(command, "weight_load_bytes", 0),
+            self.hardware_config.chip.logic_die.processing_unit.weight_bandwidth_bytes_per_second,
+        )
+        return max(compute_ns, memory_ns, weight_ns)
 
 
 class VectorUnitStage(HardwareResourceStage):
