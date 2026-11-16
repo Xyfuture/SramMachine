@@ -1,4 +1,4 @@
-"""Per-workload hypervolume-improvement annealing for SplitTrees."""
+"""Direct tree execution with PartitionChain optimization; SA is disabled."""
 
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -9,9 +9,9 @@ import random
 import re
 from typing import Optional, Tuple
 
-from srammachine.hardware import DEFAULT_HARDWARE_CONFIG, HardwareConfig
+from srammachine.hardware import HardwareConfig
 from srammachine.mapping import (
-    HardwareMapper, HardwareMappingRequest, HardwareMappingResult,
+    HardwareMappingRequest, HardwareMappingResult, HBFBandwidthTable, mapper_for_model,
 )
 from srammachine.pipetree import PipeTree, TreeParser
 from srammachine.simulator import SimulationResult, Simulator
@@ -21,6 +21,7 @@ from .config import (
 )
 from .hypervolume import HypervolumeBounds, dominates, hypervolume_improvement
 from .mutations import legal_tree_mutations, rebind_split_tree
+from .partition import optimize_partition_chains, partition_chains_to_dict
 from .serialization import split_tree_to_dict
 
 
@@ -282,14 +283,19 @@ class SplitTreeSearchResult:
 
 
 class SplitTreeOptimizer:
-    """Run one tree directly or search every batch/MTP workload fairly."""
+    """Run a fixed tree with optional PartitionChain optimization; reject SA."""
 
     def __init__(
-        self, hardware_config: HardwareConfig = DEFAULT_HARDWARE_CONFIG,
+        self, hardware_config: HardwareConfig | None = None,
+        *, hbf_bandwidth_csv: str | Path | None = None,
     ) -> None:
-        if not isinstance(hardware_config, HardwareConfig):
+        if hardware_config is not None and not isinstance(hardware_config, HardwareConfig):
             raise TypeError("hardware_config must be a HardwareConfig")
         self.hardware_config = hardware_config
+        self._configured_hardware = hardware_config
+        self.hbf_bandwidth_csv = (
+            Path(hbf_bandwidth_csv).resolve() if hbf_bandwidth_csv is not None else None
+        )
 
     def run(
         self,
@@ -302,12 +308,21 @@ class SplitTreeOptimizer:
             raise TypeError("request must be a HardwareMappingRequest")
         if not isinstance(config, SimulatedAnnealingConfig):
             raise TypeError("config must be a SimulatedAnnealingConfig")
+        if config.enabled:
+            raise NotImplementedError("SplitTree search is disabled; use PartitionChain optimization.")
         if initial_tree is not None and not isinstance(initial_tree, PipeTree):
             raise TypeError("initial_tree must be a PipeTree")
 
         self._request = request
         self._config = config
-        self._mapper = HardwareMapper(self.hardware_config)
+        self._hbf_bandwidth_table = (
+            HBFBandwidthTable.from_csv(self.hbf_bandwidth_csv)
+            if self.hbf_bandwidth_csv is not None else None
+        )
+        self._mapper = mapper_for_model(
+            request.model_name, self._configured_hardware,
+        )
+        self.hardware_config = self._mapper.hardware_config
         self._parser = TreeParser(self.hardware_config)
         self._simulator = Simulator(self.hardware_config)
         self._mapping_cache = {}
@@ -404,9 +419,12 @@ class SplitTreeOptimizer:
                 global_batch_size=batch,
                 mtp_enabled=mtp,
             )
-            self._mapping_cache[key] = self._mapper.map(HardwareMappingRequest(
-                self._request.model_name, inference,
-            ))
+            mapping = self._mapper.map(replace(
+                self._request, inference_config=inference,
+            ), hbf_bandwidth_table=self._hbf_bandwidth_table)
+            if self._config.optimize_partition_chains:
+                mapping = optimize_partition_chains(mapping, self.hardware_config)
+            self._mapping_cache[key] = mapping
         return self._mapping_cache[key]
 
     @staticmethod
@@ -473,6 +491,7 @@ class SplitTreeOptimizer:
     def _search_workload(
         self, batch: int, mtp: bool, initial_tree: Optional[PipeTree], seed: int,
     ) -> WorkloadSearchResult:
+        raise NotImplementedError("SplitTree search is disabled; use PartitionChain optimization.")
         mapping = self._mapping(batch, mtp)
         score_cache = {}
         full_cache = {}
@@ -749,6 +768,9 @@ class SplitTreeOptimizer:
             "format_version": 2,
             "reference_point": [0.0, 0.0],
             "model": self._request.model_name,
+            "xfold": self._request.xfold,
+            "hbf_bandwidth_csv": str(self.hbf_bandwidth_csv) if self.hbf_bandwidth_csv else None,
+            "partition_optimization_enabled": self._config.optimize_partition_chains,
             "hardware": {"chip_count": self.hardware_config.chip_count},
             "inference": {
                 "input_sequence_length": inference.input_sequence_length,
@@ -819,6 +841,7 @@ class SplitTreeOptimizer:
         return {
             "global_batch_size": item.global_batch_size,
             "mtp_enabled": item.mtp_enabled,
+            "partition_chains": partition_chains_to_dict(best.mapping_result),
             "random_seed": item.random_seed,
             "restart_count": item.restart_count,
             "restart_results": [
@@ -860,6 +883,7 @@ class SplitTreeOptimizer:
                 "global_batch_size": item.global_batch_size,
                 "mtp_enabled": item.mtp_enabled,
                 "split_tree": tree,
+                "partition_chains": partition_chains_to_dict(best.mapping_result),
             } for tree in best_split_trees],
         }
 
@@ -886,6 +910,7 @@ class SplitTreeOptimizer:
                 "global_batch_size": point.global_batch_size,
                 "mtp_enabled": point.mtp_enabled,
                 "split_tree": tree,
+                "partition_chains": partition_chains_to_dict(point.evaluations[0].mapping_result),
             } for tree in split_trees],
         }
 

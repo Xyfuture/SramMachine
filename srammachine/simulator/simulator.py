@@ -1,5 +1,6 @@
 """User-facing orchestration for command-graph simulation."""
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional, Union
 
@@ -31,6 +32,35 @@ class Simulator:
         if not isinstance(hardware_config, HardwareConfig):
             raise TypeError("hardware_config must be a HardwareConfig")
         self.hardware_config = hardware_config
+        self._additional_layer_cache = {}
+
+    def _execute(self, graph: CommandGraph, mapping: Optional[HardwareMappingResult]):
+        """Use each operator's hardware view while retaining shared resources."""
+        overrides = {} if mapping is None else {
+            op_id: policy.hardware_config
+            for op_id, policy in mapping.operator_mappings.items()
+            if policy.hardware_config is not None
+        }
+        return GraphExecutor.simulate(graph, self.hardware_config, operator_hardware=overrides)
+
+    def _latency_components(self, mapping: HardwareMappingResult, layer_time_ns: float) -> tuple:
+        """Weight representative layers; cache fixed auxiliary layer baselines."""
+        if mapping.represented_layer_count is None:
+            return ()
+        components = [(mapping.layer_type, mapping.represented_layer_count, layer_time_ns)]
+        for additional in mapping.additional_layer_mappings:
+            key = id(additional)
+            cached = self._additional_layer_cache.get(key)
+            if cached is None:
+                from srammachine.pipetree import TreeParser
+                graph = TreeParser(self.hardware_config).parse(
+                    additional.root_node, additional.operators, additional.operator_mappings,
+                )
+                result = self.run(graph, mapping_result=additional)
+                cached = (additional, result.model_latency_components)
+                self._additional_layer_cache[key] = cached
+            components.extend(cached[1])
+        return tuple(components)
 
     def run(
         self, graph: CommandGraph, *,
@@ -53,7 +83,7 @@ class Simulator:
                 raise ValueError(
                     "mapping_result and simulator hardware chip counts differ"
                 )
-        execution_result = GraphExecutor.simulate(graph, self.hardware_config)
+        execution_result = self._execute(graph, mapping_result)
         model_layer_count = (
             None if mapping_result is None
             else mapping_result.model_config.num_hidden_layers
@@ -62,7 +92,7 @@ class Simulator:
             None if mapping_result is None
             else mapping_result.request.inference_config
         )
-        return build_simulation_result(
+        result = build_simulation_result(
             graph, execution_result, self.hardware_config,
             model_layer_count=model_layer_count,
             global_batch_size=(
@@ -72,6 +102,12 @@ class Simulator:
                 1 if inference is None else inference.accepted_tokens_per_step
             ),
         )
+        if mapping_result is not None:
+            components = self._latency_components(mapping_result, result.pipeline_layer_time_ns)
+            if components:
+                result = replace(result, model_latency_components=components,
+                                 model_layer_count=sum(count for _, count, _ in components))
+        return result
 
     def run_latency(
         self, graph: CommandGraph, *, mapping_result: HardwareMappingResult,
@@ -91,7 +127,7 @@ class Simulator:
             raise ValueError(
                 "mapping_result and simulator hardware chip counts differ"
             )
-        execution = GraphExecutor.simulate(graph, self.hardware_config)
+        execution = self._execute(graph, mapping_result)
         graph_ids = tuple(command.cmd_id for command in graph.commands)
         if set(graph_ids) != set(execution.executions):
             raise ValueError("execution result does not match the command graph")
@@ -140,6 +176,9 @@ class Simulator:
                     pipeline_layer_time_ns = 0
                 else:
                     pipeline_layer_time_ns = active[1] - active[0]
+        components = self._latency_components(mapping_result, pipeline_layer_time_ns)
+        if components:
+            return sum(count * latency for _, count, latency in components)
         return (
             pipeline_layer_time_ns
             * mapping_result.model_config.num_hidden_layers
@@ -166,6 +205,11 @@ class Simulator:
             f"({layer_time_ns / 1_000_000:.6f} ms)"
         )
         if result.latency_ns is not None:
+            if result.model_latency_components:
+                print("Layer estimate: " + " + ".join(
+                    f"{count} x {name} ({latency:.3f} ns/layer)"
+                    for name, count, latency in result.model_latency_components
+                ))
             print(
                 f"Inference latency: {result.latency_ns:.3f} ns "
                 f"({result.latency_ns / 1_000_000:.6f} ms)"
@@ -178,6 +222,7 @@ class Simulator:
             result,
             trace_label=trace_label,
             output_dir=output_dir,
+            mapping_result=mapping_result,
         )
         print(f"Perfetto trace: {trace_path}")
         return SimulationArtifacts(result, trace_path)

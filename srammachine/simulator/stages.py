@@ -10,7 +10,7 @@ from srammachine.commands import (
     Command, DramCmd, FlashAttentionCmd, FusedIndexerScoreCmd, GemmCmd,
     InterChipCmd, NoCCmd,
     VectorCmd,
-    SramReadCmd, WeightLoadCmd,
+    PUMemoryReadCmd,
 )
 from srammachine.hardware import HardwareConfig
 from srammachine.systolic_cost import systolic_gemm_duration_ns
@@ -155,26 +155,16 @@ class DramResourceStage(HardwareResourceStage):
         return _rate_duration_ns(command.size_bytes, bandwidth)
 
 
-class SramResourceStage(HardwareResourceStage):
-    accepted_command_types = (WeightLoadCmd, SramReadCmd)
+class PUMemoryResourceStage(HardwareResourceStage):
+    """Independent DRAM or Flash port belonging to one mapped PU."""
 
-    def latency_ns(self, command: WeightLoadCmd | SramReadCmd) -> int:
+    accepted_command_types = (PUMemoryReadCmd,)
+
+    def latency_ns(self, command: PUMemoryReadCmd) -> int:
         self._validate_command(command)
-        logic_die = self.hardware_config.chip.logic_die
-        bandwidth = min(
-            logic_die.memory.sram_bandwidth_bytes_per_second,
-            logic_die.processing_unit.weight_bandwidth_bytes_per_second,
-        )
-        if self.resource_id == "chip0.sram":
-            if isinstance(command, SramReadCmd) and command.data_kind == "flash_kv":
-                # Cache traffic retains the prior per-PU SRAM port limit.
-                # Four representative dies stream in parallel on the chip.
-                bandwidth *= self.hardware_config.chip.logic_die_count
-            else:
-                bandwidth = (
-                    self.hardware_config.chip.logic_die_count
-                    * logic_die.memory.sram_bandwidth_bytes_per_second
-                )
+        pu = self.hardware_config.chip.logic_die.processing_unit
+        bandwidth = (pu.dram_bandwidth_bytes_per_second if command.port == "dram"
+                     else command.bandwidth_bytes_per_second)
         return _rate_duration_ns(command.size_bytes, bandwidth)
 
 
@@ -202,11 +192,7 @@ class ProcessingUnitStage(HardwareResourceStage):
         if command.memory_bytes:
             dram_bandwidth *= self.hardware_config.chip.logic_die_count
         memory_ns = _rate_duration_ns(command.memory_bytes, dram_bandwidth)
-        weight_ns = _rate_duration_ns(
-            getattr(command, "weight_load_bytes", 0),
-            self.hardware_config.chip.logic_die.processing_unit.weight_bandwidth_bytes_per_second,
-        )
-        return max(compute_ns, memory_ns, weight_ns)
+        return max(compute_ns, memory_ns, command.memory_duration_ns)
 
 
 class VectorUnitStage(HardwareResourceStage):
@@ -256,10 +242,10 @@ class InterChipFabricStage(HardwareResourceStage):
 
 
 def stage_class_for_command(command: Command):
+    if isinstance(command, PUMemoryReadCmd):
+        return PUMemoryResourceStage
     if isinstance(command, DramCmd):
         return DramResourceStage
-    if isinstance(command, (WeightLoadCmd, SramReadCmd)):
-        return SramResourceStage
     if isinstance(command, (GemmCmd, FlashAttentionCmd)):
         return ProcessingUnitStage
     if isinstance(command, VectorCmd):

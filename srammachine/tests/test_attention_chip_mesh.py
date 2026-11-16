@@ -1,10 +1,12 @@
 """Attention chip-mesh invariants and cache-accounting regressions."""
 
+# These regression fixtures intentionally cover the retained legacy mapper.
+# DSA list-based mapping is covered by test_dsa_mapper.py.
 import unittest
 
 from srammachine.inference import InferenceConfig, MoEParallelStrategy
-from srammachine.hardware import DEFAULT_HARDWARE_CONFIG
-from srammachine.mapping import HardwareMapper, HardwareMappingRequest
+from srammachine.tests.hardware_fixtures import LEGACY_HARDWARE_CONFIG
+from srammachine.mapping import LegacyHardwareMapper as HardwareMapper, HardwareMappingRequest
 from srammachine.pipetree import GroupNode, PipeTree, TreeParser
 from srammachine.simulator import Simulator
 
@@ -17,7 +19,7 @@ PROJECTIONS = (
 
 
 def mapped(name, batch, mode, mtp=False):
-    return HardwareMapper().map(HardwareMappingRequest(
+    return HardwareMapper(LEGACY_HARDWARE_CONFIG).map(HardwareMappingRequest(
         name, InferenceConfig(batch, 32000, 600, mode, mtp_enabled=mtp),
     ))
 
@@ -32,7 +34,7 @@ class AttentionChipMeshTests(unittest.TestCase):
                     for current in (tp, ep):
                         with self.subTest(name=name, batch=batch, mtp=mtp,
                                           mode=current.request.inference_config.moe_parallel_strategy):
-                            TreeParser().parse(
+                            TreeParser(LEGACY_HARDWARE_CONFIG).parse(
                                 current.root_node, current.operators,
                                 current.operator_mappings, layer_count=1,
                             )
@@ -47,14 +49,9 @@ class AttentionChipMeshTests(unittest.TestCase):
                                                  hw.chip_dimensions["N"])
                                 op_map = current.operator_mappings[op_id]
                                 self.assertEqual(op_map.dram_resource_id, "chip0.dram")
-                                self.assertEqual(op_map.sram_resource_id, "chip0.sram")
                                 self.assertEqual(
-                                    op_map.dram_read_once_bytes,
-                                    hw.weight_bytes,
-                                )
-                                self.assertLessEqual(
-                                    hw.weight_bytes,
-                                    4 * DEFAULT_HARDWARE_CONFIG.chip.logic_die.memory.sram_capacity_bytes,
+                                    op_map.weight_read_fixed_bytes,
+                                    hw.weight_bytes // 64,
                                 )
                                 for suffix in ("input_broadcast", "output_reduce"):
                                     comm = current.operators[op_id + "." + suffix]
@@ -90,10 +87,10 @@ class AttentionChipMeshTests(unittest.TestCase):
         tree = PipeTree(current.root_node.batch_size,
                         current.root_node.operator_order,
                         GroupNode((GroupNode(tuple(children)), moe)))
-        graph = TreeParser().parse(
+        graph = TreeParser(LEGACY_HARDWARE_CONFIG).parse(
             tree, current.operators, current.operator_mappings, layer_count=1,
         )
-        result = Simulator().run(graph)
+        result = Simulator(LEGACY_HARDWARE_CONFIG).run(graph)
         input_commands = [c for c in result.command_results
                           if c.op_id == "attn.latent_down.input_broadcast"]
         output_commands = [c for c in result.command_results

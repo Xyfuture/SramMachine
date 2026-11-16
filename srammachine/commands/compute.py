@@ -13,29 +13,36 @@ class GemmCmd(Command):
     # DRAM traffic overlapped with this PU operation.  The PU occupies the
     # longer of compute time and this transfer time.
     memory_bytes: int = field(default=0, kw_only=True)
-    weight_load_bytes: int = field(default=0, kw_only=True)
+    # Ideal streaming lower bound. Separate PU memory commands account for
+    # port contention, and the output waits for their actual completion.
+    memory_duration_ns: int = field(default=0, kw_only=True)
 
     def __post_init__(self) -> None:
         super().__post_init__()
         for name in ("B", "M", "K", "N"):
             integer(name, getattr(self, name), 1)
         integer("memory_bytes", self.memory_bytes)
-        integer("weight_load_bytes", self.weight_load_bytes)
+        integer("memory_duration_ns", self.memory_duration_ns)
 
 
 @dataclass(frozen=True)
 class FusedIndexerScoreCmd(GemmCmd):
-    """Full-K indexer QK, head aggregation and per-batch local top-k.
+    """Full-K indexer QK, head aggregation and per-query local top-k.
 
+    M packs queries_per_request groups, reduced and selected independently.
     Top-k selection arithmetic is not included in the current FLOP model.
     """
 
     main_gemm_flops_override: int | None = None
     top_k: int = field(default=2048, kw_only=True)
+    queries_per_request: int = field(default=1, kw_only=True)
 
     def __post_init__(self) -> None:
         super().__post_init__()
         integer("top_k", self.top_k, 1)
+        integer("queries_per_request", self.queries_per_request, 1)
+        if self.M % self.queries_per_request:
+            raise ValueError("M must be divisible by queries_per_request")
         if self.main_gemm_flops_override is not None:
             integer(
                 "main_gemm_flops_override",
@@ -46,7 +53,7 @@ class FusedIndexerScoreCmd(GemmCmd):
     @property
     def output_candidates(self) -> int:
         """Number of local candidates after head reduction and truncation."""
-        return self.B * min(self.top_k, self.N)
+        return self.B * self.queries_per_request * min(self.top_k, self.N)
 
     @property
     def qk_flops(self) -> int:
@@ -64,7 +71,7 @@ class FusedIndexerScoreCmd(GemmCmd):
 
     @property
     def head_reduce_flops(self) -> int:
-        return self.B * self.N * (2 * self.M - 1)
+        return self.B * self.N * (2 * self.M - self.queries_per_request)
 
     @property
     def total_flops(self) -> int:
@@ -86,12 +93,14 @@ class FlashAttentionCmd(Command):
     sv_K: int
     sv_N: int
     memory_bytes: int = field(default=0, kw_only=True)
+    memory_duration_ns: int = field(default=0, kw_only=True)
 
     def __post_init__(self) -> None:
         super().__post_init__()
         for name in ("B", "M", "qk_K", "qk_N", "sv_K", "sv_N"):
             integer(name, getattr(self, name), 1)
         integer("memory_bytes", self.memory_bytes)
+        integer("memory_duration_ns", self.memory_duration_ns)
 
     @property
     def qk_flops(self) -> int:

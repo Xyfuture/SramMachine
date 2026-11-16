@@ -7,6 +7,8 @@ PU_COMMAND_TYPES = frozenset((
     "GemmCmd",
     "FlashAttentionCmd",
     "FusedIndexerScoreCmd",
+    "FlashMSACmd",
+    "MiniMaxFusedIndexerScoreCmd",
 ))
 
 

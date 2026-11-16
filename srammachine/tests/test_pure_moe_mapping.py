@@ -1,11 +1,13 @@
 """Focused invariants for the 16-chip TP/EP MoE 8×8 mesh layouts."""
 
+# These regression fixtures intentionally cover the retained legacy mapper.
+# DSA list-based mapping is covered by test_dsa_mapper.py.
 import unittest
 
-from srammachine.hardware import DEFAULT_HARDWARE_CONFIG
+from srammachine.tests.hardware_fixtures import LEGACY_HARDWARE_CONFIG
 from srammachine.inference import InferenceConfig, MoEParallelStrategy
 from srammachine.mapping import (
-    HardwareMapper, HardwareMappingRequest, load_model_config,
+    LegacyHardwareMapper as HardwareMapper, HardwareMappingRequest, load_model_config,
 )
 from srammachine.pipetree import TreeParser
 from srammachine.simulator import Simulator
@@ -20,17 +22,17 @@ class PureMoEMappingTests(unittest.TestCase):
             for batch in (32, 8192):
                 for mtp in (False, True):
                     with self.subTest(name=name, batch=batch, mtp=mtp):
-                        mapped = HardwareMapper().map(HardwareMappingRequest(
+                        mapped = HardwareMapper(LEGACY_HARDWARE_CONFIG).map(HardwareMappingRequest(
                             name, InferenceConfig(
                                 batch, 32000, 600, MoEParallelStrategy.EP,
                                 mtp_enabled=mtp,
                             ),
                         ))
-                        graph = TreeParser().parse(
+                        graph = TreeParser(LEGACY_HARDWARE_CONFIG).parse(
                             mapped.root_node, mapped.operators,
                             mapped.operator_mappings, layer_count=1,
                         )
-                        result = Simulator().run(graph)
+                        result = Simulator(LEGACY_HARDWARE_CONFIG).run(graph)
                         self.assertTrue(result.command_results)
                         self.assertFalse(any(
                             command.op_id.startswith("moe.ep")
@@ -39,7 +41,7 @@ class PureMoEMappingTests(unittest.TestCase):
                         ))
 
     def test_all_models_modes_batches_and_mtp(self):
-        mapper = HardwareMapper()
+        mapper = HardwareMapper(LEGACY_HARDWARE_CONFIG)
         for name in MODELS:
             model = load_model_config(name)
             for strategy in (MoEParallelStrategy.TP, MoEParallelStrategy.EP):
@@ -103,15 +105,13 @@ class PureMoEMappingTests(unittest.TestCase):
                                 {i for i, load in enumerate(mapped.expert_token_loads)
                                  if load > 0 and i in ownership[0]},
                             )
-                            weight_bytes = sum(
-                                mapped.hardware_mappings[op].weight_bytes
-                                for op in up_ids + down_ids
-                            )
-                            self.assertLessEqual(
-                                weight_bytes,
-                                DEFAULT_HARDWARE_CONFIG.chip.logic_die.memory.sram_capacity_bytes
-                                * 4,
-                            )
+                            for op_id in up_ids + down_ids:
+                                hw = mapped.hardware_mappings[op_id]
+                                self.assertEqual(
+                                    mapped.operator_mappings[op_id].weight_read_fixed_bytes,
+                                    hw.pu_dimensions["B"] * hw.pu_dimensions["K"]
+                                    * hw.pu_dimensions["N"],
+                                )
                             if strategy is MoEParallelStrategy.TP:
                                 self.assertIn("moe.tp_input_alltoall", order)
                                 self.assertEqual(

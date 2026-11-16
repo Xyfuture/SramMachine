@@ -2,14 +2,15 @@
 
 import heapq
 from types import MappingProxyType
+from typing import Mapping
 
 from Desim import FIFO, SimModule, SimSession
 from greenlet import GreenletExit
 
-from srammachine.commands import CommandGraph, InterChipCmd
+from srammachine.commands import CommandGraph, InterChipCmd, PUMemoryReadCmd
 from srammachine.hardware import DEFAULT_HARDWARE_CONFIG, HardwareConfig
 from .records import CommandExecution, CommandState, ExecutionResult
-from .stages import stage_class_for_command
+from .stages import PUMemoryResourceStage, stage_class_for_command
 
 
 class GraphExecutor(SimModule):
@@ -18,6 +19,7 @@ class GraphExecutor(SimModule):
     def __init__(
         self, graph: CommandGraph,
         hardware_config: HardwareConfig = DEFAULT_HARDWARE_CONFIG,
+        *, operator_hardware: Mapping[str, HardwareConfig] | None = None,
     ) -> None:
         if SimSession.scheduler is None:
             raise RuntimeError("initialize SimSession before creating GraphExecutor")
@@ -30,6 +32,12 @@ class GraphExecutor(SimModule):
         super().__init__()
         self.graph = graph
         self.hardware_config = hardware_config
+        self.operator_hardware = dict(operator_hardware or {})
+        for value in self.operator_hardware.values():
+            if not isinstance(value, HardwareConfig):
+                raise TypeError("operator_hardware values must be HardwareConfig")
+            if value.chip_count != hardware_config.chip_count:
+                raise ValueError("operator hardware must preserve chip count")
         self._rank = {
             command.cmd_id: index for index, command in enumerate(graph.commands)
         }
@@ -77,6 +85,8 @@ class GraphExecutor(SimModule):
     def _build_stages(self):
         stage_types = {}
         stage_resource_ids = {}
+        stage_hardware = {}
+        stage_classes = {}
         for command in self.graph.commands:
             stage_key = self._stage_keys[command.cmd_id]
             stage_type = stage_class_for_command(command)
@@ -88,19 +98,30 @@ class GraphExecutor(SimModule):
                         f"{existing.__name__} and {stage_type.__name__}"
                     )
             stage_resource_ids[stage_key] = command.resource_id
+            stage_classes[stage_key] = stage_type
+            stage_hardware[stage_key] = self.operator_hardware.get(command.op_id, self.hardware_config)
+            if isinstance(command, PUMemoryReadCmd):
+                pu_id = command.resource_id.rsplit(".", 1)[0]
+                for port in ("dram", "flash"):
+                    port_id = f"{pu_id}.{port}"
+                    stage_types[port_id] = PUMemoryResourceStage
+                    stage_resource_ids[port_id] = port_id
+                    stage_classes[port_id] = PUMemoryResourceStage
+                    stage_hardware.setdefault(port_id, self.hardware_config)
         return {
-            stage_key: stage_types[stage_key](
+            stage_key: stage_classes[stage_key](
                 resource_id,
-                self.hardware_config,
+                stage_hardware[stage_key],
                 self._completion_fifo,
             )
             for stage_key, resource_id in stage_resource_ids.items()
         }
 
-    @staticmethod
-    def _stage_key(command) -> str:
+    def _stage_key(self, command) -> str:
         if isinstance(command, InterChipCmd):
             return f"{command.resource_id}::{command.cmd_id}"
+        if command.op_id in self.operator_hardware:
+            return f"{command.resource_id}::op::{command.op_id}"
         return command.resource_id
 
     def _resource_keys(self, command) -> tuple[str, ...]:
@@ -209,13 +230,14 @@ class GraphExecutor(SimModule):
     def simulate(
         cls, graph: CommandGraph,
         hardware_config: HardwareConfig = DEFAULT_HARDWARE_CONFIG,
+        *, operator_hardware: Mapping[str, HardwareConfig] | None = None,
     ) -> ExecutionResult:
         """Run one graph in a fresh Desim global session."""
         SimSession.reset()
         SimSession.init()
         completed = False
         try:
-            executor = cls(graph, hardware_config)
+            executor = cls(graph, hardware_config, operator_hardware=operator_hardware)
             SimSession.scheduler.run()
             if not executor.is_complete:
                 incomplete = [

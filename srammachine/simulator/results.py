@@ -15,10 +15,9 @@ from srammachine.commands import (
     GemmCmd,
     InterChipCmd,
     NoCCmd,
-    SramReadCmd,
     VectorCmd,
-    WeightLoadCmd,
-    WeightPrefetchCmd,
+    PUMemoryReadCmd,
+    FlashMSACmd, MiniMaxFusedIndexerScoreCmd,
 )
 from srammachine.commands.base import integer, nonempty
 from srammachine.hardware import DEFAULT_HARDWARE_CONFIG, HardwareConfig
@@ -28,7 +27,6 @@ from .records import CommandState, ExecutionResult
 
 class CommandCategory(Enum):
     COMPUTE = "compute"
-    PREFETCH = "prefetch"
     MEMORY = "memory"
     COMMUNICATION = "communication"
 
@@ -59,11 +57,9 @@ def _freeze_parameters(parameters: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _command_category(command: Command) -> CommandCategory:
-    if isinstance(command, WeightPrefetchCmd):
-        return CommandCategory.PREFETCH
     if isinstance(command, (GemmCmd, FlashAttentionCmd, VectorCmd)):
         return CommandCategory.COMPUTE
-    if isinstance(command, (DramCmd, WeightLoadCmd, SramReadCmd)):
+    if isinstance(command, (DramCmd, PUMemoryReadCmd)):
         return CommandCategory.MEMORY
     if isinstance(command, (NoCCmd, InterChipCmd)):
         return CommandCategory.COMMUNICATION
@@ -73,27 +69,15 @@ def _command_category(command: Command) -> CommandCategory:
 def _command_parameters(
     command: Command, hardware_config: HardwareConfig,
 ) -> Mapping[str, Any]:
-    if isinstance(command, WeightPrefetchCmd):
+    if isinstance(command, PUMemoryReadCmd):
         parameters = {
             "size_bytes": command.size_bytes,
-            "weight_size_bytes": command.size_bytes,
-            "weight_shape": command.weight_shape,
-            "sram_resource_id": command.sram_resource_id,
+            "port": command.port,
+            "bandwidth_bytes_per_second": command.bandwidth_bytes_per_second,
+            "data_kind": command.data_kind,
         }
     elif isinstance(command, DramCmd):
         parameters = {"size_bytes": command.size_bytes}
-    elif isinstance(command, WeightLoadCmd):
-        parameters = {
-            "size_bytes": command.size_bytes,
-            "weight_size_bytes": command.size_bytes,
-            "weight_shape": command.weight_shape,
-        }
-    elif isinstance(command, SramReadCmd):
-        parameters = {
-            "size_bytes": command.size_bytes,
-            "data_kind": command.data_kind,
-            "operand_role": "right_operand",
-        }
     elif isinstance(command, FusedIndexerScoreCmd):
         parameters = {
             "B": command.B,
@@ -111,8 +95,25 @@ def _command_parameters(
             "head_reduce_flops": command.head_reduce_flops,
             "total_flops": command.total_flops,
             "fused_indexer_score": True,
+            "queries_per_request": command.queries_per_request,
+            "heads_per_query": command.M // command.queries_per_request,
             "top_k": command.top_k,
             "output_candidates": command.output_candidates,
+        }
+    elif isinstance(command, MiniMaxFusedIndexerScoreCmd):
+        parameters = {
+            **{axis: getattr(command, axis) for axis in ("B", "M", "K", "N")},
+            "qk_flops": command.qk_flops,
+            "total_flops": command.total_flops,
+            "block_size": command.block_size,
+            "top_k": command.top_k,
+            "queries_per_request": command.queries_per_request,
+            "index_heads": command.M // command.queries_per_request,
+            "output_candidates": command.output_candidates,
+            "selection_unit": "block",
+            "score_reduction": "block_max_per_head",
+            "local_block_in_top_k": True,
+            "vector_flops": 0,
         }
     elif isinstance(command, GemmCmd):
         parameters = {
@@ -138,6 +139,9 @@ def _command_parameters(
             "total_flops": command.total_flops,
             "softmax_flops": 0,
         }
+        if isinstance(command, FlashMSACmd):
+            parameters.update(H=command.H, cache_layout="separate_k_v_per_group",
+                              attention_count_unit="request_kv_head")
     elif isinstance(command, VectorCmd):
         parameters = {
             "kind": command.kind,
@@ -195,6 +199,7 @@ def _command_parameters(
             "attention_complete_batches_per_row": command.attention_complete_batches_per_row,
             "attention_partial_batches_per_row": command.attention_partial_batches_per_row,
             "attention_partial_payload": "m_l_unnormalized_u",
+            "attention_count_unit": command.attention_count_unit,
         })
     if isinstance(command, NoCCmd) and command.top_k is not None:
         parameters.update({
@@ -203,8 +208,11 @@ def _command_parameters(
             "output_reduction": "per_batch_topk_merge",
             "output_payload": "score_and_global_sequence_index",
         })
+        if command.topk_selection_unit == "block":
+            parameters.update(selection_unit="block", output_reduction="per_query_group_block_max_topk_merge",
+                              output_payload="score_and_global_block_index")
     if (
-        isinstance(command, (DramCmd, WeightLoadCmd, SramReadCmd))
+        isinstance(command, DramCmd)
         and command.logical_size_bytes is not None
     ):
         parameters.update({
@@ -212,8 +220,8 @@ def _command_parameters(
             "effective_size_bytes": command.size_bytes,
             "shared_die_factor": command.shared_die_factor,
         })
-    if isinstance(command, GemmCmd):
-        parameters["weight_load_bytes"] = command.weight_load_bytes
+    if isinstance(command, (GemmCmd, FlashAttentionCmd)):
+        parameters["memory_duration_ns"] = command.memory_duration_ns
     return _freeze_parameters(parameters)
 
 
@@ -338,6 +346,7 @@ class SimulationResult:
     model_layer_count: Optional[int] = None
     global_batch_size: Optional[int] = None
     accepted_tokens_per_step: int = 1
+    model_latency_components: Tuple[Tuple[str, int, float], ...] = ()
     _command_lookup: Mapping[str, CommandResult] = field(
         init=False, repr=False, compare=False,
     )
@@ -361,6 +370,13 @@ class SimulationResult:
             integer("model_layer_count", self.model_layer_count, 1)
             integer("global_batch_size", self.global_batch_size, 1)
         integer("accepted_tokens_per_step", self.accepted_tokens_per_step, 1)
+        components = tuple(self.model_latency_components)
+        for name, count, latency in components:
+            nonempty("layer type", name)
+            integer("layer count", count, 1)
+            if not isinstance(latency, (int, float)) or latency < 0:
+                raise ValueError("layer latency must be nonnegative")
+        object.__setattr__(self, "model_latency_components", components)
 
         lookup = {item.cmd_id: item for item in command_results}
         if len(lookup) != len(command_results):
@@ -418,6 +434,8 @@ class SimulationResult:
         """Estimated full-model latency from steady-state representative layers."""
         if self.model_layer_count is None:
             return None
+        if self.model_latency_components:
+            return sum(count * latency for _, count, latency in self.model_latency_components)
         return self.pipeline_layer_time_ns * self.model_layer_count
 
     @property

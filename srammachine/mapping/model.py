@@ -12,6 +12,7 @@ _SUPPORTED_MODELS = {
     "deepseek-v3.2": "deepseek-v3.2.json",
     "kimi-k2.5": "kimi-k2.5.json",
     "glm-5.1": "glm-5.1.json",
+    "minimax-m3": "minimax-m3.json",
 }
 
 
@@ -318,6 +319,9 @@ def load_model_config(model_name: str) -> ModelConfig:
         raise ValueError(f"unsupported model: {model_name}") from error
     with (_MODEL_CARD_DIR / filename).open(encoding="utf-8") as stream:
         data = json.load(stream)
+    if model_name == "minimax-m3":
+        from .minimax_config import MiniMaxM3Config
+        return MiniMaxM3Config.from_dict(data)
     if model_name == "deepseek-v3":
         return DeepSeekV3Config.from_dict(data)
     if model_name == "deepseek-v3.2":

@@ -12,6 +12,7 @@ from .model import (
 )
 from .mapper import (
     HardwareMapper,
+    LegacyHardwareMapper,
     HardwareMappingRequest,
     HardwareMappingResult,
     OperatorHardwareMapping,
@@ -29,4 +30,21 @@ __all__ = [
     "HardwareMappingResult",
     "OperatorHardwareMapping",
     "HardwareMapper",
+    "LegacyHardwareMapper",
 ]
+
+from .model_mappers import (
+    DeepSeekV3Mapper, DeepSeekV32Mapper, KimiK25Mapper, GLM51Mapper,
+    mapper_for_model,
+)
+
+__all__ += ["DeepSeekV3Mapper", "DeepSeekV32Mapper", "KimiK25Mapper", "GLM51Mapper", "mapper_for_model"]
+
+from .minimax import MiniMaxM3Mapper
+from .minimax_config import MiniMaxM3Config
+
+__all__ += ["MiniMaxM3Mapper", "MiniMaxM3Config"]
+
+from .hbf_bandwidth import DEFAULT_HBF_BANDWIDTH_CSV, HBFBandwidthTable
+
+__all__ += ["DEFAULT_HBF_BANDWIDTH_CSV", "HBFBandwidthTable"]

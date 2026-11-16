@@ -7,9 +7,11 @@ Per-token counts refer to entries assigned to the mapped resource.  When
 logical tree batch to the representative partition's ceiling-sized batch.
 """
 from dataclasses import dataclass
-from types import MappingProxyType
-from typing import Mapping, Optional
+import math
+from typing import Optional
 from srammachine.commands.base import integer, nonempty
+from srammachine.hardware import HardwareConfig
+from .ep_routing import EPRouting
 
 
 @dataclass(frozen=True)
@@ -17,28 +19,13 @@ class OperatorMapping:
     batch_axis: str
     resource_id: str
     dram_resource_id: Optional[str] = None
-    sram_resource_id: Optional[str] = None
-    dram_read_once_bytes: int = 0
     dram_read_bytes_per_token: int = 0
     dram_write_bytes_per_token: int = 0
-    weight_load_fixed_bytes: int = 0
-    weight_load_bytes_per_token: int = 0
-    # Exact resident weight shape.  HardwareMapper supplies the die-local
-    # matrix shape here so trace metadata does not mistake the 4x4 PU tile
-    # count for the batched-GEMM B dimension.
-    weight_shape: Optional[Mapping[str, int]] = None
+    # Explicit per-PU weight bytes for prepartitioned legacy operators.
+    weight_read_fixed_bytes: int = 0
     batch_partition_degree: int = 1
-    sram_read_bytes_per_mapped_token: int = 0
-    sram_read_data_kind: Optional[str] = None
-    # Optional pre-sharing sizes.  Existing byte fields remain the effective
-    # traffic charged to the representative resource, preserving the original
-    # positional API and all scheduling/capacity semantics.
-    dram_read_once_logical_bytes: Optional[int] = None
     dram_read_logical_bytes_per_token: Optional[int] = None
     dram_write_logical_bytes_per_token: Optional[int] = None
-    weight_load_logical_fixed_bytes: Optional[int] = None
-    weight_load_logical_bytes_per_token: Optional[int] = None
-    sram_read_logical_bytes_per_mapped_token: Optional[int] = None
     shared_die_factor: int = 1
     # Optional number of indivisible logical work units along batch_axis.
     # TreeParser distributes these units across microbatches with quotient /
@@ -49,8 +36,28 @@ class OperatorMapping:
     demand_batch_partition_degree: Optional[int] = None
     # Extra NoC directions occupied by the same communication command.
     additional_resource_ids: tuple[str, ...] = ()
+    cache_query_group_size: int = 1
+    ep_routing: Optional[EPRouting] = None
+    # Uniform per-PU KV share for legacy head-expanded attention tiles.
+    cache_read_bytes_per_request: Optional[float] = None
+    # Per-op execution view; resource IDs still identify shared physical ports.
+    hardware_config: Optional[HardwareConfig] = None
 
     def __post_init__(self) -> None:
+        if self.hardware_config is not None and not isinstance(self.hardware_config, HardwareConfig):
+            raise TypeError("hardware_config must be a HardwareConfig")
+        if self.cache_read_bytes_per_request is not None:
+            size = self.cache_read_bytes_per_request
+            if (isinstance(size, bool) or not isinstance(size, (int, float))
+                    or not math.isfinite(size) or size <= 0):
+                raise ValueError("cache_read_bytes_per_request must be positive and finite")
+        if self.ep_routing is not None:
+            if not isinstance(self.ep_routing, EPRouting):
+                raise TypeError("ep_routing must be EPRouting")
+            if (self.batch_axis != "size_bytes" or self.batch_partition_degree != 1
+                    or self.batch_scaling_unit_count is not None):
+                raise ValueError("EP routing requires unpartitioned byte mapping")
+        integer("cache_query_group_size", self.cache_query_group_size, 1)
         if self.batch_axis not in ("B", "M", "m", "size_bytes"):
             raise ValueError("batch_axis must be B, M, m or size_bytes")
         nonempty("resource_id", self.resource_id)
@@ -62,27 +69,16 @@ class OperatorMapping:
         if len(set((self.resource_id,) + additional)) != 1 + len(additional):
             raise ValueError("resource IDs must be unique")
         object.__setattr__(self, "additional_resource_ids", additional)
-        for name in ("dram_resource_id", "sram_resource_id"):
-            value = getattr(self, name)
-            if value is not None:
-                nonempty(name, value)
+        if self.dram_resource_id is not None:
+            nonempty("dram_resource_id", self.dram_resource_id)
         for name in (
-            "dram_read_once_bytes", "dram_read_bytes_per_token",
-            "dram_write_bytes_per_token", "weight_load_fixed_bytes",
-            "weight_load_bytes_per_token",
-            "sram_read_bytes_per_mapped_token",
+            "dram_read_bytes_per_token", "dram_write_bytes_per_token",
+            "weight_read_fixed_bytes",
         ):
             integer(name, getattr(self, name))
         for effective_name, logical_name in (
-            ("dram_read_once_bytes", "dram_read_once_logical_bytes"),
             ("dram_read_bytes_per_token", "dram_read_logical_bytes_per_token"),
             ("dram_write_bytes_per_token", "dram_write_logical_bytes_per_token"),
-            ("weight_load_fixed_bytes", "weight_load_logical_fixed_bytes"),
-            ("weight_load_bytes_per_token", "weight_load_logical_bytes_per_token"),
-            (
-                "sram_read_bytes_per_mapped_token",
-                "sram_read_logical_bytes_per_mapped_token",
-            ),
         ):
             logical = getattr(self, logical_name)
             if logical is not None:
@@ -95,12 +91,8 @@ class OperatorMapping:
         has_shared_size = any(
             getattr(self, name) is not None
             for name in (
-                "dram_read_once_logical_bytes",
                 "dram_read_logical_bytes_per_token",
                 "dram_write_logical_bytes_per_token",
-                "weight_load_logical_fixed_bytes",
-                "weight_load_logical_bytes_per_token",
-                "sram_read_logical_bytes_per_mapped_token",
             )
         )
         if self.shared_die_factor > 1 and not has_shared_size:
@@ -117,29 +109,6 @@ class OperatorMapping:
                 raise ValueError(
                     "nonuniform batch scaling requires batch_partition_degree=1"
                 )
-        if (self.dram_read_once_bytes or self.dram_read_bytes_per_token
+        if (self.dram_read_bytes_per_token
                 or self.dram_write_bytes_per_token) and self.dram_resource_id is None:
             raise ValueError("DRAM traffic requires dram_resource_id")
-        # Resident weights are fetched directly from DRAM by the PU.  Keep the
-        # optional SRAM identifier for backwards-compatible mapping data, but
-        # do not require or use it for direct transfers.
-        if (self.weight_load_fixed_bytes or self.weight_load_bytes_per_token
-                ) and self.sram_resource_id is None:
-            raise ValueError("weight loading requires sram_resource_id")
-        if self.sram_read_bytes_per_mapped_token:
-            if self.sram_resource_id is None:
-                raise ValueError("SRAM demand read requires sram_resource_id")
-            nonempty("sram_read_data_kind", self.sram_read_data_kind)
-        elif self.sram_read_data_kind is not None:
-            raise ValueError(
-                "sram_read_data_kind requires SRAM demand-read traffic"
-            )
-        if self.weight_shape is not None:
-            if not isinstance(self.weight_shape, Mapping):
-                raise TypeError("weight_shape must be a mapping")
-            copied = {}
-            for name, value in self.weight_shape.items():
-                nonempty("weight shape dimension", name)
-                integer(name, value, 0)
-                copied[name] = value
-            object.__setattr__(self, "weight_shape", MappingProxyType(copied))

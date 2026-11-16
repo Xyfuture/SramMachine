@@ -36,7 +36,7 @@ class IndexerPartitionTests(unittest.TestCase):
         self.assertEqual((core.B, core.M, core.K, core.N), (3, 3, 7, 3))
         self.assertEqual(core.top_k, 2)
         self.assertEqual(core.output_candidates, 6)
-        self.assertEqual(core.weight_load_bytes, 3 * 7 * 3)
+        self.assertEqual(graph.command("i0.indexer_cache.dram.0").size_bytes, 3 * 7 * 3)
         self.assertEqual(core.qk_flops, 2 * 3 * 3 * 7 * 3)
         output = graph.command("i0.output")
         self.assertEqual(output.topk_candidates_per_row, (6, 4))
@@ -113,7 +113,7 @@ class IndexerPartitionTests(unittest.TestCase):
                              input_dtype_bytes=1, output_dtype_bytes=4, index_dtype_bytes=2)
                 graph = self.parse(op)
                 self.assertEqual(len(graph.commands),
-                                 1 + (source == "io_die") + (destination == "io_die"))
+                                 3 + (source == "io_die"))
                 if source == "io_die":
                     self.assertEqual(graph.command("i0.input").size_bytes, 105)
                 if destination == "io_die":
@@ -135,9 +135,45 @@ class IndexerPartitionTests(unittest.TestCase):
         self.assertEqual(execution.end_time_ns - execution.start_time_ns,
                          (24 * 10**9 + bandwidth - 1) // bandwidth)
 
+    def test_queries_share_cache_but_reduce_and_select_independently(self):
+        from dataclasses import replace
+
+        single = self.op((("B", "p", 2), ("S", "q", 4)), top_k=2)
+        packed = replace(single, M=6, queries_per_request=2)
+        baseline = self.parse(single)
+        graph = self.parse(packed)
+        core = graph.command("i0.core")
+        original = baseline.command("i0.core")
+        self.assertEqual((core.B, core.M, core.queries_per_request), (3, 6, 2))
+        for attribute in ("qk_flops", "relu_flops", "head_reduce_flops",
+                          "total_flops", "output_candidates"):
+            self.assertEqual(getattr(core, attribute), 2 * getattr(original, attribute))
+        self.assertEqual(core.total_flops, packed.total_flops * 3 * 3 // (5 * 9))
+        for suffix in ("input", "output"):
+            self.assertEqual(graph.command(f"i0.{suffix}").io_bytes_per_row,
+                             tuple(2 * n for n in baseline.command(f"i0.{suffix}").io_bytes_per_row))
+        self.assertEqual(graph.command("i0.output").topk_candidates_per_row, (12, 8))
+        self.assertEqual(graph.command("i0.indexer_cache.dram.0").size_bytes,
+                         baseline.command("i0.indexer_cache.dram.0").size_bytes)
+        params = _command_parameters(core, DEFAULT_HARDWARE_CONFIG)
+        self.assertEqual((params["queries_per_request"], params["heads_per_query"]), (2, 3))
+
+    def test_packed_queries_survive_microbatch_and_sequence_merges(self):
+        op = FusedIndexerScoreOp(
+            "a", 8, 6, 7, 9, top_k=5, queries_per_request=2,
+            partition_chain=PartitionChain((("B", "p", 3), ("S", "q", 3))),
+        )
+        graph = self.parse(op, split=2, layers=2)
+        core = graph.command("layer0.i0.core")
+        self.assertEqual((core.B, core.M, core.queries_per_request), (2, 6, 2))
+        self.assertEqual(core.output_candidates, 2 * 2 * 3)
+        self.assertEqual(graph.command("layer0.i0.output").topk_candidates_per_row,
+                         (20, 20, 0))
+
     def test_validation(self):
         for kwargs in (dict(top_k=0), dict(top_k=True), dict(index_dtype_bytes=0),
-                       dict(output_destination="pu_vertical")):
+                       dict(output_destination="pu_vertical"), dict(queries_per_request=0),
+                       dict(queries_per_request=True), dict(queries_per_request=2)):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 self.op(**kwargs)
         for axis in ("M", "K", "N"):

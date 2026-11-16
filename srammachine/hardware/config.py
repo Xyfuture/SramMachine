@@ -1,4 +1,4 @@
-"""Typed hardware configuration for the UltraStack simulator.
+"""Typed hardware configuration with Nexus defaults.
 
 All byte and bandwidth values use decimal SI units: MB = 10**6 bytes,
 GB = 10**9 bytes, and TB/s = 10**12 bytes per second.
@@ -10,7 +10,6 @@ import math
 from numbers import Real
 
 
-_MB = 10**6
 _GB = 10**9
 _TFLOPS = 10**12
 _TB_PER_SECOND = 10**12
@@ -43,6 +42,7 @@ def _nonempty(name: str, value: str) -> None:
 class NoCBandwidthPreset(Enum):
     """Supported directional bandwidths for one adjacent-PU NoC link."""
 
+    GBPS_128 = 128 * _GB
     GBPS_256 = 256 * _GB
     GBPS_512 = 512 * _GB
 
@@ -56,20 +56,15 @@ class SystolicArrayConfig:
     """Configuration shared by every systolic array in a PU."""
 
     rows: int = 16
-    columns: int = 128
+    columns: int = 16
     frequency_hz: int = 1_000_000_000
     precision: str = "fp8"
     flops_per_mac: int = 2
-    weight_bandwidth_bytes_per_second: int = 128 * _GB
 
     def __post_init__(self) -> None:
         for name in ("rows", "columns", "frequency_hz", "flops_per_mac"):
             _positive_integer(name, getattr(self, name))
         _nonempty("precision", self.precision)
-        _positive_real(
-            "weight_bandwidth_bytes_per_second",
-            self.weight_bandwidth_bytes_per_second,
-        )
 
     @property
     def peak_flops(self) -> int:
@@ -80,13 +75,17 @@ class SystolicArrayConfig:
 class ProcessingUnitConfig:
     """A PU containing identical systolic arrays."""
 
-    systolic_array_count: int = 32
+    systolic_array_count: int = 4
     systolic_array: SystolicArrayConfig = field(
         default_factory=SystolicArrayConfig
     )
+    dram_bandwidth_bytes_per_second: float = 16 * _GB
+    flash_bandwidth_bytes_per_second: float = 4 * _GB
 
     def __post_init__(self) -> None:
         _positive_integer("systolic_array_count", self.systolic_array_count)
+        for name in ("dram_bandwidth_bytes_per_second", "flash_bandwidth_bytes_per_second"):
+            _positive_real(name, getattr(self, name))
         if not isinstance(self.systolic_array, SystolicArrayConfig):
             raise ValueError("systolic_array must be a SystolicArrayConfig")
 
@@ -94,12 +93,6 @@ class ProcessingUnitConfig:
     def peak_flops(self) -> int:
         return self.systolic_array_count * self.systolic_array.peak_flops
 
-    @property
-    def weight_bandwidth_bytes_per_second(self) -> int:
-        return (
-            self.systolic_array_count
-            * self.systolic_array.weight_bandwidth_bytes_per_second
-        )
 
 
 @dataclass(frozen=True)
@@ -116,19 +109,15 @@ class VectorUnitConfig:
 
 @dataclass(frozen=True)
 class MemoryConfig:
-    """DRAM and SRAM resources associated with one stack/logic die."""
+    """DRAM resources associated with one stack/logic die."""
 
     dram_capacity_bytes: int = 40 * _GB
     dram_bandwidth_bytes_per_second: int = 16 * _TB_PER_SECOND
-    sram_capacity_bytes: int = 768 * _MB
-    sram_bandwidth_bytes_per_second: int = 64 * _TB_PER_SECOND
 
     def __post_init__(self) -> None:
         for name in (
             "dram_capacity_bytes",
             "dram_bandwidth_bytes_per_second",
-            "sram_capacity_bytes",
-            "sram_bandwidth_bytes_per_second",
         ):
             _positive_real(name, getattr(self, name))
 
@@ -137,8 +126,8 @@ class MemoryConfig:
 class LogicDieConfig:
     """One logic die and its associated stack-local resources."""
 
-    pu_mesh_rows: int = 4
-    pu_mesh_columns: int = 4
+    pu_mesh_rows: int = 16
+    pu_mesh_columns: int = 32
     processing_unit: ProcessingUnitConfig = field(
         default_factory=ProcessingUnitConfig
     )
@@ -170,12 +159,6 @@ class LogicDieConfig:
     def systolic_peak_flops(self) -> int:
         return self.processing_unit_count * self.processing_unit.peak_flops
 
-    @property
-    def systolic_weight_bandwidth_bytes_per_second(self) -> int:
-        return (
-            self.processing_unit_count
-            * self.processing_unit.weight_bandwidth_bytes_per_second
-        )
 
 
 @dataclass(frozen=True)
@@ -188,10 +171,10 @@ class NoCConfig:
     metadata and do not add latency or extra resources to this model.
     """
 
-    mesh_rows: int = 8
-    mesh_columns: int = 8
+    mesh_rows: int = 32
+    mesh_columns: int = 64
     link_bandwidth_bytes_per_second: int = (
-        NoCBandwidthPreset.GBPS_256.bytes_per_second
+        NoCBandwidthPreset.GBPS_128.bytes_per_second
     )
     link_latency_ns: float = 0
     full_duplex: bool = True
@@ -352,7 +335,7 @@ class InterChipFabricConfig:
     """Per-chip interface to a full-mesh switched inter-chip fabric."""
 
     topology: str = "full_mesh_switch_fabric"
-    per_chip_directional_bandwidth_bytes_per_second: int = 1600 * _GB
+    per_chip_directional_bandwidth_bytes_per_second: int = 900 * _GB
     full_duplex: bool = True
 
     def __post_init__(self) -> None:
@@ -377,15 +360,15 @@ class InterChipFabricConfig:
 class HardwareConfig:
     """Top-level system hardware configuration."""
 
-    chip_count: int = 16
+    chip_count: int = 8
     chip: ChipConfig = field(default_factory=ChipConfig)
     inter_chip_fabric: InterChipFabricConfig = field(
         default_factory=InterChipFabricConfig
     )
 
     def __post_init__(self) -> None:
-        if type(self.chip_count) is not int or self.chip_count not in (16, 32):
-            raise ValueError("chip_count must be either 16 or 32")
+        if type(self.chip_count) is not int or self.chip_count not in (8, 16, 32):
+            raise ValueError("chip_count must be 8, 16 or 32")
         if not isinstance(self.chip, ChipConfig):
             raise ValueError("chip must be a ChipConfig")
         if not isinstance(self.inter_chip_fabric, InterChipFabricConfig):

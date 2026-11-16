@@ -1,8 +1,56 @@
-# SramMachine 与 SA 脚本使用指南
+# SramMachine 实验脚本使用指南
+
+**当前禁用 SplitTree 搜索。** `run_sa` 保留历史入口名称，默认只执行
+PartitionChain 枚举、顺序仿真和 trace 导出，无需提供任何 SA 轮数。
+Python 设置 `SimulatedAnnealingConfig(enabled=True)`、CLI 指定
+`--split-tree-search`，或提供非零 `--rounds` / `--warmup-rounds` / `--restarts`，
+都会立即抛出 `NotImplementedError`。PartitionChain 枚举仍默认开启。
+
+当前批量运行示例：
+
+```bash
+.venv/bin/python -m srammachine.script.run_sa --models deepseek-v3.2 --mtp on --batch-sizes 64 128 192 256 320 384 448 512 --input-sequence-length 32768 --output-sequence-length 600
+```
+
+下方保留的 SA 轮数、温度、restart 和 SplitTree 搜索说明属于历史接口文档，
+不能用于当前运行。
+
+## MiniMax M3 快速运行
+
+M3 使用独立的 MSA/Indexer 实现，投影与专家计算复用 BMM。默认结果按
+57 层 MSA/MoE 与 3 层 dense GQA/FFN 分别按固定顺序仿真后加权，
+dense 前缀使用固定顺序 baseline。Vector 操作暂不计时。详细语义及近似见
+[Mapper 文档](../mapping/README.md#minimax-m3)。
+
+默认枚举 MiniMax 代表层的 PartitionChain：BMM 使用 `B/M/K/N`，MSA 使用
+`B/H/S`（H 为完整 KV head group），Indexer 使用 `B/S` 并按 block top-k
+通信量评分。支持普通版、XFold、TP/EP、MTP 和 FP8/FP16，添加
+`--no-partition-optimization` 可关闭。完整 decoder 估算附带的 dense 前缀仍用
+原始 baseline；单独指定 `--minimax-layer-type dense` 导出时，会枚举该 dense 层。
+
+```bash
+.venv/bin/python -m srammachine.script.export_trace --model minimax-m3 --batch-size 256 --input-sequence-length 20000
+.venv/bin/python -m srammachine.script.export_trace --model minimax-m3 --minimax-layer-type dense --batch-size 256 --input-sequence-length 20000
+.venv/bin/python -m srammachine.script.run_sa --models minimax-m3 --mtp off --batch-sizes 256 --input-sequence-length 20000 --output-sequence-length 600 --moe-strategy tp
+```
+
+第一条导出 MSA 代表层 trace 并报告完整 decoder 的加权估算；第二条仅检查
+dense 前缀。支持 `fp8/fp16` KV、TP/EP 和现有理想 MTP1。添加 `--xfold` 可启用
+MiniMax 的 512 维 index-query folding：包含 residual/shared/routed contribution，
+在 routed FC1 后提前执行分组 QK 和 Block Top-16，再重叠 DRAM FC2 与 Flash KV
+预取。vector 操作不计时，dense 前缀仍走普通路径。
+
+```bash
+.venv/bin/python -m srammachine.script.export_trace --model minimax-m3 --xfold --batch-size 256 --input-sequence-length 20000
+.venv/bin/python -m srammachine.script.run_sa --models minimax-m3 --xfold --mtp off --batch-sizes 256 --input-sequence-length 20000 --output-sequence-length 600 --moe-strategy ep
+```
+
+稳态估算及矩阵形状见 [MiniMax XFold](../mapping/README.md#minimax-xfold)。
+`--minimax-layer-type dense` 不接受 `--xfold`。
 
 ## 项目简介
 
-SramMachine 是面向 SRAM-centric AI 加速器的离散事件模拟器。目前主要用于研究 decoding 阶段中 Attention、MoE、存储和片上/片间通信的延迟，以及 SplitTree microbatch 对流水并行效果的影响。
+SramMachine 是面向 DRAM/Flash 直连 PU 的 AI 加速器的离散事件模拟器。目前主要用于研究 decoding 阶段中 Attention、MoE、存储和片上/片间通信的延迟，以及 SplitTree microbatch 对流水并行效果的影响。
 
 当前主要流程为：
 
@@ -23,26 +71,150 @@ GraphExecutor + Desim
 目前支持的模型：
 
 - `deepseek-v3`
+- `minimax-m3`
 - `deepseek-v3.2`
 - `kimi-k2.5`
 - `glm-5.1`
 
-模拟器支持 MoE TP/EP、MTP1、FP8/FP16 KV cache，以及由模拟退火搜索 SplitTree。TP 与 EP 可以在同一次脚本运行中搜索；模拟退火同时考察单用户吞吐和总吞吐，并保留搜索得到的 Pareto 最优 SplitTree。
+模拟器支持 MoE TP/EP、MTP1、FP8/FP16 KV cache，以及 PartitionChain 枚举优化。TP 与 EP 可以在同一次脚本运行中比较，并导出各 workload 的指标、布局和 Perfetto trace。SplitTree 搜索当前禁用。
 
-当前 MoE 映射不按 BS 分档：TP 的16个chip仅沿 intermediate N
-切分；每chip视为统一的8×8 PU mesh，直接做 hidden K8 × intermediate N8。
-TP 的 MoE 权重读取、SiLU 以整个chip为资源粒度；Up输入和Down输出
-使用显式总字节数和横向NoC带宽计时。当前仍省略Up K partial归约，属于实验假设。
-EP仍由16个chip分别持有所属experts，chip内同样使用统一的8×8 PU mesh
-对每个本地expert做K8×N8张量并行；dispatch/combine仍是EP16 all-to-all。
-两种模式中，每个chip的64个PU对**每个本地expert**做张量并行，
-不按expert给PU分工。activation按FP8（1 byte/元素）计费，
-Fabric为每chip每方向1.6TB/s。切分依据和通信计费见
-[MoE TP/EP映射说明](MOE_PURE_TP_EXPERIMENT.md)。旧策略代码仍在，但
-默认16-chip四模型不再触发。
-- 小 batch 允许只激活部分experts；inactive expert不产生weight或计算命令。
+## 默认 PartitionChain 枚举优化
 
-## 并行 SA 脚本
+`SplitTreeOptimizer`、`run_sa` 和 `export_trace` 默认对 DeepSeek V3 / V3.2 / GLM 5.1 / MiniMax M3
+启用 PartitionChain 枚举，支持普通版、Fold、TP/EP 和 FP8/FP16。
+DeepSeek V3 不含 Indexer，完整读取 KV cache；即使传入 `--xfold` 也执行普通版，
+结果记录 `xfold=false`。Flash 带宽使用默认 CSV 的 V3 `dense_kv` 数据。
+
+```bash
+.venv/bin/python -m srammachine.script.run_sa --models deepseek-v3 --xfold --mtp off on --batch-sizes 256 --input-sequence-length 32768 --output-sequence-length 600 --moe-strategy ep tp
+```
+
+每个 `(batch, MTP)` workload 在完成 chip 级映射及 HBF 带宽查表后，先枚举
+各 Op 的片内布局，再固定这些布局顺序执行一次。每个 workload 只枚举一次，
+不启动 SplitTree 搜索、不生成邻居，也不执行 restart。
+其他模型和直接调用 Mapper 的行为保持原样。
+
+BMM 枚举 B/M/K/N 在 p、q 两方向的 2 的幂次因子分配，MLA/DSA Attention 与
+DSA/MiniMax Indexer 枚举 B/S，MiniMax MSA 枚举 B/H/S。
+候选先切 p 再切 q，覆盖完整 32×64 PU 网格，支持不能整除时的裁剪。
+按 `输入 NoC 时间 + max(计算时间, DRAM/Flash 并行加载时间) + 输出 NoC 时间`
+选择最低成本布局，保留原布局参与比较；BMM 的最佳三个候选通过 TreeParser
+精确通信量独立核对。Flash 使用每个算子的实际带宽。XFold 的 KV 预取作为
+独立 Flash 指令参与资源竞争，不计入 FC2 的 PU 时间或布局评分；其完成约束
+下一层 Core Attention 的输出。枚举优化各算子的局部执行成本，
+也不代表候选范围以外的全局最优。
+
+关闭枚举以使用 Mapper 原始布局：
+
+```bash
+.venv/bin/python -m srammachine.script.run_sa --models deepseek-v3.2 --mtp on --batch-sizes 256 --input-sequence-length 32768 --output-sequence-length 600 --no-partition-optimization
+.venv/bin/python -m srammachine.script.export_trace --model deepseek-v3.2 --batch-size 256 --input-sequence-length 32768 --mtp --no-partition-optimization
+```
+
+Python API 使用 `SimulatedAnnealingConfig(optimize_partition_chains=False)` 关闭。
+`enabled=False` 是默认值；设置 `enabled=True` 会立即抛出 `NotImplementedError`。
+批量入口的 `baseline_*` 指标来自 Mapper 原始布局，`pareto_best_*` 来自枚举后的
+顺序执行结果；关闭枚举时两者相同。所有 SA proposal/restart/接受计数均为 0。
+
+结果 JSON 和 case checkpoint 保存 `partition_chains`，每棵树的 record 也携带该字段；
+CSV 记录 `optimize_partition_chains`，完整布局在它引用的 JSON 内。
+Trace 重放使用保存的布局，不重新枚举，并核对记录的仿真延迟。
+旧文件没有布局字段时保留原 Mapper 重放方式。Python 重放示例：
+
+```python
+from srammachine.search import (
+    apply_partition_chains, load_pareto_partition_chains, load_pareto_split_tree,
+)
+
+# mapped 必须使用与结果相同的模型、推理配置、硬件及 HBF 带宽表重建。
+mapped = apply_partition_chains(
+    mapped, load_pareto_partition_chains(result_path), mapper.hardware_config,
+)
+tree = load_pareto_split_tree(result_path)
+graph = TreeParser(mapper.hardware_config).parse(
+    tree, mapped.operators, mapped.operator_mappings, layer_count=4,
+)
+```
+
+## Nexus 默认硬件
+
+| 项目 | 默认值 |
+| --- | --- |
+| 系统 | 8 Chip；Attention 使用 DP，FFN/MoE 使用 EP |
+| 每 Chip PU 网格 | 32×64，共 2048 PU |
+| 每 PU 脉动阵列 | 4 个 16×16 阵列，1 GHz |
+| 每 PU DRAM / Flash 带宽 | 16 GB/s / 4 GB/s |
+| 片内互联 | 2D mesh，全双工；每条链路每方向 128 GB/s |
+
+带宽采用十进制 GB（10⁹ bytes）。双源权重加载默认按 DRAM:Flash = 4:1
+分配，理想并行带宽为 20 GB/s；算子可覆盖 Flash 带宽。
+当前配置层次保留每 Chip 2×2 logic die，各 die 为 16×32 PU，拼成 32×64
+mesh。未另行指定的容量、向量单元和 Chip 间 Fabric 参数沿用现有设置。
+
+DeepSeek V3 和 DSA 模型的片内切分见 [Mapper 说明](../mapping/README.md)。Kimi K2.5
+在 Chip 间使用 Attention DP / MoE EP，片内投影按 K32×N64 切分；显式 TP
+模式额外按 Chip 数切分 intermediate 维度。原 16-Chip、8×8 mesh 实验记录
+见 [历史 MoE TP/EP 映射说明](MOE_PURE_TP_EXPERIMENT.md)，不代表当前默认值。
+
+## HBF 实测带宽表
+
+`run_sa` 和 `export_trace` 默认读取仓库内的
+[`hbf_read_bandwidth.csv`](../model_cards/hbf_read_bandwidth.csv)。每次运行加载一次，
+根据模型、**global batch size**、MTP 和 `input_sequence_length`，为 Core Attention
+的 KV 读取和 indexer 设置 Flash 带宽。SA 拆分 microbatch 后继续使用原 global batch
+对应的带宽。普通权重加载仍使用其原有内存策略。
+
+原始 `mean_GBps` 是单 chip 的总带宽，采用十进制 GB；导出的
+`flash_bandwidth_bytes_per_second = mean_GBps * 1e9 / 2048` 是每 PU 带宽。
+表中保留测量元数据，新增 `op_id`、`bandwidth_scope=chip`、`pu_count=2048`
+和原始名称。`Kimi-K2` 对齐为 `kimi-k2.5`；`GLM-5.2` 保留为 `glm-5.2`，
+仅作为数据保留，尚未添加模型仿真支持。
+
+查表规则：
+
+- 精确命中时直接取值；否则沿 batch、sequence length 两轴做线性/双线性插值，
+  使用原数值坐标，不使用对数坐标。任何一轴越界或缺少插值角点都报错。
+- 当前表覆盖 global batch **16–4096**，sequence length **16384–65536**。
+- `dense_kv`、`dense_indexer` 缺少 MTP=1 系列时沿用 MTP=0；稀疏 KV 分别查 MTP=0/1。
+- MiniMax 的 dense attention 层使用硬件默认 Flash 带宽并发出提示，不套用 sparse 测量。
+- Fold 模式下，保留的 indexer score 使用 indexer 数据（DeepSeek V3.2/MiniMax
+  仅 `moe.indexer_score`，GLM 5.1 还包括 `attn.indexer_score`），FC2 的 Flash KV 预取使用 sparse KV
+  数据；Core Attention 仍读 DRAM。DeepSeek-V3/Kimi 的旧 KV 路径转换为每 PU Flash
+  读取，按每请求唯一 KV 数据量均分到 2048 个 PU，不按 head 或 MTP query 重复读取。
+- 表格没有 dtype 维度，FP8/FP16 使用相同测量带宽；实际读取字节数仍由 KV dtype 决定。
+
+指定另一份规范化表，或关闭实测带宽：
+
+```bash
+.venv/bin/python -m srammachine.script.run_sa --models deepseek-v3.2 --mtp off on --batch-sizes 256 --rounds 10 --input-sequence-length 20000 --output-sequence-length 600 --hbf-bandwidth-csv /home/xyfuture/nex/SramMachine/HBF-read-bandwidth-results-normalized.csv
+.venv/bin/python -m srammachine.script.export_trace --model deepseek-v3 --no-hbf-bandwidth
+```
+
+SA 的 CSV/JSON 记录带宽表路径，搜索结果的 trace 重建时也使用该路径。旧结果未记录
+此字段时按旧配置重建。Python API 显式启用：
+
+```python
+from srammachine.mapping import DEFAULT_HBF_BANDWIDTH_CSV, HBFBandwidthTable, mapper_for_model
+from srammachine.inference import InferenceConfig
+
+table = HBFBandwidthTable.from_csv(DEFAULT_HBF_BANDWIDTH_CSV)
+mapped = mapper_for_model("deepseek-v3.2").map(
+    InferenceConfig(256, 20000, 600), hbf_bandwidth_table=table,
+)
+# SplitTreeOptimizer(hbf_bandwidth_csv=DEFAULT_HBF_BANDWIDTH_CSV) 同样支持。
+```
+
+重新规范化原始测量文件（默认输出到源文件旁的 `*-normalized.csv`）：
+
+```bash
+.venv/bin/python -m srammachine.script.normalize_hbf_csv /home/xyfuture/nex/SramMachine/HBF-read-bandwidth-results.csv
+```
+
+## 并行运行与历史 SA 说明
+
+当前 worker 仅运行顺序仿真。下文涉及 SA 预热、restart、搜索轮数和温度的说明
+均为历史记录；非零轮数会触发 `NotImplementedError`。进程隔离、checkpoint、CSV
+和 trace 的保存方式继续适用，文件名中的 `sa` / `splittree` 前后缀保留兼容。
 
 通信算子分为 `NoCOp`（片内）和 `FabricOp`（片间）；原 `CommOp` 已移除。
 NoC 使用两个独立带宽资源：NocHorizontal (`chip0.noc_horizontal`) 和
@@ -105,7 +277,10 @@ Batch size会按降序进入任务队列，使耗时通常更长的大batch优�
 
 ## 基本示例
 
-### 全量 400-round 测试规则
+下面历史实验示例中如包含 batch 8192，已超出当前 HBF 表的 4096 上限；
+需要补充测量数据，或显式添加 `--no-hbf-bandwidth` 运行原有带宽配置。
+
+### 历史全量 400-round 测试规则（当前禁用）
 
 当前全量测试固定覆盖：
 
@@ -176,13 +351,14 @@ python -m srammachine.script.run_sa --models deepseek-v3 --mtp off on --batch-si
 | `--rounds` | 每次 restart 的正式 SA 轮数 |
 | `--input-sequence-length` | 一个或多个 decoding 历史上下文长度；单值用法保持兼容 |
 | `--output-sequence-length` | 输出长度元数据 |
-| `--moe-strategy` | 一个或多个MoE并行策略：`tp`、`ep`，也可以同时指定 |
 
 可选参数及默认值：
 
 | 参数 | 默认值 | 含义 |
 |---|---:|---|
+| `--moe-strategy` | `ep` | 一个或多个 MoE 并行策略：`tp`、`ep` |
 | `--kv-cache-dtype` | `fp8` | KV cache 数据类型，可选 `fp8`/`fp16` |
+| `--partition-optimization` | 开启 | V3/DSA/MiniMax workload 仿真前枚举 PartitionChain；用 `--no-partition-optimization` 关闭 |
 | `--warmup-rounds` | `16` | 每个 case 的 SA 预热轮数 |
 | `--initial-temperature` | `1.0` | 初始温度 |
 | `--final-temperature` | `0.01` | 最终温度 |
@@ -243,7 +419,7 @@ Pareto front 只在固定配置内部计算。分组字段包括模型、MoE策�
 
 - TP只要求batch为正整数，因此最低为`BS=1`。
 - EP要求`BS × accepted_tokens_per_step × top_k ≥ chip_count`，确保每个chip至少有一个活跃expert assignment。
-- 默认16 chips、top-k=8时，EP的MTP off最低`BS=2`，MTP on最低`BS=1`。
+- 默认8 chips、top-k=8时，EP的MTP off/on最低均为`BS=1`。
 - 32 chips时对应最低值为`BS=4`和`BS=2`。
 - 当同时指定`--moe-strategy tp ep`时，所有batch会与两种策略做笛卡尔积，因此batch列表必须同时满足EP约束；否则整个任务会报告具体失败case并停止。
 
@@ -306,8 +482,12 @@ IO 命令的 `io_bytes_per_row` 保留各行有效字节数，`size_bytes` 为�
 没有该字段时保留原来的 `size_bytes` 语义，trace 用 `volume_semantics` 区分。
 
 lower 生成 `.input -> .core -> .output`，`none` 或零通信量时省略对应通信节点。
-相邻算子和跨层依赖均从输出完成连接到下一个输入开始。`GemmCmd.weight_load_bytes`
-自动取本 PU 的 B×K×N×weight_dtype_bytes，`shared_weight=True` 时不乘 B。
+相邻算子和跨层依赖均从输出完成连接到下一个输入开始。权重通过 `PUMemoryReadCmd`
+从 DRAM 或 Flash 直接流入 PU，不经过 SRAM，也不受 SRAM 容量限制。
+权重字节数取本 PU 的 B×K×N×weight_dtype_bytes，`shared_weight=True` 时不乘 B。
+未指定 `weight_memory` 的自动权重加载默认使用 DRAM；显式策略支持 DRAM、Flash
+或两者同时使用。双端口按算子的实际带宽比例分配数据，并行耗时为 W/(B_dram+B_flash)。
+旧映射使用 `weight_read_fixed_bytes` 指定 PU 权重字节数，不再生成额外的预取或中转读取。
 默认权重 1 byte、输入输出各 2 bytes，可分别配置。权重端口传输与计算重叠，
 耗时取较大值；已有 mapping 内存流量时沿用显式流量，避免重复计费。
 
@@ -376,10 +556,12 @@ HardwareMapper 尚未迁移：其预切分 shape、独立通信节点不能直�
 
 ### PartitionChain 驱动的 FusedIndexerScore top-k 输出
 
-`FusedIndexerScoreOp` 保留 `B/M/K/N` 构造参数，其中 B 是 batch，M 是
-indexer head 数，K 是 head dimension，N 是 sequence length。
+`FusedIndexerScoreOp` 保留 `B/M/K/N` 构造参数，其中 B 是请求 batch，M 是
+`queries_per_request * indexer_heads`，K 是 head dimension，N 是 sequence length。
+`queries_per_request` 默认 1；MTP1 使用 2，同请求的 query 共享缓存，
+每个 query 的 head reduction 和 top-k 独立执行，M 必须能被 query 数整除。
 切分链只接受 `B/S`，其中 `S` 映射到 N；不允许切分 M/K，也不用 N 作为
-切分链维度名。每个 PU 执行完整的 head reduction 后，独立对每个 batch
+切分链维度名。每个 PU 执行各 query 的 head reduction 后，独立对每个请求/query
 取 top-k。`top_k` 默认 2048，可显式配置。
 
 ```python
@@ -396,24 +578,24 @@ assert op.communication_volumes()["output_bytes_per_row"] == (36, 24)
 
 输入按行对 Q 的 B 范围去重：S 切分 broadcast，B 切分 scatter，输入大小为
 有效 batch 数乘 `M*K*input_dtype_bytes`。每个 PU 输出的候选数量为
-`local_B * min(top_k, local_S)`，而不是对该 PU 的所有 batch 一起取 k 个。
+`local_B * queries_per_request * min(top_k, local_S)`，而不是对该 PU 的所有 batch 一起取 k 个。
 
-同一行相同 batch 的候选先合并并再次截断，再向 IO die 发送。对该行每个
+同一行相同请求/query 的候选先合并并再次截断，再向 IO die 发送。对该行每个
 有效 B 区间，设 batch 数为 b、S 范围并集的元素数为 s，则：
 
 ```text
-row_candidates += b * min(top_k, s)
+row_candidates += b * queries_per_request * min(top_k, s)
 row_output_bytes = row_candidates * (output_dtype_bytes + index_dtype_bytes)
 ```
 
 这里不能把每个 PU 的候选数量直接相加，也不能把不同 batch 一起截断到 k。
-当每个 PU 的局部 S 少于 k 时，合并后的数量可以增长，但每个 batch 最多 k 个。
-输出已完成 head reduction，因此不乘 M。空 tile 不贡献候选或输入通信。
+当每个 PU 的局部 S 少于 k 时，合并后的数量可以增长，但每个请求/query 最多 k 个。
+输出已完成每个 query 的 head reduction，因此乘 query 数、不乘 M。空 tile 不贡献候选或输入通信。
 
 候选携带 score 和全局 sequence index，默认分别为 2 bytes 和 4 bytes；
 可通过 `output_dtype_bytes` 和 `index_dtype_bytes` 配置，索引宽度必须足够
 表示 `[0, N)`。即使某行覆盖完整 S，当前接口也统一发送 score/index 对。
-跨行序列分片由 IO die 继续做相同的 top-k merge，每个 batch 最终仍最多 k 个。
+跨行序列分片由 IO die 继续做相同的 top-k merge，每个请求/query 最终仍最多 k 个。
 逐级合并需使用一致的排序规则，例如 score 降序、全局 index 升序处理同分。
 
 默认生成 `.input -> .core -> .output`，支持 `io_die` 和 `none` 路由。
@@ -425,3 +607,47 @@ row_output_bytes = row_candidates * (output_dtype_bytes + index_dtype_bytes)
 `main_gemm_flops_override` 仅保留用于空切分链；非空切分链必须由局部 shape
 推导 FLOPs，避免把旧的单 PU 覆盖值应用到新的完整逻辑 shape。
 HardwareMapper 的预切分及独立通信路径暂未迁移。
+
+### DSA Mapper / Fold
+
+DeepSeek V3.2 和 GLM 5.1 现在通过各自的 Mapper 生成顺序 Op 列表，默认使用
+8 chips，每 Chip 使用 32×64 PU 切分。`--xfold` 启用 `FusedFoldingMoE`，包括下一层
+indexer 预测，以及 DRAM FC2 与 Flash KV 预取重叠。MiniMax M3 使用专用
+`MiniMaxFoldingMoE`；DeepSeek V3 接受该开关并回退到普通版，Kimi K2.5 不支持。
+V3/DSA 路径默认枚举片内 PartitionChain，跨 Chip 默认 Attention DP、MoE EP；
+`--moe-strategy tp` 可显式切换为跨 Chip MoE TP。
+接口、形状、带宽参数和模拟口径见 [mapping/README.md](../mapping/README.md)。
+
+### 直接导出 Perfetto trace
+
+无需运行 SplitTree SA，可直接导出顺序执行基线的普通版或 Fold 版；
+V3/DSA/MiniMax 默认先枚举 PartitionChain，添加 `--no-partition-optimization` 使用原始布局：
+
+```bash
+.venv/bin/python -m srammachine.script.export_trace
+.venv/bin/python -m srammachine.script.export_trace --xfold
+```
+
+默认配置为 DeepSeek V3.2、batch 256、输入长度 20000、输出长度 600、FP8 KV、
+MTP 关闭，模拟连续 4 层。使用 `--help` 查看模型、batch、序列长度、层数等参数。
+文件写入 `test result/perfetto/`，名称包含模型、版本、配置和 `baseline`，不覆盖已有文件。
+将 JSON 加载到 Perfetto 的 Open trace file 中即可分析。
+
+PU 计算、DRAM、Flash、NoC 各有独立轨道。内存事件名称标明端口、读取用途、
+数据量和带宽；Fold 的独立 Flash 预取标记为 `next_layer_kv`，名称包含
+`kv_prefetch L0->L1` 等来源层和目标层。它与 FC2 core 共享前序依赖，
+与下一层 Core Attention core 共享后续依赖；FC2 输出不等待预取完成。
+XFold 的 PreAttention、中间 Indexer 和 Core Attention 默认全部只读 DRAM，
+为跨层 KV 预取保留 Flash 端口；PostAttention 和 MoE 沿用各自的内存策略。
+不同 microbatch 按 token 范围的交集关联。首层保留初始 KV 已位于 DRAM 的
+稳态假设；末层的 look-ahead 读取仍显示，但在当前有限图内没有消费者。
+Flash 实际读取时间由数据量和带宽决定，端口仍与普通权重读取竞争。
+点击事件可查看 `component`、`partition_chain`、`global_dimensions`、
+`mapped_pu_dimensions`、`weight_source`、层号和 token 范围。映射维度是完整
+batch 的计划形状，计算事件自身的 B/M/K/N 则是该微批次实际执行的形状。
+JSON 的 `otherData` 保存实验配置；事件时间戳使用微秒，args 中保留纳秒值。
+
+`Simulator.run_and_trace(..., mapping_result=mapped)` 会自动携带映射信息；
+已有 `SimulationResult` 也可以调用
+`export_perfetto_trace(result, mapping_result=mapped)`。
+`run_sa` 导出的搜索结果 trace 同样包含这些信息。

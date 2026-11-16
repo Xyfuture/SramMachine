@@ -7,6 +7,7 @@ from typing import Mapping
 
 AXES = ("B", "M", "K", "N")
 ATTENTION_AXES = ("B", "S")
+MSA_AXES = ("B", "H", "S")
 
 
 @dataclass(frozen=True)
@@ -18,8 +19,8 @@ class SplitStep:
     factor: int
 
     def __post_init__(self) -> None:
-        if self.dimension not in (*AXES, "S") or self.pu_dimension not in ("p", "q"):
-            raise ValueError("split dimensions must be B/M/K/N/S and p/q")
+        if self.dimension not in (*AXES, "S", "H") or self.pu_dimension not in ("p", "q"):
+            raise ValueError("split dimensions must be B/M/K/N/S/H and p/q")
         if type(self.factor) is not int or self.factor < 1:
             raise ValueError("split factor must be a positive integer")
 
@@ -69,10 +70,10 @@ class PartitionChain:
 
     def tile_ranges(self, shape: Mapping[str, int], p: int, q: int) -> dict:
         """Return each PU's clipped half-open logical index ranges."""
-        if set(shape) not in (set(AXES), set(ATTENTION_AXES)) or any(
+        if set(shape) not in (set(AXES), set(ATTENTION_AXES), set(MSA_AXES)) or any(
             type(size) is not int or size < 1 for size in shape.values()
         ):
-            raise ValueError("shape must contain positive integer B/M/K/N or B/S")
+            raise ValueError("shape must contain positive integer B/M/K/N, B/S or B/H/S")
         if any(step.dimension not in shape for step in self.steps):
             raise ValueError("partition dimension is not present in the logical shape")
         for coord, extent in zip((p, q), self.grid_shape):
@@ -126,6 +127,36 @@ class PartitionChain:
             sum(stop - start for start, stop, count in row if count == shape["S"]),
             sum(stop - start for start, stop, count in row if count < shape["S"]),
         ) for row in self.sequence_coverage_per_row(shape))
+
+    def attention_groups_per_row(self, shape: Mapping[str, int]) -> tuple:
+        """Count complete/partial (request, KV-head) pairs after S merging.
+
+        Heads own distinct caches and never reduce across H. Sweep interval
+        boundaries so the cost does not depend on the logical batch size.
+        """
+        if set(shape) != set(MSA_AXES):
+            raise ValueError("MSA shape must contain B/H/S")
+        rows, columns = self.grid_shape
+        result = []
+        for p in range(rows):
+            tiles = [self.tile_ranges(shape, p, q) for q in range(columns)]
+            tiles = [tile for tile in tiles
+                     if all(stop > start for start, stop in tile.values())]
+            endpoints = sorted({v for tile in tiles for v in tile["B"]})
+            complete = partial = 0
+            for start, stop in zip(endpoints, endpoints[1:]):
+                active = [tile for tile in tiles if tile["B"][0] <= start < tile["B"][1]]
+                heads = sorted({v for tile in active for v in tile["H"]})
+                for h_start, h_stop in zip(heads, heads[1:]):
+                    count = _union_volume(tuple((tile["S"],) for tile in active
+                                                if tile["H"][0] <= h_start < tile["H"][1]))
+                    pairs = (stop - start) * (h_stop - h_start)
+                    if count == shape["S"]:
+                        complete += pairs
+                    elif count:
+                        partial += pairs
+            result.append((complete, partial))
+        return tuple(result)
 
     def compute_shape(self, shape: Mapping[str, int]) -> dict:
         """Largest active PU tile (the all-zero coordinate), without padding."""

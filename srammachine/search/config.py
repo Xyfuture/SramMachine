@@ -1,4 +1,4 @@
-"""Configuration for SplitTree simulated annealing."""
+"""Direct-execution controls; SplitTree simulated annealing is disabled."""
 
 from dataclasses import dataclass, field
 import hashlib
@@ -13,7 +13,7 @@ def _positive_integer(name: str, value: int) -> None:
 
 @dataclass(frozen=True)
 class SimulatedAnnealingConfig:
-    """Immutable controls for direct execution or per-workload tree search."""
+    """Immutable direct-run controls; requesting tree search raises immediately."""
 
     enabled: bool = False
     batch_sizes: Tuple[int, ...] = ()
@@ -27,10 +27,17 @@ class SimulatedAnnealingConfig:
     layer_count: int = 4
     output_dir: Path = field(default_factory=lambda: Path("best split tree result"))
     write_result: bool = True
+    optimize_partition_chains: bool = True
 
     def __post_init__(self) -> None:
         if type(self.enabled) is not bool:
             raise TypeError("enabled must be a boolean")
+        if self.enabled:
+            raise NotImplementedError(
+                "SplitTree search is disabled; use PartitionChain optimization with enabled=False."
+            )
+        if type(self.optimize_partition_chains) is not bool:
+            raise TypeError("optimize_partition_chains must be a boolean")
         batches = tuple(self.batch_sizes)
         if any(type(batch) is not int or batch <= 0 for batch in batches):
             raise ValueError("batch_sizes must contain positive integers")

@@ -86,6 +86,36 @@ def load_pareto_split_tree(
     return split_tree_from_dict(tree)
 
 
+def load_pareto_partition_chains(
+    path: str | Path, *, point_index: int = 0, tree_index: int = 0,
+) -> dict[str, Any]:
+    """Load the selected tree's saved layouts; old files return an empty profile."""
+    if type(point_index) is not int or point_index < 0:
+        raise ValueError("point_index must be a nonnegative integer")
+    if type(tree_index) is not int or tree_index < 0:
+        raise ValueError("tree_index must be a nonnegative integer")
+    with Path(path).open(encoding="utf-8") as stream:
+        payload = json.load(stream)
+    try:
+        point = payload["pareto_front"][point_index]
+        if "split_tree_records" in point:
+            record = point["split_tree_records"][tree_index]
+            profile = record.get("partition_chains", point.get("partition_chains"))
+        else:
+            point["split_trees"][tree_index]  # Check that the requested tree exists.
+            profile = point.get("partition_chains")
+    except (KeyError, IndexError, TypeError) as error:
+        raise ValueError("Pareto file does not contain the requested tree") from error
+    if profile is None:
+        if payload.get("partition_optimization_enabled", False):
+            raise ValueError("optimized result is missing its saved PartitionChains")
+        return {}
+    if not isinstance(profile, dict):
+        raise ValueError("saved PartitionChains must be an operator mapping")
+    return profile
+
+
 __all__ = [
     "split_tree_to_dict", "split_tree_from_dict", "load_pareto_split_tree",
+    "load_pareto_partition_chains",
 ]

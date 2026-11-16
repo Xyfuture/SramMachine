@@ -127,8 +127,8 @@ class FlashAttentionPartitionTests(unittest.TestCase):
     def test_dynamic_kv_read_without_legacy_broadcast_node(self):
         op = self.op()
         graph = self.parse(op, mapping=OperatorMapping(
-            "B", "chip0.pu0", "chip0.dram", "chip0.sram",
-            sram_read_bytes_per_mapped_token=32, sram_read_data_kind="flash_kv",
+            "B", "chip0.pu0", "chip0.dram",
+            dram_read_bytes_per_token=32,
         ))
         self.assertGreater(GraphExecutor.simulate(graph).total_time_ns, 0)
 

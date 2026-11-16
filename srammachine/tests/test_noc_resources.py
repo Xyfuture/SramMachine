@@ -19,11 +19,11 @@ VERTICAL = "chip0.noc_vertical"
 
 
 def transfer(cmd_id, resource_id, duration=10, additional=()):
-    """Create a transfer at the default 256 bytes/ns link bandwidth."""
+    """Create a transfer at the default 128 bytes/ns link bandwidth."""
     return NoCCmd(
         cmd_id, cmd_id, resource_id,
         "PUMesh" if additional else "PUHorizontal" if resource_id == HORIZONTAL else "PUVertical",
-        duration * 256, "p2p", (0, 1),
+        duration * 128, "p2p", (0, 1),
         additional_resource_ids=additional,
     )
 
@@ -42,7 +42,7 @@ class NoCResourceTests(unittest.TestCase):
                         {op.op_id: OperatorMapping("size_bytes", cmd.resource_id)},
                     )
                     result = Simulator().run(graph)
-                    self.assertEqual(result.command_results[0].duration_ns, 11)
+                    self.assertEqual(result.command_results[0].duration_ns, 21)
                     item = result.command_results[0]
                     self.assertEqual(item.parameters["size_bytes"], 2561)
                     self.assertEqual(item.parameters["operation"], operation)
@@ -50,8 +50,8 @@ class NoCResourceTests(unittest.TestCase):
 
     def test_io_transfers_contend_while_vertical_overlaps(self):
         commands = (
-            NoCCmd("input", "input", HORIZONTAL, "FromIOdie", 2560),
-            NoCCmd("output", "output", HORIZONTAL, "ToIOdie", 2560),
+            NoCCmd("input", "input", HORIZONTAL, "FromIOdie", 1280),
+            NoCCmd("output", "output", HORIZONTAL, "ToIOdie", 1280),
             transfer("vertical", VERTICAL, 20),
         )
         result = GraphExecutor.simulate(CommandGraph(commands))
@@ -179,7 +179,7 @@ class NoCResourceTests(unittest.TestCase):
 
     def test_mapper_migrates_resources_and_supports_special_collectives(self):
         request = HardwareMappingRequest(
-            "deepseek-v3", InferenceConfig(256, 20000, 600, MoEParallelStrategy.TP),
+            "deepseek-v3", InferenceConfig(256, 20000, 600, MoEParallelStrategy.EP),
         )
         mapped = HardwareMapper().map(request)
         graph = TreeParser().parse(

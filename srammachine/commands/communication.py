@@ -44,10 +44,16 @@ class NoCCmd(Command):
     attention_partial_batches_per_row: Tuple[int, ...] = field(default=(), kw_only=True)
     top_k: Optional[int] = field(default=None, kw_only=True)
     topk_candidates_per_row: Tuple[int, ...] = field(default=(), kw_only=True)
+    topk_selection_unit: str = field(default="token", kw_only=True)
+    attention_count_unit: str = field(default="request", kw_only=True)
     scope: ClassVar[str] = "intra_chip"
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.topk_selection_unit not in ("token", "block"):
+            raise ValueError("topk_selection_unit must be token or block")
+        if self.attention_count_unit not in ("request", "request_kv_head"):
+            raise ValueError("invalid attention_count_unit")
         checked = NoCOp(self.op_id, self.operation, self.size_bytes,
                         self.kind, self.group)
         chip_id, separator, _ = self.resource_id.rpartition(".")

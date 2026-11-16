@@ -11,3 +11,8 @@ __all__ = [
 ]
 
 from .partition import PartitionChain, SplitStep
+from .memory import WeightMemory, WeightSource
+from .minimax import FlashMSAOp, MiniMaxFusedIndexerScoreOp
+
+__all__ += ["WeightMemory", "WeightSource"]
+__all__ += ["FlashMSAOp", "MiniMaxFusedIndexerScoreOp"]

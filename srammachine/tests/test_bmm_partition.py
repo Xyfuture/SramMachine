@@ -3,7 +3,7 @@
 import itertools
 import unittest
 
-from srammachine.commands import GemmCmd, NoCCmd
+from srammachine.commands import GemmCmd, NoCCmd, PUMemoryReadCmd
 from srammachine.frontend.modules import BMMOp, PartitionChain, SplitStep
 from srammachine.pipetree.mapping import OperatorMapping
 from srammachine.pipetree.parser import TreeParser
@@ -96,10 +96,10 @@ class BMMPartitionLoweringTests(unittest.TestCase):
             (("K", "p", 3), ("N", "q", 4))))
         graph = self.parse(op)
         commands = {cmd.cmd_id: cmd for cmd in graph.commands}
-        self.assertEqual(len(commands), 3)
+        self.assertEqual(len(commands), 4)
         core = commands["i0.core"]
         self.assertEqual((core.B, core.M, core.K, core.N), (2, 4, 4, 4))
-        self.assertEqual(core.weight_load_bytes, 32)
+        self.assertEqual(graph.command("i0.weight.dram.0").size_bytes, 32)
         self.assertEqual(commands["i0.input"].io_bytes_per_row, (64, 64, 64))
         self.assertEqual(commands["i0.output"].io_bytes_per_row, (256, 256, 256))
         self.assertIn(("i0.input", "i0.core"), graph.edges)
@@ -108,7 +108,7 @@ class BMMPartitionLoweringTests(unittest.TestCase):
         self.assertGreater(result.total_time_ns, 0)
 
     def test_optional_routes_and_vertical_resource(self):
-        for route, count in (("none", 1), ("pu_vertical", 2)):
+        for route, count in (("none", 3), ("pu_vertical", 3)):
             with self.subTest(route=route):
                 op = BMMOp("a", 1, 4, 8, 16, input_source="none",
                            output_destination=route,
@@ -146,8 +146,10 @@ class BMMPartitionLoweringTests(unittest.TestCase):
         graph = self.parse(op)
         core = graph.command("i0.core")
         hardware = DEFAULT_HARDWARE_CONFIG
-        rate = hardware.chip.logic_die.processing_unit.weight_bandwidth_bytes_per_second
-        weight_ns = (core.weight_load_bytes * 1_000_000_000 + rate - 1) // rate
+        rate = hardware.chip.logic_die.processing_unit.dram_bandwidth_bytes_per_second
+        weight_bytes = sum(c.size_bytes for c in graph.commands
+                           if isinstance(c, PUMemoryReadCmd))
+        weight_ns = (weight_bytes * 1_000_000_000 + rate - 1) // rate
         result = GraphExecutor.simulate(graph)
         self.assertEqual(result.total_time_ns, max(
             weight_ns, systolic_gemm_duration_ns(core, hardware),
@@ -166,8 +168,7 @@ class BMMPartitionLoweringTests(unittest.TestCase):
 
     def test_shared_weights(self):
         graph = self.parse(BMMOp("a", 3, 2, 5, 7, shared_weight=True))
-        core = next(c for c in graph.commands if isinstance(c, GemmCmd))
-        self.assertEqual(core.weight_load_bytes, 35)
+        self.assertEqual(graph.command("i0.weight.dram.0").size_bytes, 35)
 
 
 if __name__ == "__main__":

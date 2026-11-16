@@ -23,7 +23,7 @@ class InferenceConfig:
     The current simulator models decoding only.  ``input_sequence_length`` is
     therefore the context length used by the representative decode step.
     Query length and derived history length are not stored.  KV-cache dtype is
-    workload-selectable because it directly changes both DRAM and SRAM traffic;
+    workload-selectable because it directly changes cache traffic from DRAM or Flash;
     activation and weight dtypes remain properties of the hardware path.
     ``mtp_enabled`` force-applies the simulator's ideal MTP1 model: one extra
     prediction token is evaluated and always accepted.  This what-if switch is
@@ -33,7 +33,7 @@ class InferenceConfig:
     global_batch_size: int
     input_sequence_length: int
     output_sequence_length: int
-    moe_parallel_strategy: MoEParallelStrategy = MoEParallelStrategy.TP
+    moe_parallel_strategy: MoEParallelStrategy = MoEParallelStrategy.EP
     kv_cache_dtype: str = "fp8"
     mtp_enabled: bool = False
 

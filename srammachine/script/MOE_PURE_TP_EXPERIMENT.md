@@ -10,10 +10,10 @@ every locally owned expert likewise uses the full K8×N8 PU mesh. There are no
 BS thresholds or token groups. Attention, the existing FP8 activation policy
 and the 1.6 TB/s per-direction Fabric configuration are unchanged.
 
-The MoE weight prefetch and weight load commands charge the whole chip's
-FP8 Up/Gate or Down weight bytes at four times one die's DRAM or SRAM
-bandwidth. The chip SRAM capacity used by the prefetch scheduler is likewise
-four times one die's capacity. GEMM commands still show one PU's K×N shard.
+MoE weights stream directly from each PU's DRAM port. Each transfer charges
+only that PU's FP8 Up/Gate or Down shard, once per invocation. There is no
+intermediate SRAM or capacity-based expert wave splitting. GEMM commands
+show the corresponding PU's K×N shard.
 SiLU and residual vector commands use the four vector units' combined peak.
 
 Up/Gate input and Down output each charge the complete chip-level FP8 tensor

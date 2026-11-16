@@ -2,23 +2,24 @@
 
 V1 assumes a token-preserving linear operator flow. It does not infer residual
 branches, expert routing, cross-request dependencies or physical memory layout.
-One representative stack models the identical SRAM pressure of every stack.
 """
 from copy import deepcopy
 from dataclasses import replace
+import math
 from typing import Iterator, Mapping, Tuple
 
 from srammachine.commands import (
-    CommandGraph, CommandTrace, DramReadCmd, DramWriteCmd,
-    FlashAttentionCmd,
+    CommandGraph, CommandTrace, DramReadCmd, DramWriteCmd, PUMemoryReadCmd,
+    FlashAttentionCmd, FlashMSACmd, MiniMaxFusedIndexerScoreCmd,
     FusedIndexerScoreCmd, GemmCmd,
     VectorCmd, NoCCmd, InterChipCmd,
 )
 from srammachine.commands.base import integer
 from srammachine.frontend.modules import (
-    BMMOp, BMMOutputDestination, FabricOp, FlashAttentionOp, FusedIndexerScoreOp, NoCOp, Operator, VectorOp,
+    BMMOp, BMMOutputDestination, FabricOp, FlashAttentionOp, FusedIndexerScoreOp, NoCOp, Operator, VectorOp, WeightMemory, WeightSource,
 )
 from srammachine.hardware import DEFAULT_HARDWARE_CONFIG, HardwareConfig
+from srammachine.frontend.modules import FlashMSAOp, MiniMaxFusedIndexerScoreOp
 from .mapping import OperatorMapping
 from .tree import GroupNode, Node, OpInstance, OpNode, PipeTree
 
@@ -42,13 +43,13 @@ class TreeParser:
         """Generate four consecutive layers by default, as in the design diagram.
 
         This repeats one layer template, not four different model layer types.
-        Each layer has its own prefetch and command IDs but shares hardware
+        Each layer has its own command IDs but shares hardware
         resource IDs. Pass layer_count=1 to inspect the original single layer.
         """
         integer("layer_count", layer_count, 1)
         single = self._parse_one_layer(tree, operators, mappings)
         if layer_count == 1:
-            return single
+            return self._link_kv_prefetch(single)
 
         # 原设计流程图要求复制单层 CommandGraph，模拟连续四层。
         # 保留原 op_id 以查询模型算子，使用 layer_index 区分不同层。
@@ -73,6 +74,7 @@ class TreeParser:
                 j += 1
 
         commands, edges, traces = [], [], {}
+        start_edges = []
         for layer in range(layer_count):
             prefix = f"layer{layer}."
             for cmd in single.commands:
@@ -88,6 +90,8 @@ class TreeParser:
                 commands.append(copied)
                 traces[copied_id] = replace(single.traces[cmd.cmd_id], layer_index=layer)
             edges.extend((prefix + source, prefix + target) for source, target in single.edges)
+            start_edges.extend((prefix + source, prefix + target)
+                               for source, target in single.start_edges)
             if layer:
                 # 仅连接前层输出到后层对应 token 的计算，不能把所有图根节点
                 # 都串起来；后层 DRAM 读取仍允许提前执行。
@@ -95,8 +99,48 @@ class TreeParser:
                 previous = f"layer{layer - 1}."
                 edges.extend((previous + source, prefix + target)
                              for source, target in boundary_edges)
-        graph = CommandGraph(commands, edges, traces=traces)
-        return graph
+        graph = CommandGraph(commands, edges, start_edges=start_edges, traces=traces)
+        return self._link_kv_prefetch(graph)
+
+    @staticmethod
+    def _link_kv_prefetch(graph: CommandGraph) -> CommandGraph:
+        """Fork XFold KV reads beside FC2 and join next-layer Attention outputs.
+
+        Token-range overlap pairs independently partitioned producer/consumer
+        instances. Layer zero uses the mapper's initial DRAM cache assumption;
+        the last layer's look-ahead read has no consumer inside this graph.
+        """
+        reads = [command for command in graph.commands
+                 if isinstance(command, PUMemoryReadCmd)
+                 and command.data_kind == "next_layer_kv"]
+        if not reads:
+            return graph
+        cores = {}
+        attention = {}
+        for command in graph.commands:
+            trace = graph.traces[command.cmd_id]
+            if command.cmd_id.endswith(".core"):
+                cores[trace.layer_index, trace.instance_index] = command.cmd_id
+            if isinstance(command, FlashAttentionCmd):
+                attention.setdefault(trace.layer_index, []).append(command.cmd_id)
+        edges, start_edges = list(graph.edges), list(graph.start_edges)
+        for read in reads:
+            source = graph.traces[read.cmd_id]
+            fc2 = cores[source.layer_index, source.instance_index]
+            edges.extend((parent, read.cmd_id) for parent in graph.predecessors(fc2))
+            start_edges.extend((parent, read.cmd_id)
+                               for parent in graph.start_predecessors(fc2))
+            for target_id in attention.get(source.layer_index + 1, ()):
+                target = graph.traces[target_id]
+                if max(source.token_start, target.token_start) < min(
+                    source.token_stop, target.token_stop,
+                ):
+                    edges.extend((read.cmd_id, successor)
+                                 for successor in graph.successors(target_id))
+        return CommandGraph(
+            graph.commands, edges, start_edges=start_edges, traces=graph.traces,
+            scheduling_priorities=graph.scheduling_priorities,
+        )
 
     def _parse_one_layer(
         self, tree: PipeTree, operators: Mapping[str, Operator],
@@ -121,6 +165,12 @@ class TreeParser:
                 raise ValueError("additional resources require intra-chip NoC")
             # Snapshot and revalidate mutable model operators without changing them.
             op = replace(op)
+            if mapping.ep_routing is not None:
+                routing = mapping.ep_routing
+                if (not isinstance(op, FabricOp) or op.kind != "alltoall"
+                        or op.group != tuple(range(routing.chip_count))
+                        or op.transfer_bytes != routing.transfer_bytes(0, tree.batch_size, tree.batch_size)):
+                    raise ValueError("EP routing must match the full-batch FabricOp")
             axes = (("B", "M") if isinstance(op, (BMMOp, FlashAttentionOp)) else
                     ("m",) if isinstance(op, VectorOp) else ("size_bytes",))
             if mapping.batch_axis not in axes:
@@ -132,12 +182,13 @@ class TreeParser:
         for instance in instances:
             by_op[instance.op_id].append(instance)
         commands, edges, traces = [], [], {}
-        def emit(cmd, instance, once=False):
+        start_edges = []
+        def emit(cmd, instance):
             commands.append(cmd)
             traces[cmd.cmd_id] = CommandTrace(
-                None if once else instance.index,
-                0 if once else instance.token_start,
-                tree.batch_size if once else instance.token_stop,
+                instance.index,
+                instance.token_start,
+                instance.token_stop,
                 instance.node_path,
             )
             return cmd.cmd_id
@@ -158,14 +209,7 @@ class TreeParser:
                 mapping.demand_batch_partition_degree
                 or mapping.batch_partition_degree,
             )
-            memory_bytes = mapping.dram_read_once_bytes
-            if mapping.dram_read_once_bytes:
-                emit(DramReadCmd(
-                    prefix + ".weight_read", op_id, mapping.dram_resource_id,
-                    mapping.dram_read_once_bytes,
-                    logical_size_bytes=mapping.dram_read_once_logical_bytes,
-                    shared_die_factor=mapping.shared_die_factor,
-                ), instance)
+            memory_bytes = 0
             if mapping.dram_read_bytes_per_token:
                 read_id = emit(DramReadCmd(
                     prefix + ".read", op_id, mapping.dram_resource_id,
@@ -180,43 +224,33 @@ class TreeParser:
                 ), instance)
                 dynamic_dram_reads[instance.index] = read_id
                 memory_bytes += demand_batch * mapping.dram_read_bytes_per_token
-            load_bytes = (mapping.weight_load_fixed_bytes
-                          + mapped_batch * mapping.weight_load_bytes_per_token)
-            if load_bytes:
-                emit(DramReadCmd(
-                    prefix + ".load", op_id, mapping.dram_resource_id, load_bytes,
-                    logical_size_bytes=(
-                        (mapping.weight_load_logical_fixed_bytes or 0)
-                        + mapped_batch
-                        * (mapping.weight_load_logical_bytes_per_token or 0)
-                        if (
-                            mapping.weight_load_logical_fixed_bytes is not None
-                            or mapping.weight_load_logical_bytes_per_token
-                            is not None
-                        ) else None
-                    ),
-                    shared_die_factor=mapping.shared_die_factor,
-                ), instance)
-                memory_bytes += load_bytes
-            if mapping.sram_read_bytes_per_mapped_token:
-                sram_read = emit(DramReadCmd(
-                    prefix + ".sram_read", op_id, mapping.dram_resource_id,
-                    demand_batch * mapping.sram_read_bytes_per_mapped_token,
-                    logical_size_bytes=(
-                        demand_batch
-                        * mapping.sram_read_logical_bytes_per_mapped_token
-                        if mapping.sram_read_logical_bytes_per_mapped_token
-                        is not None else None
-                    ),
-                    shared_die_factor=mapping.shared_die_factor,
-                ), instance)
-                dynamic_dram_reads[instance.index] = sram_read
-                memory_bytes += demand_batch * mapping.sram_read_bytes_per_mapped_token
-
             core = self._core_command(
                 prefix + ".core", op, mapping, instance, tree.batch_size,
                 memory_bytes=memory_bytes,
             )
+            streams = []
+            if op.weight_memory is not None:
+                if memory_bytes or mapping.weight_read_fixed_bytes:
+                    raise ValueError("explicit weight_memory cannot mix with legacy memory mappings")
+                streams = self._memory_streams(op, core, mapping, instance)
+            elif mapping.weight_read_fixed_bytes:
+                if not isinstance(op, BMMOp):
+                    raise ValueError("weight_read_fixed_bytes requires a BMM operator")
+                pu = (mapping.hardware_config or self.hardware_config).chip.logic_die.processing_unit
+                streams = [("dram", mapping.weight_read_fixed_bytes,
+                            pu.dram_bandwidth_bytes_per_second, "weight")]
+            elif isinstance(op, BMMOp) and op.auto_weight_load and not memory_bytes:
+                streams = self._memory_streams(op, core, mapping, instance)
+            if streams:
+                port_durations = {}
+                for port, size, rate, kind in streams:
+                    if kind == "next_layer_kv":
+                        continue  # Independent XFold read, not FC2 execution time.
+                    port_durations[port] = (
+                        port_durations.get(port, 0) + math.ceil(size * 1e9 / rate)
+                    )
+                duration = max(port_durations.values(), default=0)
+                core = replace(core, memory_duration_ns=duration)
             core_ids[instance.index] = emit(core, instance)
             entry_ids[instance.index] = core.cmd_id
             exit_ids[instance.index] = core.cmd_id
@@ -230,6 +264,8 @@ class TreeParser:
                                  if isinstance(op, FlashAttentionOp) else {
                     axis: getattr(logical, axis) for axis in ("B", "M", "K", "N")
                 })
+                if isinstance(op, FlashMSAOp):
+                    logical_shape["H"] = logical.H
                 volumes = op.communication_volumes(logical_shape)
                 chip_id = mapping.resource_id.split(".")[0]
                 for suffix, operation, rows, size, kind in (
@@ -243,7 +279,7 @@ class TreeParser:
                      "reduce" if op.output_destination ==
                      BMMOutputDestination.PU_VERTICAL else None),
                 ):
-                    if not size:
+                    if not size and not ((streams or memory_bytes) and suffix == "output"):
                         continue
                     direction = "vertical" if operation == "PUVertical" else "horizontal"
                     comm_id = emit(NoCCmd(
@@ -257,12 +293,14 @@ class TreeParser:
                             volumes["partial_batches_per_row"]
                             if isinstance(op, FlashAttentionOp) and suffix == "output" else ()
                         ),
-                        top_k=(op.top_k if isinstance(op, FusedIndexerScoreOp)
-                               and suffix == "output" else None),
+                        top_k=(op.top_k if isinstance(op, (FusedIndexerScoreOp, MiniMaxFusedIndexerScoreOp))
+                               and suffix == "output" and rows else None),
                         topk_candidates_per_row=(
                             volumes["topk_candidates_per_row"]
-                            if isinstance(op, FusedIndexerScoreOp) and suffix == "output" else ()
+                            if isinstance(op, (FusedIndexerScoreOp, MiniMaxFusedIndexerScoreOp)) and suffix == "output" and rows else ()
                         ),
+                        topk_selection_unit=("block" if isinstance(op, MiniMaxFusedIndexerScoreOp) else "token"),
+                        attention_count_unit=("request_kv_head" if isinstance(op, FlashMSAOp) else "request"),
                     ), instance)
                     if suffix == "input":
                         entry_ids[instance.index] = comm_id
@@ -270,6 +308,21 @@ class TreeParser:
                     else:
                         exit_ids[instance.index] = comm_id
                         edges.append((core.cmd_id, comm_id))
+            if instance.index in dynamic_dram_reads:
+                edges.append((dynamic_dram_reads[instance.index], exit_ids[instance.index]))
+            for stream_index, (port, size, rate, kind) in enumerate(streams):
+                read_id = emit(PUMemoryReadCmd(
+                    f"{prefix}.{kind}.{port}.{stream_index}", op_id,
+                    f"{mapping.resource_id}.{port}", size, port, rate, kind,
+                ), instance)
+                if kind == "next_layer_kv":
+                    # Wired after layer expansion so this read shares FC2's
+                    # predecessors and next-layer Attention's successors.
+                    continue
+                start_edges.append((core.cmd_id, read_id))
+                # Streaming overlaps arithmetic. Completion of the Op (and
+                # layer boundary) waits for its own operand streams.
+                edges.append((read_id, exit_ids[instance.index]))
             if mapping.dram_write_bytes_per_token:
                 write = emit(DramWriteCmd(
                     prefix + ".write", op_id, mapping.dram_resource_id,
@@ -282,7 +335,7 @@ class TreeParser:
                     ),
                     shared_die_factor=mapping.shared_die_factor,
                 ), instance)
-                edges.append((core.cmd_id, write))
+                edges.append((exit_ids[instance.index], write))
 
         # Each operator's intervals are ordered and partition the full batch.
         # Merge adjacent partitions in linear time, connecting every overlap.
@@ -300,8 +353,8 @@ class TreeParser:
 
         # A dynamic right operand is a demand read, not a look-ahead weight
         # load.  Open it at the same BMM-block boundary as the explicit input
-        # broadcast so the two resources can run in parallel.  The GEMM waits
-        # for both through their independent edges.
+        # broadcast so the two resources can run in parallel. Operator output
+        # waits for both the memory transfer and the compute command.
         order_index = {
             op_id: index for index, op_id in enumerate(tree.operator_order)
         }
@@ -336,28 +389,52 @@ class TreeParser:
                 ):
                     edges.append((core_ids[source.index], dram_read))
 
-        return CommandGraph(commands, edges, traces=traces)
+        return CommandGraph(commands, edges, start_edges=start_edges, traces=traces)
+
+    def _memory_streams(self, op, core, mapping, instance):
+        """Lower weights/cache for the representative active PU tile."""
+        pu = (mapping.hardware_config or self.hardware_config).chip.logic_die.processing_unit
+        if isinstance(op, FlashAttentionOp):
+            requests = self._mapped_batch_size(core.B, mapping.cache_query_group_size)
+            size = requests * core.qk_N * core.qk_K * op.kv_cache_dtype_bytes
+            if isinstance(op, FlashMSAOp):
+                size = requests * core.H * core.qk_N * (core.qk_K + core.sv_N) * op.kv_cache_dtype_bytes
+            kind = "kv_cache"
+        elif isinstance(op, BMMOp):
+            size = (1 if op.shared_weight else core.B) * core.K * core.N * op.weight_dtype_bytes
+            if isinstance(op, (FusedIndexerScoreOp, MiniMaxFusedIndexerScoreOp)):
+                requests = self._mapped_batch_size(core.B, mapping.cache_query_group_size)
+                size = requests * core.K * core.N * op.weight_dtype_bytes
+            kind = "indexer_cache" if isinstance(op, (FusedIndexerScoreOp, MiniMaxFusedIndexerScoreOp)) else "weight"
+        else:
+            raise TypeError("explicit memory policy requires BMM or FlashAttention")
+        if mapping.cache_read_bytes_per_request is not None:
+            requests = self._mapped_batch_size(
+                instance.batch_size,
+                mapping.demand_batch_partition_degree or mapping.batch_partition_degree,
+            )
+            size = math.ceil(requests * mapping.cache_read_bytes_per_request)
+        policy = op.weight_memory or WeightMemory(WeightSource.DRAM)
+        streams = [(*transfer, kind) for transfer in policy.transfers(
+            size, pu.dram_bandwidth_bytes_per_second,
+            pu.flash_bandwidth_bytes_per_second,
+        )]
+        if op.flash_prefetch_bytes_per_request:
+            # The prefetch is independent of FC2's expert/K/N partition. All
+            # chip-local requests' selected KV entries are striped over its grid.
+            count = math.prod(op.partition_chain.grid_shape)
+            requests = self._mapped_batch_size(
+                instance.batch_size, mapping.demand_batch_partition_degree or 1,
+            )
+            size = requests * op.flash_prefetch_bytes_per_request / count
+            rate = (op.weight_memory.flash_bandwidth_bytes_per_second
+                    or pu.flash_bandwidth_bytes_per_second)
+            streams.append(("flash", size, rate, "next_layer_kv"))
+        return streams
 
     @staticmethod
     def _mapped_batch_size(batch: int, partition_degree: int) -> int:
         return (batch + partition_degree - 1) // partition_degree
-
-    @staticmethod
-    def _weight_shape(op, size_bytes):
-        if not isinstance(op, BMMOp):
-            return {"size_bytes": size_bytes}
-        matrix_elements = op.K * op.N
-        weight_batches, remainder = divmod(size_bytes, matrix_elements)
-        shape = {"K": op.K, "N": op.N, "size_bytes": size_bytes}
-        if remainder == 0 and weight_batches:
-            shape["B"] = weight_batches
-        return shape
-
-    @classmethod
-    def _prefetch_weight_shape(cls, op, mapping, size_bytes):
-        if mapping.weight_shape is None:
-            return cls._weight_shape(op, size_bytes)
-        return dict(mapping.weight_shape, size_bytes=size_bytes)
 
     @staticmethod
     def _core_command(cmd_id, op, mapping, instance, full_batch, *, memory_bytes=0, partition=True):
@@ -411,32 +488,30 @@ class TreeParser:
             dimensions = {name: getattr(op, name) for name in ("B", "M", "K", "N")}
             dimensions[mapping.batch_axis] = scale(dimensions[mapping.batch_axis])
             if partition:
-                if isinstance(op, FusedIndexerScoreOp):
+                if isinstance(op, (FusedIndexerScoreOp, MiniMaxFusedIndexerScoreOp)):
                     local = op.partition_chain.compute_shape(
                         {"B": dimensions["B"], "S": dimensions["N"]},
                     )
                     dimensions.update(B=local["B"], N=local["S"])
                 else:
                     dimensions = op.partition_chain.compute_shape(dimensions)
-            weight_load_bytes = 0
-            if partition and op.auto_weight_load and not memory_bytes:
-                weight_load_bytes = (
-                    (1 if op.shared_weight else dimensions["B"])
-                    * dimensions["K"] * dimensions["N"] * op.weight_dtype_bytes
-                )
             command_type = (
                 FusedIndexerScoreCmd
                 if isinstance(op, FusedIndexerScoreOp) else GemmCmd
             )
             if isinstance(op, FusedIndexerScoreOp):
                 dimensions["top_k"] = op.top_k
+                dimensions["queries_per_request"] = op.queries_per_request
                 dimensions["main_gemm_flops_override"] = (
                     None
                     if op.main_gemm_flops_override is None
                     else scale(op.main_gemm_flops_override)
                 )
-            return command_type(**common, memory_bytes=memory_bytes,
-                                weight_load_bytes=weight_load_bytes, **dimensions)
+            elif isinstance(op, MiniMaxFusedIndexerScoreOp):
+                command_type = MiniMaxFusedIndexerScoreCmd
+                dimensions.update(top_k=op.top_k, block_size=op.block_size,
+                                  queries_per_request=op.queries_per_request)
+            return command_type(**common, memory_bytes=memory_bytes, **dimensions)
         if isinstance(op, FlashAttentionOp):
             dimensions = {
                 name: getattr(op, name)
@@ -445,12 +520,18 @@ class TreeParser:
             dimensions[mapping.batch_axis] = scale(
                 dimensions[mapping.batch_axis]
             )
+            if isinstance(op, FlashMSAOp):
+                dimensions["H"] = op.H
             if partition:
-                local = op.partition_chain.compute_shape(
-                    {"B": dimensions["B"], "S": dimensions["qk_N"]},
-                )
+                shape = {"B": dimensions["B"], "S": dimensions["qk_N"]}
+                if isinstance(op, FlashMSAOp):
+                    shape["H"] = op.H
+                local = op.partition_chain.compute_shape(shape)
                 dimensions.update(B=local["B"], qk_N=local["S"], sv_K=local["S"])
-            return FlashAttentionCmd(**common, memory_bytes=memory_bytes, **dimensions)
+                if isinstance(op, FlashMSAOp):
+                    dimensions["H"] = local["H"]
+            command_type = FlashMSACmd if isinstance(op, FlashMSAOp) else FlashAttentionCmd
+            return command_type(**common, memory_bytes=memory_bytes, **dimensions)
         if isinstance(op, VectorOp):
             return VectorCmd(**common, memory_bytes=memory_bytes, kind=op.kind, m=scale(op.m), n=op.n, params=op.params)
         if isinstance(op, NoCOp):
@@ -459,8 +540,12 @@ class TreeParser:
                 kind=op.kind, group=op.group,
                 additional_resource_ids=mapping.additional_resource_ids,
             )
-        matrix = (None if op.transfer_bytes is None else
-                  tuple(tuple(scale(value) for value in row) for row in op.transfer_bytes))
+        if mapping.ep_routing is not None:
+            matrix = mapping.ep_routing.transfer_bytes(
+                instance.token_start, instance.token_stop, full_batch)
+        else:
+            matrix = (None if op.transfer_bytes is None else
+                      tuple(tuple(scale(value) for value in row) for row in op.transfer_bytes))
         return InterChipCmd(
             **common, kind=op.kind, group=op.group,
             size_bytes=None if op.size_bytes is None else scale(op.size_bytes),

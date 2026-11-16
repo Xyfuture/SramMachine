@@ -9,6 +9,7 @@ from typing import Any, ClassVar, Dict, Optional, Tuple, Union
 from enum import Enum
 
 from .partition import PartitionChain
+from .memory import WeightMemory
 
 
 ParticipantId = Union[str, int]
@@ -30,9 +31,18 @@ class Operator:
     """An operator occurrence identified by the same ID used in OpNode."""
 
     op_id: str
+    weight_memory: WeightMemory | None = field(default=None, kw_only=True)
+    # XFold next-layer KV traffic: shares FC2's predecessors and next-layer
+    # Core Attention's successors; does not extend FC2's own duration.
+    flash_prefetch_bytes_per_request: int = field(default=0, kw_only=True)
 
     def __post_init__(self) -> None:
         _name("op_id", self.op_id)
+        if self.weight_memory is not None and not isinstance(self.weight_memory, WeightMemory):
+            raise TypeError("weight_memory must be a WeightMemory")
+        _integer("flash_prefetch_bytes_per_request", self.flash_prefetch_bytes_per_request, 0)
+        if self.flash_prefetch_bytes_per_request and self.weight_memory is None:
+            raise ValueError("Flash prefetch requires an explicit memory policy")
 
 
 class BMMInputSource(str, Enum):
@@ -116,10 +126,12 @@ class BMMOp(Operator):
 
 @dataclass
 class FusedIndexerScoreOp(BMMOp):
-    """Full-head QK/ReLU/head reduction and per-batch top-k selection.
+    """QK/ReLU with independent head reduction and top-k per query.
 
+    B counts requests; M packs queries_per_request groups of heads.
+    Queries share cached keys but never share head reduction or top-k.
     Only B and S (= N) can be partitioned. Local and row-merged candidates
-    are capped at top_k independently for each batch, not across batches.
+    are capped at top_k independently for each request/query pair.
     IO candidates carry scores and global sequence indices for further merging.
     """
 
@@ -128,10 +140,14 @@ class FusedIndexerScoreOp(BMMOp):
     main_gemm_flops_override: Optional[int] = None
     top_k: int = field(default=2048, kw_only=True)
     index_dtype_bytes: int = field(default=4, kw_only=True)
+    queries_per_request: int = field(default=1, kw_only=True)
 
     def __post_init__(self) -> None:
         super().__post_init__()
         _integer("top_k", self.top_k, 1)
+        _integer("queries_per_request", self.queries_per_request, 1)
+        if self.M % self.queries_per_request:
+            raise ValueError("M must be divisible by queries_per_request")
         _integer("index_dtype_bytes", self.index_dtype_bytes, 1)
         if self.N > 1 << (8 * self.index_dtype_bytes):
             raise ValueError("index_dtype_bytes cannot represent global sequence indices")
@@ -150,7 +166,8 @@ class FusedIndexerScoreOp(BMMOp):
         """Return Q input bytes and row-merged top-k (score, index) bytes.
 
         shape uses the existing B/M/K/N fields after microbatch scaling.
-        M heads are reduced before top-k, so output has no M multiplier.
+        Each group of M / queries_per_request heads is reduced separately.
+        Output scales with query count, not with the number of heads.
         """
         shape = shape if shape is not None else {
             axis: getattr(self, axis) for axis in ("B", "M", "K", "N")
@@ -160,7 +177,7 @@ class FusedIndexerScoreOp(BMMOp):
         coverage = self.partition_chain.sequence_coverage_per_row(
             {"B": shape["B"], "S": shape["N"]},
         )
-        candidates = tuple(sum((stop - start) * min(self.top_k, count)
+        candidates = tuple(sum((stop - start) * self.queries_per_request * min(self.top_k, count)
                                for start, stop, count in row) for row in coverage)
         return {
             "input_bytes_per_row": tuple(
@@ -192,7 +209,7 @@ class FusedIndexerScoreOp(BMMOp):
 
     @property
     def head_reduce_flops(self) -> int:
-        return self.B * self.N * (2 * self.M - 1)
+        return self.B * self.N * (2 * self.M - self.queries_per_request)
 
     @property
     def total_flops(self) -> int:
@@ -203,11 +220,14 @@ class FusedIndexerScoreOp(BMMOp):
 class FlashAttentionOp(Operator):
     """Full fused Attention, partitionable along batch B and KV sequence S.
 
+    B counts requests; M packs query tokens times heads sharing one KV cache.
     Q is the NoC input; KV storage traffic remains explicitly mapped.
     Row-local S shards merge before IO. Rows with incomplete S coverage send
     unnormalized (m, l, u) states for final merging on the IO die, not sums
     of normalized outputs. NONE leaves communication to the caller.
     """
+
+    PARTITION_AXES: ClassVar[Tuple[str, ...]] = ("B", "S")
 
     B: int
     M: int
@@ -221,6 +241,7 @@ class FlashAttentionOp(Operator):
     input_dtype_bytes: int = field(default=2, kw_only=True)
     output_dtype_bytes: int = field(default=2, kw_only=True)
     state_dtype_bytes: int = field(default=4, kw_only=True)
+    kv_cache_dtype_bytes: int = field(default=1, kw_only=True)
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -230,13 +251,13 @@ class FlashAttentionOp(Operator):
             raise ValueError("qk_N and sv_K must describe the same sequence length")
         if not isinstance(self.partition_chain, PartitionChain):
             raise TypeError("partition_chain must be a PartitionChain")
-        if any(step.dimension not in ("B", "S") for step in self.partition_chain.steps):
-            raise ValueError("FlashAttention partitions only support B/S")
+        if any(step.dimension not in self.PARTITION_AXES for step in self.partition_chain.steps):
+            raise ValueError(f"{type(self).__name__} partitions only support {self.PARTITION_AXES}")
         if self.input_source not in ("io_die", "none"):
             raise ValueError("FlashAttention input_source must be io_die or none")
         if self.output_destination not in ("io_die", "none"):
             raise ValueError("FlashAttention output_destination must be io_die or none")
-        for name in ("input_dtype_bytes", "output_dtype_bytes", "state_dtype_bytes"):
+        for name in ("input_dtype_bytes", "output_dtype_bytes", "state_dtype_bytes", "kv_cache_dtype_bytes"):
             _integer(name, getattr(self, name), 1)
 
     def communication_volumes(self, shape=None) -> dict:

@@ -1,10 +1,10 @@
-"""Run independent SplitTree SA workloads in isolated worker processes.
+"""Run PartitionChain-optimized sequential workloads in isolated processes.
 
 Invoke from the SramMachine project directory, for example::
 
     python -m srammachine.script.run_sa \
       --models deepseek-v3 deepseek-v3.2 \
-      --mtp off on --batch-sizes 256 512 --rounds 50 \
+      --mtp off on --batch-sizes 256 512 \
       --input-sequence-length 20000 --output-sequence-length 600 \
       --moe-strategy tp ep
 
@@ -32,27 +32,31 @@ from typing import Any, Callable, Iterable, Sequence
 
 from Desim.Utils import UniquePriorityQueue
 
-from srammachine.hardware import DEFAULT_HARDWARE_CONFIG
 from srammachine.inference import InferenceConfig, MoEParallelStrategy
-from srammachine.mapping import HardwareMapper, HardwareMappingRequest
+from srammachine.mapping import (
+    DEFAULT_HBF_BANDWIDTH_CSV, HBFBandwidthTable, HardwareMappingRequest, mapper_for_model,
+)
 from srammachine.pipetree import TreeParser
 from srammachine.search import (
     SimulatedAnnealingConfig,
     SplitTreeOptimizer,
     split_tree_from_dict,
     split_tree_to_dict,
+    apply_partition_chains,
+    partition_chains_to_dict,
+    derive_workload_seed,
 )
 from srammachine.simulator import Simulator, steady_pu_metrics
 
 
 SUPPORTED_MODELS = (
-    "deepseek-v3", "deepseek-v3.2", "kimi-k2.5", "glm-5.1",
+    "deepseek-v3", "deepseek-v3.2", "kimi-k2.5", "glm-5.1", "minimax-m3",
 )
 DEFAULT_SEED = SimulatedAnnealingConfig().random_seed
 DEFAULT_OUTPUT_DIR = Path("best split tree result")
-CSV_OMITTED_FIELDS = frozenset(("best_split_trees", "restart_results"))
+CSV_OMITTED_FIELDS = frozenset(("best_split_trees", "restart_results", "partition_chains"))
 CSV_FIELDNAMES = (
-    "model", "mtp_enabled", "moe_strategy", "global_batch_size",
+    "model", "xfold", "mtp_enabled", "moe_strategy", "global_batch_size",
     "input_sequence_length", "output_sequence_length", "kv_cache_dtype",
     "pareto_best_total_throughput_tokens_per_second",
     "pareto_best_single_user_throughput_per_second",
@@ -69,6 +73,9 @@ CSV_FIELDNAMES = (
     "cache_hit_count", "accepted_proposal_count",
     "is_model_global_pareto",
     "best_split_tree_path", "selected_split_tree_index", "trace_path",
+    "hbf_bandwidth_csv",
+    "optimize_partition_chains",
+    "split_tree_search_enabled",
 )
 
 
@@ -90,6 +97,9 @@ class SACase:
     final_temperature: float
     layer_count: int
     base_seed: int
+    optimize_partition_chains: bool = True
+    hbf_bandwidth_csv: str | None = str(DEFAULT_HBF_BANDWIDTH_CSV)
+    xfold: bool = False
     artifact_dir: str | None = None
     case_checkpoint_dir: str | None = None
     run_stamp: str | None = None
@@ -105,6 +115,13 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be nonnegative")
+    return parsed
+
+
 def _positive_float(value: str) -> float:
     parsed = float(value)
     if parsed <= 0:
@@ -115,9 +132,8 @@ def _positive_float(value: str) -> float:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run one independent SplitTree simulated-annealing search per "
-            "(model, MoE strategy, batch, MTP) case and export throughput "
-            "comparisons."
+            "Enumerate PartitionChains and simulate each sequential "
+            "(model, MoE strategy, batch, MTP) case. SplitTree search is disabled."
         ),
     )
     parser.add_argument("--models", nargs="+", required=True, choices=SUPPORTED_MODELS)
@@ -125,10 +141,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--batch-sizes", nargs="+", required=True, type=_positive_int,
     )
-    parser.add_argument("--rounds", required=True, type=_positive_int)
+    parser.add_argument("--split-tree-search", action="store_true",
+                        help="unsupported: requesting SplitTree search raises NotImplementedError")
+    parser.add_argument("--rounds", type=_nonnegative_int, default=0,
+                        help="legacy SA option; nonzero values raise NotImplementedError")
     parser.add_argument(
-        "--restarts", type=_positive_int, default=4,
-        help="full deterministic restarts per workload (default: 4)",
+        "--restarts", type=_nonnegative_int, default=0,
+        help="legacy SA option; nonzero values raise NotImplementedError",
     )
     parser.add_argument(
         "--input-sequence-length", nargs="+", required=True, type=_positive_int,
@@ -137,12 +156,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-sequence-length", required=True, type=_positive_int,
     )
     parser.add_argument(
-        "--moe-strategy", nargs="+", required=True, choices=("tp", "ep"),
+        "--moe-strategy", nargs="+", default=["ep"], choices=("tp", "ep"),
+        help="chip-level MoE parallel strategy (default: ep)",
     )
     parser.add_argument(
         "--kv-cache-dtype", choices=("fp8", "fp16"), default="fp8",
     )
-    parser.add_argument("--warmup-rounds", type=_positive_int, default=16)
+    parser.add_argument("--xfold", action="store_true",
+                        help="use the DSA or MiniMax MSA folding MoE path; DeepSeek V3 runs ordinary MLA")
+    parser.add_argument(
+        "--partition-optimization", dest="optimize_partition_chains",
+        action=argparse.BooleanOptionalAction, default=True,
+        help="enumerate MLA/DSA/MiniMax per-op PartitionChains before simulation (default: enabled)",
+    )
+    hbf = parser.add_mutually_exclusive_group()
+    hbf.add_argument("--hbf-bandwidth-csv", type=Path, default=DEFAULT_HBF_BANDWIDTH_CSV,
+                     help="normalized HBF measurements (default: bundled table)")
+    hbf.add_argument("--no-hbf-bandwidth", dest="hbf_bandwidth_csv", action="store_const",
+                     const=None, help="disable measured HBF bandwidths")
+    parser.add_argument("--warmup-rounds", type=_nonnegative_int, default=0,
+                        help="legacy SA option; nonzero values raise NotImplementedError")
     parser.add_argument("--initial-temperature", type=_positive_float, default=1.0)
     parser.add_argument("--final-temperature", type=_positive_float, default=0.01)
     parser.add_argument("--layer-count", type=_positive_int, default=4)
@@ -162,6 +195,10 @@ def build_parser() -> argparse.ArgumentParser:
 def _validate_args(
     parser: argparse.ArgumentParser, args: argparse.Namespace,
 ) -> argparse.Namespace:
+    if args.split_tree_search or args.rounds or args.restarts or args.warmup_rounds:
+        raise NotImplementedError("SplitTree search is disabled; omit SA options and use PartitionChain optimization.")
+    if args.xfold and any(model not in ("deepseek-v3", "deepseek-v3.2", "glm-5.1", "minimax-m3") for model in args.models):
+        parser.error("--xfold supports deepseek-v3 (ordinary), deepseek-v3.2, glm-5.1 and minimax-m3")
     if len(set(args.models)) != len(args.models):
         parser.error("--models must not contain duplicates")
     if len(set(args.mtp)) != len(args.mtp):
@@ -178,6 +215,12 @@ def _validate_args(
         parser.error("--layer-count must be at least 3 for steady-state PU utilization")
     if args.output_csv is not None and args.output_csv.exists():
         parser.error(f"--output-csv already exists: {args.output_csv}")
+    if args.hbf_bandwidth_csv is not None:
+        args.hbf_bandwidth_csv = args.hbf_bandwidth_csv.resolve()
+        try:
+            HBFBandwidthTable.from_csv(args.hbf_bandwidth_csv)
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
     # Submit the heaviest workloads first.  There is no barrier between batch
     # sizes: each replacement worker immediately takes the next queued case.
     args.batch_sizes = sorted(args.batch_sizes, reverse=True)
@@ -197,6 +240,8 @@ def _make_cases(args: argparse.Namespace) -> list[SACase]:
     return [
         SACase(
             model=model,
+            xfold=args.xfold,
+            optimize_partition_chains=args.optimize_partition_chains,
             global_batch_size=batch,
             mtp_enabled=mtp == "on",
             input_sequence_length=input_sequence_length,
@@ -210,6 +255,7 @@ def _make_cases(args: argparse.Namespace) -> list[SACase]:
             final_temperature=args.final_temperature,
             layer_count=args.layer_count,
             base_seed=args.seed,
+            hbf_bandwidth_csv=(str(args.hbf_bandwidth_csv) if args.hbf_bandwidth_csv else None),
         )
         for batch in args.batch_sizes
         for input_sequence_length in args.input_sequence_length
@@ -266,6 +312,8 @@ def _run_case(case: SACase) -> dict[str, Any]:
 
 
 def _run_case_impl(case: SACase) -> dict[str, Any]:
+    if case.rounds or case.restart_count or case.warmup_rounds:
+        raise NotImplementedError("SplitTree search is disabled; all SA round/restart counts must be zero.")
     strategy = MoEParallelStrategy(case.moe_strategy)
     request = HardwareMappingRequest(case.model, InferenceConfig(
         global_batch_size=case.global_batch_size,
@@ -274,28 +322,19 @@ def _run_case_impl(case: SACase) -> dict[str, Any]:
         moe_parallel_strategy=strategy,
         kv_cache_dtype=case.kv_cache_dtype,
         mtp_enabled=case.mtp_enabled,
-    ))
-    result = SplitTreeOptimizer().run(
-        request,
-        config=SimulatedAnnealingConfig(
-            enabled=True,
-            batch_sizes=(case.global_batch_size,),
-            mtp_values=(case.mtp_enabled,),
-            warmup_rounds=case.warmup_rounds,
-            rounds=case.rounds,
-            restart_count=case.restart_count,
-            random_seed=case.base_seed,
-            initial_temperature=case.initial_temperature,
-            final_temperature=case.final_temperature,
-            layer_count=case.layer_count,
-            write_result=False,
-        ),
+    ), xfold=case.xfold)
+    optimizer = SplitTreeOptimizer(hbf_bandwidth_csv=case.hbf_bandwidth_csv)
+    direct_config = SimulatedAnnealingConfig(
+        enabled=False, layer_count=case.layer_count, write_result=False,
+        optimize_partition_chains=False,
     )
-    if result.output_path is not None or len(result.workload_results) != 1:
-        raise RuntimeError("independent SA worker produced an invalid result")
-    workload = result.workload_results[0]
-    baseline = workload.baseline_evaluation
-    best = workload.best_evaluation
+    baseline = optimizer.run(request, config=direct_config).initial_evaluation
+    best = baseline
+    if case.optimize_partition_chains:
+        best = optimizer.run(request, config=replace(
+            direct_config, optimize_partition_chains=True,
+        )).initial_evaluation
+    simulation_count = 2 if case.optimize_partition_chains else 1
     case_fields = asdict(case)
     for internal in (
         "artifact_dir", "case_checkpoint_dir", "run_stamp",
@@ -304,20 +343,14 @@ def _run_case_impl(case: SACase) -> dict[str, Any]:
         case_fields.pop(internal)
     row = {
         **case_fields,
-        "chip_count": DEFAULT_HARDWARE_CONFIG.chip_count,
-        "case_seed": workload.random_seed,
-        "restart_count": workload.restart_count,
-        "restart_results": [
-            {
-                "restart_index": item.restart_index,
-                "random_seed": item.random_seed,
-                "proposal_count": item.proposal_count,
-                "candidate_simulation_count": item.candidate_simulation_count,
-                "cache_hit_count": item.cache_hit_count,
-                "accepted_proposal_count": item.accepted_proposal_count,
-            }
-            for item in workload.restart_results
-        ],
+        "xfold": best.mapping_result.request.xfold,
+        "chip_count": optimizer.hardware_config.chip_count,
+        "partition_chains": partition_chains_to_dict(best.mapping_result),
+        "split_tree_search_enabled": False,
+        "case_seed": derive_workload_seed(case.base_seed, case.model, case.moe_strategy,
+                                          case.global_batch_size, case.mtp_enabled),
+        "restart_count": 0,
+        "restart_results": [],
         "baseline_latency_ns": baseline.latency_ns,
         "pareto_best_latency_ns": best.latency_ns,
         "baseline_single_user_throughput_per_second": (
@@ -332,20 +365,15 @@ def _run_case_impl(case: SACase) -> dict[str, Any]:
         "pareto_best_total_throughput_tokens_per_second": (
             best.total_throughput_tokens_per_second
         ),
-        "latency_reduction_fraction": workload.latency_reduction_fraction,
-        "throughput_improvement_fraction": workload.throughput_improvement_fraction,
-        "proposal_count": workload.proposal_count,
-        "candidate_simulation_count": workload.candidate_simulation_count,
-        "materialization_simulation_count": (
-            workload.materialization_simulation_count
-        ),
-        "simulator_run_count": workload.simulator_run_count,
-        "cache_hit_count": workload.cache_hit_count,
-        "accepted_proposal_count": workload.accepted_proposal_count,
-        "best_split_trees": [
-            split_tree_to_dict(item.split_tree)
-            for item in workload.best_evaluations
-        ],
+        "latency_reduction_fraction": 1.0 - best.latency_ns / baseline.latency_ns,
+        "throughput_improvement_fraction": baseline.latency_ns / best.latency_ns - 1.0,
+        "proposal_count": 0,
+        "candidate_simulation_count": simulation_count,
+        "materialization_simulation_count": 0,
+        "simulator_run_count": simulation_count,
+        "cache_hit_count": 0,
+        "accepted_proposal_count": 0,
+        "best_split_trees": [split_tree_to_dict(best.split_tree)],
     }
     if case.artifact_dir is not None:
         _persist_case_artifacts(row, case)
@@ -510,6 +538,7 @@ def write_model_json(
             "global_batch_size": row["global_batch_size"],
             "mtp_enabled": row["mtp_enabled"],
             "split_tree": tree,
+            "partition_chains": row.get("partition_chains", {}),
         } for tree in row["best_split_trees"]]
 
     front = [{
@@ -525,6 +554,7 @@ def write_model_json(
         "case_seed": row["case_seed"],
         "split_trees": row["best_split_trees"],
         "split_tree_records": tree_records(row),
+        "partition_chains": row.get("partition_chains", {}),
     } for row in workloads if row["is_model_global_pareto"]]
     best_by_workload = [{
         "global_batch_size": row["global_batch_size"],
@@ -538,14 +568,20 @@ def write_model_json(
         ),
         "split_trees": row["best_split_trees"],
         "split_tree_records": tree_records(row),
+        "partition_chains": row.get("partition_chains", {}),
     } for row in workloads]
     first = workloads[0]
     payload = {
         "format_version": 1,
         "generated_at": generated_at,
         "model": model,
-        "hardware": {"chip_count": DEFAULT_HARDWARE_CONFIG.chip_count},
+        "hardware": {"chip_count": first["chip_count"]},
+        "xfold": first.get("xfold", False),
+        "hbf_bandwidth_csv": first.get("hbf_bandwidth_csv"),
+        "partition_optimization_enabled": first.get("optimize_partition_chains", False),
+        "split_tree_search_enabled": False,
         "search": {
+            "enabled": False,
             "moe_parallel_strategy": first["moe_strategy"],
             "mtp_enabled": mtp_enabled,
             "input_sequence_length": first["input_sequence_length"],
@@ -606,9 +642,17 @@ def write_case_trace(
             mtp_enabled=row["mtp_enabled"],
         ),
     )
-    mapping = HardwareMapper().map(request)
+    request = replace(request, xfold=row.get("xfold", False))
+    mapper = mapper_for_model(request.model_name)
+    table_path = row.get("hbf_bandwidth_csv")
+    table = HBFBandwidthTable.from_csv(table_path) if table_path else None
+    mapping = mapper.map(request, hbf_bandwidth_table=table)
+    if "partition_chains" in row:
+        mapping = apply_partition_chains(mapping, row["partition_chains"], mapper.hardware_config)
+    elif row.get("optimize_partition_chains", False):
+        raise ValueError("optimized case is missing its saved PartitionChains")
     tree = split_tree_from_dict(best_trees[tree_index])
-    graph = TreeParser().parse(
+    graph = TreeParser(mapper.hardware_config).parse(
         tree,
         mapping.operators,
         mapping.operator_mappings,
@@ -616,15 +660,17 @@ def write_case_trace(
     )
     trace_label = (
         f"{_safe_name(row['model'])}_{row['moe_strategy']}_"
-        f"mtp_{'on' if row['mtp_enabled'] else 'off'}_"
+        f"{'fold_' if row.get('xfold') else ''}mtp_{'on' if row['mtp_enabled'] else 'off'}_"
         f"bs{row['global_batch_size']}_isl{row['input_sequence_length']}"
     )
-    artifacts = Simulator().run_and_trace(
+    artifacts = Simulator(mapper.hardware_config).run_and_trace(
         graph,
         mapping_result=mapping,
         trace_label=trace_label,
         output_dir=output_dir,
     )
+    if artifacts.simulation_result.latency_ns != row["pareto_best_latency_ns"]:
+        raise RuntimeError("trace replay latency does not match the searched result")
     metrics = steady_pu_metrics(artifacts.simulation_result.command_results)
     return artifacts.trace_path, metrics["pu_utilization_percent"]
 
@@ -640,7 +686,7 @@ def _persist_case_artifacts(row: dict[str, Any], case: SACase) -> None:
     checkpoint_dir = Path(case.case_checkpoint_dir)
     case_stem = (
         f"{case.run_stamp}_{_safe_name(row['model'])}_{row['moe_strategy']}_"
-        f"mtp_{'on' if row['mtp_enabled'] else 'off'}_"
+        f"{'fold_' if row.get('xfold') else ''}mtp_{'on' if row['mtp_enabled'] else 'off'}_"
         f"bs{row['global_batch_size']}_isl{row['input_sequence_length']}_"
         "sa_case_checkpoint"
     )

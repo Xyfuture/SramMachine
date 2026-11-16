@@ -22,7 +22,7 @@ from .stages import (
     InterChipFabricStage,
     NoCResourceStage,
     ProcessingUnitStage,
-    SramResourceStage,
+    PUMemoryResourceStage,
     VectorUnitStage,
 )
 from .vector_costs import VECTOR_FLOPS_PER_ELEMENT
@@ -30,7 +30,7 @@ from .vector_costs import VECTOR_FLOPS_PER_ELEMENT
 __all__ = [
     "HardwareResourceStage",
     "DramResourceStage",
-    "SramResourceStage",
+    "PUMemoryResourceStage",
     "ProcessingUnitStage",
     "VectorUnitStage",
     "NoCResourceStage",

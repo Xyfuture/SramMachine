@@ -1,7 +1,7 @@
 [project]
 name = "srammachine"
 version = "0.1.0"
-description = "SRAM-centric AI accelerator simulator"
+description = "AI accelerator simulator with direct DRAM/Flash weight streaming"
 requires-python = ">=3.10"
 dependencies = [
     "desim",

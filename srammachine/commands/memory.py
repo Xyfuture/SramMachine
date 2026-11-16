@@ -1,7 +1,34 @@
-"""DramResource read/write actions and SramResource weight loading."""
+"""Direct DRAM/Flash transfers and DRAM writeback actions."""
 from dataclasses import dataclass, field
-from typing import Mapping, Optional
+import math
+from typing import Optional
+
 from .base import Command, integer, nonempty
+
+
+@dataclass(frozen=True)
+class PUMemoryReadCmd(Command):
+    """One independent PU port stream; fractional bytes model ideal striping."""
+
+    size_bytes: float
+    port: str
+    bandwidth_bytes_per_second: float
+    data_kind: str = "weight"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.port not in ("dram", "flash"):
+            raise ValueError("PU memory port must be dram or flash")
+        if not self.resource_id.endswith("." + self.port):
+            raise ValueError("memory resource must match the selected port")
+        for name in ("size_bytes", "bandwidth_bytes_per_second"):
+            value = getattr(self, name)
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                raise ValueError(f"{name} must be nonnegative and finite")
+        if self.bandwidth_bytes_per_second == 0:
+            raise ValueError("bandwidth must be positive")
+        nonempty("data_kind", self.data_kind)
 
 
 @dataclass(frozen=True)
@@ -23,84 +50,12 @@ class DramCmd(Command):
 
 @dataclass(frozen=True)
 class DramReadCmd(DramCmd):
-    """Read DRAM into SRAM, possibly ahead of the consuming operator."""
-
-
-@dataclass(frozen=True)
-class WeightPrefetchCmd(DramReadCmd):
-    """Prefetch a resident weight from DRAM into a stack-local SRAM."""
-
-    sram_resource_id: str
-    weight_shape: Optional[Mapping[str, int]] = None
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        nonempty("sram_resource_id", self.sram_resource_id)
-        object.__setattr__(
-            self, "weight_shape", _freeze_weight_shape(self.weight_shape),
-        )
+    """Read data directly from DRAM for the consuming operator."""
 
 
 @dataclass(frozen=True)
 class DramWriteCmd(DramCmd):
-    """Write SRAM data, such as newly generated KV entries, to DRAM."""
-
-
-@dataclass(frozen=True)
-class SramReadCmd(Command):
-    """Demand-read a dynamic right operand from SRAM into an array."""
-
-    size_bytes: int
-    data_kind: str
-    logical_size_bytes: Optional[int] = field(default=None, kw_only=True)
-    shared_die_factor: int = field(default=1, kw_only=True)
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        integer("size_bytes", self.size_bytes)
-        nonempty("data_kind", self.data_kind)
-        _validate_shared_size(
-            self.size_bytes, self.logical_size_bytes, self.shared_die_factor,
-        )
-        if self.data_kind not in (
-            "kv_nope", "kv_rope", "kv_fused", "kv_value", "flash_kv",
-            "dsa_key",
-        ):
-            raise ValueError("unsupported SRAM read data_kind")
-
-
-@dataclass(frozen=True)
-class WeightLoadCmd(Command):
-    """Supply bytes from SRAM to the array independently of DRAM access."""
-    size_bytes: int
-    weight_shape: Optional[Mapping[str, int]] = None
-    logical_size_bytes: Optional[int] = field(default=None, kw_only=True)
-    shared_die_factor: int = field(default=1, kw_only=True)
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        integer("size_bytes", self.size_bytes)
-        _validate_shared_size(
-            self.size_bytes, self.logical_size_bytes, self.shared_die_factor,
-        )
-        object.__setattr__(
-            self, "weight_shape", _freeze_weight_shape(self.weight_shape),
-        )
-
-
-def _freeze_weight_shape(
-    weight_shape: Optional[Mapping[str, int]],
-) -> Optional[Mapping[str, int]]:
-    if weight_shape is None:
-        return None
-    if not isinstance(weight_shape, Mapping):
-        raise TypeError("weight_shape must be a mapping")
-    copied = {}
-    for name, value in weight_shape.items():
-        nonempty("weight shape dimension", name)
-        integer(name, value, 0)
-        copied[name] = value
-    return copied
+    """Write PU output, such as newly generated KV entries, to DRAM."""
 
 
 def _validate_shared_size(

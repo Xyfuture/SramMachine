@@ -9,6 +9,9 @@ import re
 import tempfile
 from typing import Any, Mapping, Optional, Union
 
+from srammachine.mapping import HardwareMappingResult
+from srammachine.pipetree import GroupNode
+
 from .results import SimulationResult
 
 
@@ -62,7 +65,54 @@ def _trace_path(
     return candidate
 
 
-def _trace_payload(result: SimulationResult) -> Mapping[str, Any]:
+def _operator_metadata(mapping: HardwareMappingResult) -> dict[str, dict]:
+    """Attach model shapes and policies to every command of an operator."""
+    components = {}
+
+    def assign_component(node, name):
+        if isinstance(node, GroupNode):
+            for child in node.children:
+                assign_component(child, name)
+        else:
+            components[node.op_id] = name
+
+    if mapping.component_order:
+        for name, node in zip(mapping.component_order, mapping.root_node.root.children):
+            assign_component(node, name)
+    metadata = {}
+    for op_id, op in mapping.operators.items():
+        hardware = mapping.hardware_mappings[op_id]
+        item = {
+            "model_name": mapping.request.model_name,
+            "xfold": mapping.request.xfold,
+            "global_dimensions": dict(hardware.global_dimensions),
+            "mapped_pu_dimensions": dict(hardware.pu_dimensions),
+            "parallel_strategy": hardware.parallel_strategy,
+        }
+        if op_id in components:
+            item["component"] = components[op_id]
+        chain = getattr(op, "partition_chain", None)
+        if chain is not None:
+            item["partition_chain"] = [
+                f"{step.dimension}-{step.pu_dimension}-{step.factor}"
+                for step in chain.steps
+            ]
+            item["pu_grid"] = list(chain.grid_shape)
+        if op.weight_memory is not None:
+            item["weight_source"] = op.weight_memory.source.value
+            item["flash_bandwidth_override_bytes_per_second"] = (
+                op.weight_memory.flash_bandwidth_bytes_per_second
+            )
+        if op.flash_prefetch_bytes_per_request:
+            item["flash_prefetch_bytes_per_request"] = op.flash_prefetch_bytes_per_request
+        metadata[op_id] = item
+    return metadata
+
+
+def _trace_payload(
+    result: SimulationResult, *, mapping_result: Optional[HardwareMappingResult] = None,
+) -> Mapping[str, Any]:
+    metadata = {} if mapping_result is None else _operator_metadata(mapping_result)
     resource_ids = tuple(dict.fromkeys(
         resource_id for item in result.command_results
         for resource_id in item.resource_ids
@@ -117,6 +167,13 @@ def _trace_payload(result: SimulationResult) -> Mapping[str, Any]:
             "duration_ns": item.duration_ns,
         }
         args.update(_json_value(item.parameters))
+        args.update(metadata.get(item.op_id, {}))
+        if item.parameters.get("data_kind") == "next_layer_kv":
+            args.update({
+                "prefetch_target_layer_index": item.layer_index + 1,
+                "prefetch_launch": "same predecessors as FC2 core",
+                "prefetch_completion": "same successors as next-layer Core Attention",
+            })
         if (
             any(item.op_id.startswith(f"moe.{mode}") for mode in chip_mesh_modes)
             and item.resource_id in (
@@ -126,7 +183,7 @@ def _trace_payload(result: SimulationResult) -> Mapping[str, Any]:
             args["chip_mesh_model"] = (
                 "ideal 8x8 PU mesh; Up K-partial reduction omitted"
             )
-        if item.op_id.startswith("attn."):
+        if item.op_id.startswith("attn.") and "chip0.dram" in resource_ids:
             args["attention_mesh_model"] = (
                 "chip 8x8 PU mesh; 8-way input sharing/output reduction "
                 "for projections; FlashAttention rows are independent; "
@@ -147,25 +204,74 @@ def _trace_payload(result: SimulationResult) -> Mapping[str, Any]:
         for resource_id in item.resource_ids:
             events.append({**event, "tid": thread_ids[resource_id]})
 
+    pu = result.hardware_config.chip.logic_die.processing_unit
+    context = {
+        "chip_count": result.hardware_config.chip_count,
+        "simulated_layer_count": len(result.layer_results),
+        "global_batch_size": result.global_batch_size,
+        "accepted_tokens_per_step": result.accepted_tokens_per_step,
+        "pu_dram_bandwidth_bytes_per_second": pu.dram_bandwidth_bytes_per_second,
+        "pu_default_flash_bandwidth_bytes_per_second": pu.flash_bandwidth_bytes_per_second,
+        "timing_model": "representative PU; memory streams overlap compute",
+        "timestamp_unit": "microseconds (args retain exact nanoseconds)",
+    }
+    if mapping_result is not None:
+        inference = mapping_result.request.inference_config
+        context.update({
+            "model_name": mapping_result.request.model_name,
+            "xfold": mapping_result.request.xfold,
+            "input_sequence_length": inference.input_sequence_length,
+            "output_sequence_length": inference.output_sequence_length,
+            "kv_cache_dtype": inference.kv_cache_dtype,
+            "component_order": list(mapping_result.component_order),
+            "operator_order": list(mapping_result.root_node.operator_order),
+        })
+    if result.model_latency_components:
+        context.update({
+            "model_latency_components": [
+                {"layer_type": name, "layer_count": count, "layer_time_ns": latency}
+                for name, count, latency in result.model_latency_components
+            ],
+            "estimated_model_latency_ns": result.latency_ns,
+            "latency_estimate": "weighted representative layers; auxiliary types use sequential baselines",
+            "trace_layer_type": mapping_result.layer_type if mapping_result is not None else None,
+        })
     return {
         "traceEvents": events,
         "displayTimeUnit": "ns",
+        "otherData": context,
     }
 
 
 def _event_name(item) -> str:
     base = f"{item.op_id} [{item.command_type}]"
     parameters = item.parameters
+    if parameters.get("data_kind") == "next_layer_kv":
+        base = (f"{item.op_id}.kv_prefetch L{item.layer_index}->L{item.layer_index + 1} "
+                f"[{item.command_type}]")
+    if "port" in parameters:
+        return (
+            f"{base} {parameters['port'].upper()} {parameters['data_kind']} "
+            f"size={_format_bytes(parameters['size_bytes'])} "
+            f"bandwidth={parameters['bandwidth_bytes_per_second'] / 1e12:g}TB/s"
+        )
+    if parameters.get("selection_unit") == "block" and "qk_flops" in parameters:
+        return (
+            f"{base} B={parameters['B']} M={parameters['M']} "
+            f"K={parameters['K']} N={parameters['N']} "
+            f"block={parameters['block_size']} topk={parameters['top_k']} per_group"
+        )
     if parameters.get("fused_indexer_score"):
         return (
             f"{base} B={parameters['gemm_b']} M={parameters['gemm_m']} "
             f"K={parameters['gemm_k']} N={parameters['gemm_n']} fused_postprocess"
         )
     if "qk_flops" in parameters:
+        heads = f"H={parameters['H']} " if "H" in parameters else ""
         return (
             f"{base} QK=[{parameters['B']},{parameters['M']},"
             f"{parameters['qk_K']},{parameters['qk_N']}] "
-            f"SV=[{parameters['B']},{parameters['M']},"
+            f"{heads}SV=[{parameters['B']},{parameters['M']},"
             f"{parameters['sv_K']},{parameters['sv_N']}]"
         )
     if "gemm_b" in parameters:
@@ -238,10 +344,18 @@ def export_perfetto_trace(
     trace_label: str = "srammachine",
     output_dir: Union[str, Path] = DEFAULT_TRACE_OUTPUT_DIR,
     timestamp: Optional[datetime] = None,
+    mapping_result: Optional[HardwareMappingResult] = None,
 ) -> Path:
     """Write one Chrome Trace Event JSON file without overwriting old traces."""
     if not isinstance(result, SimulationResult):
         raise TypeError("result must be a SimulationResult")
+    if mapping_result is not None:
+        if not isinstance(mapping_result, HardwareMappingResult):
+            raise TypeError("mapping_result must be a HardwareMappingResult")
+        if mapping_result.chip_count != result.hardware_config.chip_count:
+            raise ValueError("mapping and simulation chip counts differ")
+        if any(item.op_id not in mapping_result.operators for item in result.command_results):
+            raise ValueError("trace contains operators missing from the mapping")
     label = _trace_label(trace_label)
     directory = Path(output_dir)
     directory.mkdir(parents=True, exist_ok=True)
@@ -254,7 +368,7 @@ def export_perfetto_trace(
         ) as stream:
             temporary_path = Path(stream.name)
             json.dump(
-                _trace_payload(result), stream,
+                _trace_payload(result, mapping_result=mapping_result), stream,
                 ensure_ascii=False, indent=2,
             )
             stream.write("\n")

@@ -14,6 +14,7 @@ from srammachine.pipetree import (
 )
 
 from .model import ModelConfig, load_model_config
+from .hbf_bandwidth import HBFBandwidthTable
 
 
 # Fixed execution precisions for the current hardware path. They are not
@@ -66,12 +67,15 @@ class HardwareMappingRequest:
 
     model_name: str
     inference_config: InferenceConfig
+    xfold: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_name, str) or not self.model_name.strip():
             raise ValueError("model_name must be a nonempty string")
         if not isinstance(self.inference_config, InferenceConfig):
             raise TypeError("inference_config must be an InferenceConfig")
+        if type(self.xfold) is not bool:
+            raise TypeError("xfold must be a boolean")
 
 
 @dataclass(frozen=True)
@@ -132,12 +136,22 @@ class HardwareMappingResult:
     operators: Mapping[str, Operator]
     operator_mappings: Mapping[str, OperatorMapping]
     hardware_mappings: Mapping[str, OperatorHardwareMapping]
+    op_list: list[Operator] = field(default_factory=list)
+    component_order: tuple[str, ...] = ()
+    layer_type: str = "representative"
+    represented_layer_count: Optional[int] = None
+    additional_layer_mappings: tuple["HardwareMappingResult", ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.request, HardwareMappingRequest):
             raise TypeError("request must be a HardwareMappingRequest")
         if not isinstance(self.model_config, ModelConfig):
             raise TypeError("model_config must be a supported model config")
+        if self.represented_layer_count is not None:
+            _positive_integer("represented_layer_count", self.represented_layer_count)
+        if any(not isinstance(m, HardwareMappingResult) for m in self.additional_layer_mappings):
+            raise TypeError("additional_layer_mappings must contain HardwareMappingResult values")
+        object.__setattr__(self, "additional_layer_mappings", tuple(self.additional_layer_mappings))
         _positive_integer("chip_count", self.chip_count)
         _positive_integer("logic_die_count", self.logic_die_count)
         _positive_integer("local_batch_size", self.local_batch_size)
@@ -177,15 +191,17 @@ class HardwareMappingResult:
         object.__setattr__(self, "hardware_mappings", MappingProxyType(hardware))
         object.__setattr__(self, "expert_ownership", ownership)
         object.__setattr__(self, "expert_token_loads", loads)
+        ordered = self.op_list or [operators[key] for key in self.root_node.operator_order]
+        if [op.op_id for op in ordered] != list(self.root_node.operator_order):
+            raise ValueError("op_list must follow RootNode operator order")
+        object.__setattr__(self, "op_list", list(ordered))
 
 
 class _LayerBuilder:
     PU = "chip0.die0.pu0"
     VECTOR = "chip0.die0.vector"
     DRAM = "chip0.die0.dram"
-    SRAM = "chip0.die0.sram"
     CHIP_DRAM = "chip0.dram"
-    CHIP_SRAM = "chip0.sram"
     CHIP_VECTOR = "chip0.vector"
     NOC_HORIZONTAL = "chip0.noc_horizontal"
     NOC_VERTICAL = "chip0.noc_vertical"
@@ -229,16 +245,15 @@ class _LayerBuilder:
             f"chip0.die0.pu{row * columns}" for row in range(rows)
         )
 
-    @staticmethod
-    def chip_mesh_row() -> Tuple[str, ...]:
+    def chip_mesh_row(self) -> Tuple[str, ...]:
         return (_LayerBuilder.PU,) + tuple(
-            f"chip0.pu{column}" for column in range(1, 8)
+            f"chip0.pu{column}" for column in range(1, self.hardware_config.chip.noc.mesh_columns)
         )
 
-    @staticmethod
-    def chip_mesh_column() -> Tuple[str, ...]:
+    def chip_mesh_column(self) -> Tuple[str, ...]:
+        noc = self.hardware_config.chip.noc
         return (_LayerBuilder.PU,) + tuple(
-            f"chip0.pu{row * 8}" for row in range(1, 8)
+            f"chip0.pu{row * noc.mesh_columns}" for row in range(1, noc.mesh_rows)
         )
 
     @property
@@ -297,9 +312,6 @@ class _LayerBuilder:
         parallel_strategy: str,
         weight_batches: int = 0,
         weight_bytes_override: Optional[int] = None,
-        weight_logical_bytes: Optional[int] = None,
-        load_bytes_override: Optional[int] = None,
-        load_logical_bytes: Optional[int] = None,
         shared_die_factor: int = 1,
         dram_read_bytes_per_token: int = 0,
         dram_read_logical_bytes_per_token: Optional[int] = None,
@@ -311,9 +323,6 @@ class _LayerBuilder:
         batch_partition_degree: int = 1,
         demand_batch_partition_degree: Optional[int] = None,
         traffic_batch_partition_degree: Optional[int] = None,
-        sram_read_bytes_per_mapped_token: int = 0,
-        sram_read_logical_bytes_per_mapped_token: Optional[int] = None,
-        sram_read_data_kind: Optional[str] = None,
         pu_dimensions_override: Optional[Mapping[str, int]] = None,
         pu_weight_batches: Optional[int] = None,
         input_group: Optional[Sequence[Any]] = None,
@@ -329,7 +338,6 @@ class _LayerBuilder:
         main_gemm_flops_override: Optional[int] = None,
         batch_scaling_unit_count: Optional[int] = None,
         dram_resource_id: Optional[str] = None,
-        sram_resource_id: Optional[str] = None,
     ) -> None:
         for dimensions in (global_dimensions, chip_dimensions, die_dimensions):
             if set(dimensions) != {"B", "M", "K", "N"}:
@@ -363,11 +371,6 @@ class _LayerBuilder:
                 raise ValueError("weight_bytes_override requires resident weights")
             _positive_integer("weight_bytes_override", weight_bytes_override)
             weight_bytes = weight_bytes_override
-        if load_bytes_override is not None:
-            if not weight_batches:
-                raise ValueError("load_bytes_override requires resident weights")
-            _positive_integer("load_bytes_override", load_bytes_override)
-            load_bytes = load_bytes_override
         input_bytes = (
             pu_dimensions["B"] * pu_dimensions["M"] * pu_dimensions["K"]
             * _ACTIVATION_DTYPE_BYTES
@@ -422,35 +425,17 @@ class _LayerBuilder:
                 weight_bytes or dram_read_bytes_per_token
                 or dram_write_bytes_per_token
             ) else None,
-            (sram_resource_id or self.SRAM) if (
-                weight_bytes or load_bytes or sram_read_bytes_per_mapped_token
-            ) else None,
-            dram_read_once_bytes=weight_bytes,
             dram_read_bytes_per_token=dram_read_bytes_per_token,
             dram_write_bytes_per_token=dram_write_bytes_per_token,
-            dram_read_once_logical_bytes=weight_logical_bytes,
             dram_read_logical_bytes_per_token=(
                 dram_read_logical_bytes_per_token
             ),
             dram_write_logical_bytes_per_token=(
                 dram_write_logical_bytes_per_token
             ),
-            weight_load_fixed_bytes=load_bytes,
-            weight_load_logical_fixed_bytes=load_logical_bytes,
-            weight_shape=(
-                {"B": weight_batches, "K": die_dimensions["K"],
-                 "N": die_dimensions["N"]}
-                if weight_batches else None
-            ),
+            weight_read_fixed_bytes=load_bytes,
             batch_partition_degree=batch_partition_degree,
             demand_batch_partition_degree=demand_batch_partition_degree,
-            sram_read_bytes_per_mapped_token=(
-                sram_read_bytes_per_mapped_token
-            ),
-            sram_read_logical_bytes_per_mapped_token=(
-                sram_read_logical_bytes_per_mapped_token
-            ),
-            sram_read_data_kind=sram_read_data_kind,
             shared_die_factor=shared_die_factor,
             batch_scaling_unit_count=batch_scaling_unit_count,
         )
@@ -533,14 +518,11 @@ class _LayerBuilder:
         die_dimensions: Mapping[str, int],
         parallel_strategy: str,
         dram_read_bytes_per_token: int,
-        sram_read_bytes_per_mapped_token: int,
         dram_read_logical_bytes_per_token: Optional[int] = None,
-        sram_read_logical_bytes_per_mapped_token: Optional[int] = None,
         shared_die_factor: int = 1,
         batch_axis: str = "B",
         pu_dimensions_override: Optional[Mapping[str, int]] = None,
         dram_resource_id: Optional[str] = None,
-        sram_resource_id: Optional[str] = None,
         input_group: Optional[Sequence[str]] = None,
         output_group: Optional[Sequence[str]] = None,
     ) -> None:
@@ -581,18 +563,10 @@ class _LayerBuilder:
         operator = FlashAttentionOp(op_id, **pu_dimensions)
         mapping = OperatorMapping(
             batch_axis, self.PU, dram_resource_id or self.DRAM,
-            sram_resource_id or self.SRAM,
             dram_read_bytes_per_token=dram_read_bytes_per_token,
             dram_read_logical_bytes_per_token=(
                 dram_read_logical_bytes_per_token
             ),
-            sram_read_bytes_per_mapped_token=(
-                sram_read_bytes_per_mapped_token
-            ),
-            sram_read_logical_bytes_per_mapped_token=(
-                sram_read_logical_bytes_per_mapped_token
-            ),
-            sram_read_data_kind="flash_kv",
             shared_die_factor=shared_die_factor,
         )
         self._record(operator, mapping, OperatorHardwareMapping(
@@ -748,7 +722,7 @@ class _LayerBuilder:
         )
 
 
-class HardwareMapper:
+class LegacyHardwareMapper:
     """Map supported MLA/MoE decode layers onto the configured hierarchy."""
 
     def __init__(self, hardware_config: HardwareConfig = DEFAULT_HARDWARE_CONFIG):
@@ -759,6 +733,8 @@ class HardwareMapper:
     def map(self, request: HardwareMappingRequest) -> HardwareMappingResult:
         if not isinstance(request, HardwareMappingRequest):
             raise TypeError("request must be a HardwareMappingRequest")
+        if request.xfold:
+            raise ValueError("xfold requires a DSA model mapper")
         model = load_model_config(request.model_name)
         self._validate(request, model)
         builder = _LayerBuilder(request, self.hardware_config, model)
@@ -775,8 +751,8 @@ class HardwareMapper:
     def _validate(self, request: HardwareMappingRequest, model: ModelConfig) -> None:
         chips = self.hardware_config.chip_count
         dies = self.hardware_config.chip.logic_die_count
-        if chips not in (16, 32):
-            raise ValueError("decode mapping supports only 16 or 32 chips")
+        if chips not in (8, 16, 32):
+            raise ValueError("decode mapping supports only 8, 16 or 32 chips")
         if dies != 4:
             raise ValueError("decode mapping requires exactly four logic dies per chip")
         inference = request.inference_config
@@ -834,20 +810,18 @@ class HardwareMapper:
         weight_batches: int = 1, batch_axis: str = "M",
         dram_write_bytes_per_token: int = 0,
     ) -> None:
-        """One representative tile of a chip-wide K8×N8 projection."""
+        """One representative tile of a chip-wide K×N projection."""
         chip = chip_dimensions
+        noc = self.hardware_config.chip.noc
         pu = self._dims(chip["B"], chip["M"],
-                        _ceil_div(chip["K"], 8), _ceil_div(chip["N"], 8))
+                        _ceil_div(chip["K"], noc.mesh_rows),
+                        _ceil_div(chip["N"], noc.mesh_columns))
         builder.add_bmm(
             op_id, op_kind, global_dimensions=global_dimensions,
             chip_dimensions=chip, die_dimensions=chip,
             pu_dimensions_override=pu, parallel_strategy=strategy,
             weight_batches=weight_batches, batch_axis=batch_axis,
             dram_resource_id=builder.CHIP_DRAM,
-            sram_resource_id=builder.CHIP_SRAM,
-            load_bytes_override=(
-                weight_batches * chip["K"] * chip["N"] * _WEIGHT_DTYPE_BYTES
-            ),
             dram_write_bytes_per_token=dram_write_bytes_per_token,
             input_bytes_override=(
                 chip["B"] * chip["M"] * chip["K"] * _ACTIVATION_DTYPE_BYTES
@@ -869,15 +843,14 @@ class HardwareMapper:
         token_multiplier = request.inference_config.accepted_tokens_per_step
         # MTP1 evaluates two query tokens with the same cached context.  Scale
         # all Attention arithmetic and activation communication by two, while
-        # the per-request DRAM/SRAM cache traffic below remains unchanged.
+        # the per-request DRAM cache traffic below remains unchanged.
         global_batch = base_global_batch * token_multiplier
         chip_batch = _ceil_div(base_global_batch, chips) * token_multiplier
-        pu_rows = self.hardware_config.chip.logic_die.pu_mesh_rows
-        pu_columns = self.hardware_config.chip.logic_die.pu_mesh_columns
         latent_width = (
             model.q_lora_rank + model.kv_lora_rank + model.qk_rope_head_dim
         )
-        strategy = "attention_chip_dp_pu_k8_n8"
+        noc = self.hardware_config.chip.noc
+        strategy = f"attention_chip_dp_pu_k{noc.mesh_rows}_n{noc.mesh_columns}"
 
         builder.add_vector(
             "attn.input_norm", "rmsnorm",
@@ -1002,28 +975,16 @@ class HardwareMapper:
             die_dimensions=flash_dimensions(chip_head_batch),
             parallel_strategy=strategy,
             pu_dimensions_override={
-                **flash_dimensions(_exact_div(chip_head_batch, 8, "flash row heads")),
-                "qk_N": _ceil_div(attention_history, 8),
-                "sv_K": _ceil_div(attention_history, 8),
+                **flash_dimensions(_ceil_div(chip_head_batch, noc.mesh_rows)),
+                "qk_N": _ceil_div(attention_history, noc.mesh_columns),
+                "sv_K": _ceil_div(attention_history, noc.mesh_columns),
             },
             dram_resource_id=builder.CHIP_DRAM,
-            sram_resource_id=builder.CHIP_SRAM,
             input_group=builder.chip_mesh_row(),
             output_group=builder.chip_mesh_row(),
             dram_read_bytes_per_token=(
                 4 * _shared_effective_bytes(
                     attention_history * fused_qk_width
-                    * kv_dtype_bytes,
-                    dies,
-                )
-            ),
-            sram_read_bytes_per_mapped_token=(
-                4 * _shared_effective_bytes(
-                    (
-                        _ceil_div(model.kv_lora_rank, pu_rows)
-                        + _ceil_div(model.qk_rope_head_dim, pu_rows)
-                    )
-                    * _ceil_div(attention_history, pu_columns)
                     * kv_dtype_bytes,
                     dies,
                 )
@@ -1121,8 +1082,8 @@ class HardwareMapper:
 
         if base_global_batch <= 128:
             pu_dimensions = self._dims(
-                chip_batch, _ceil_div(model.indexer_num_heads, 8),
-                model.indexer_head_dim, _ceil_div(history, 8),
+                chip_batch, _ceil_div(model.indexer_num_heads, self.hardware_config.chip.noc.mesh_rows),
+                model.indexer_head_dim, _ceil_div(history, self.hardware_config.chip.noc.mesh_columns),
             )
             batch_partition_degree = 1
             output_kind = "reduce"
@@ -1131,7 +1092,6 @@ class HardwareMapper:
             output_bytes = (
                 chip_batch * pu_dimensions["N"] * _ACTIVATION_DTYPE_BYTES
             )
-            sequence_partitions = 8
             main_gemm_override = None
         elif base_global_batch < 1024:
             # Use the largest equal per-request PU allocation and leave any
@@ -1151,7 +1111,6 @@ class HardwareMapper:
             output_bytes = (
                 local_req * pu_per_req * token_multiplier * local_top_k * 4
             )
-            sequence_partitions = pu_per_req
             main_gemm_override = old_main_gemm_flops
         else:
             # At BS=1024 on a 32-chip system there are only 32 local
@@ -1174,7 +1133,6 @@ class HardwareMapper:
             # Each top-k candidate carries a 2-byte shard-local token ID and
             # a 2-byte score. The source PU identifies the shard origin.
             output_bytes = local_req * token_multiplier * top_k * 4
-            sequence_partitions = 1
             main_gemm_override = old_main_gemm_flops
 
         builder.add_bmm(
@@ -1201,19 +1159,10 @@ class HardwareMapper:
                 )
             ),
             dram_resource_id=builder.CHIP_DRAM,
-            sram_resource_id=builder.CHIP_SRAM,
             batch_axis="B",
             pu_dimensions_override=pu_dimensions,
             fused_indexer_score=True,
             main_gemm_flops_override=main_gemm_override,
-            sram_read_bytes_per_mapped_token=(
-                sequence_partitions * 4 * _shared_effective_bytes(
-                    model.indexer_head_dim * pu_dimensions["N"]
-                    * kv_dtype_bytes,
-                    dies,
-                )
-            ),
-            sram_read_data_kind="dsa_key",
             batch_partition_degree=batch_partition_degree,
             demand_batch_partition_degree=1,
             traffic_batch_partition_degree=1,
@@ -1232,7 +1181,7 @@ class HardwareMapper:
                 "attn.dsa_score_allgather", "indexer_score_allgather",
                 scope="intra_chip", kind="allgather",
                 group=builder.chip_mesh_row(),
-                size_bytes=chip_batch * _ceil_div(history, 8)
+                size_bytes=chip_batch * _ceil_div(history, self.hardware_config.chip.noc.mesh_columns)
                 * _ACTIVATION_DTYPE_BYTES,
                 parallel_strategy=strategy,
             )
@@ -1713,35 +1662,14 @@ class HardwareMapper:
         if len(grouped) != 1:
             raise ValueError("hierarchical TP expects one uniform positive expert load")
         active_ids, token_count = grouped[0]
-        up_weight_bytes = (
-            len(active_ids) * model.hidden_size
-            * (2 * model.moe_intermediate_size // chip_tp_degree)
-            * _WEIGHT_DTYPE_BYTES
-        )
-        sram_capacity = self.hardware_config.chip.logic_die.memory.sram_capacity_bytes
-        wave_count = _ceil_div(up_weight_bytes, sram_capacity)
-        if len(active_ids) % wave_count:
-            raise ValueError("expert waves must evenly partition representative die experts")
-        experts_per_wave = len(active_ids) // wave_count
-        if experts_per_wave % self.hardware_config.chip.logic_die.processing_unit_count:
-            raise ValueError("each expert wave must evenly partition across die PUs")
-        waves = tuple(
-            active_ids[index * experts_per_wave:(index + 1) * experts_per_wave]
-            for index in range(wave_count)
-        )
         for phase in ("up_gate", "silu", "down"):
-            for wave_index, wave_ids in enumerate(waves):
-                prefix = (
-                    "moe.tp" if wave_count == 1
-                    else f"moe.tp.wave{wave_index}"
-                )
-                self._add_hierarchical_tp_expert_group(
-                    builder, expert_ids=wave_ids,
-                    tokens_per_expert=token_count,
-                    token_groups=token_groups,
-                    chip_tp_degree=chip_tp_degree,
-                    phase=phase, prefix=prefix,
-                )
+            self._add_hierarchical_tp_expert_group(
+                builder, expert_ids=active_ids,
+                tokens_per_expert=token_count,
+                token_groups=token_groups,
+                chip_tp_degree=chip_tp_degree,
+                phase=phase, prefix="moe.tp",
+            )
 
         builder.add_comm(
             "moe.tp_down_die_reduce_scatter",
@@ -1779,13 +1707,12 @@ class HardwareMapper:
         )
 
     def _use_pure_moe_mapping(self, builder: _LayerBuilder) -> bool:
-        """The new MoE layout is defined for the default 16-chip 4x4 mesh."""
+        """Use chip-wide layouts for Nexus and the retained 16-chip preset."""
         die = self.hardware_config.chip.logic_die
         return (
-            self.hardware_config.chip_count == 16
+            (self.hardware_config.chip_count, die.pu_mesh_rows, die.pu_mesh_columns)
+            in ((8, 16, 32), (16, 4, 4))
             and self.hardware_config.chip.logic_die_count == 4
-            and die.pu_mesh_rows == 4
-            and die.pu_mesh_columns == 4
             and builder.model_config.model_name in {
                 "deepseek-v3", "deepseek-v3.2", "kimi-k2.5", "glm-5.1",
             }
@@ -2011,7 +1938,7 @@ class HardwareMapper:
         tokens_per_expert: int, global_expert_count: int,
         chip_tp_degree: int, prefix: str, strategy: str,
     ) -> None:
-        """Model a TP or EP expert group on one unified 8×8 chip PU mesh.
+        """Model a TP or EP expert group on the configured chip PU mesh.
 
         Up's K-partial reduction is intentionally omitted in this idealized
         experiment. The Up output command charges half the fused channel
@@ -2047,9 +1974,7 @@ class HardwareMapper:
                 experts, m, hidden_pu, 2 * intermediate_pu,
             ),
             weight_batches=experts, pu_weight_batches=experts,
-            load_bytes_override=experts * hidden * 2 * intermediate,
             dram_resource_id=builder.CHIP_DRAM,
-            sram_resource_id=builder.CHIP_SRAM,
             input_kind="p2p", input_suffix="input_transfer",
             input_group=("chip0.input", builder.PU),
             input_noc_direction="horizontal",
@@ -2081,9 +2006,7 @@ class HardwareMapper:
                 experts, m, intermediate_pu, hidden_pu,
             ),
             weight_batches=experts, pu_weight_batches=experts,
-            load_bytes_override=experts * intermediate * hidden,
             dram_resource_id=builder.CHIP_DRAM,
-            sram_resource_id=builder.CHIP_SRAM,
             input_kind="p2p", input_suffix="input_transfer",
             input_group=("chip0.vector", builder.PU),
             input_noc_direction="horizontal",
@@ -2109,7 +2032,8 @@ class HardwareMapper:
         dtype = _ACTIVATION_DTYPE_BYTES
         chip_k_degree = 1
         chip_n_degree = chips // chip_k_degree
-        strategy = "moe_tp_chip_mesh_k8_n8_ideal_noc32"
+        noc = self.hardware_config.chip.noc
+        strategy = f"moe_tp_chip_mesh_k{noc.mesh_rows}_n{noc.mesh_columns}"
         entry_shard_bytes = (
             local_batch * model.hidden_size // chip_k_degree * dtype
         )
@@ -2330,7 +2254,8 @@ class HardwareMapper:
         local_batch = _ceil_div(inference.global_batch_size, chips)
         local_batch *= inference.accepted_tokens_per_step
         dtype = _ACTIVATION_DTYPE_BYTES
-        strategy = "moe_ep_chip_mesh_k8_n8_ideal_noc32"
+        noc = self.hardware_config.chip.noc
+        strategy = f"moe_ep_chip_mesh_k{noc.mesh_rows}_n{noc.mesh_columns}"
         experts_per_chip = _exact_div(
             model.num_experts, chips, "pure EP experts per chip",
         )
@@ -2613,10 +2538,31 @@ class HardwareMapper:
         )
 
 
+class HardwareMapper:
+    """Compatibility entry point dispatching to one mapper class per model."""
+
+    def __init__(self, hardware_config: HardwareConfig | None = None):
+        if hardware_config is not None and not isinstance(hardware_config, HardwareConfig):
+            raise TypeError("hardware_config must be a HardwareConfig")
+        self.hardware_config = hardware_config
+
+    def map(self, request: HardwareMappingRequest, *,
+            hbf_bandwidth_table: HBFBandwidthTable | None = None) -> HardwareMappingResult:
+        """Build the requested model through its dedicated mapper."""
+        from .model_mappers import mapper_for_model
+
+        if not isinstance(request, HardwareMappingRequest):
+            raise TypeError("request must be a HardwareMappingRequest")
+        return mapper_for_model(request.model_name, self.hardware_config).map(
+            request, hbf_bandwidth_table=hbf_bandwidth_table,
+        )
+
+
 __all__ = [
     "MoEParallelStrategy",
     "HardwareMappingRequest",
     "HardwareMappingResult",
     "OperatorHardwareMapping",
     "HardwareMapper",
+    "LegacyHardwareMapper",
 ]
