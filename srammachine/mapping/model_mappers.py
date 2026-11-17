@@ -22,7 +22,7 @@ from .mapper import (
     OperatorHardwareMapping,
 )
 from .model import DeepSeekV3Config, DeepSeekV32Config, GLM51Config, ModelConfig, load_model_config
-from .hbf_bandwidth import HBFBandwidthTable, apply_hbf_bandwidths
+from .hbf_bandwidth import HBFBandwidthTable, apply_hbf_bandwidths, apply_indexer_noc_bandwidth
 
 
 class PartitionedLayerMapper:
@@ -236,8 +236,8 @@ class PartitionedLayerMapper:
             tuple(type(component).__name__ for component in components),
         )
         if hbf_bandwidth_table is not None:
-            result = apply_hbf_bandwidths(result, self.hardware_config, hbf_bandwidth_table)
-        return result
+            return apply_hbf_bandwidths(result, self.hardware_config, hbf_bandwidth_table)
+        return apply_indexer_noc_bandwidth(result, self.hardware_config)
 
 
 class DSAMapper(PartitionedLayerMapper):
@@ -283,8 +283,8 @@ class _MLAMapper(LegacyHardwareMapper):
             raise ValueError(f"{type(self).__name__} only maps {self.model_name}")
         result = super().map(request)
         if hbf_bandwidth_table is not None:
-            result = apply_hbf_bandwidths(result, self.hardware_config, hbf_bandwidth_table)
-        return result
+            return apply_hbf_bandwidths(result, self.hardware_config, hbf_bandwidth_table)
+        return apply_indexer_noc_bandwidth(result, self.hardware_config)
 
     def build_op_list(self, inference: InferenceConfig) -> list[Operator]:
         """Return the existing MLA layer in execution order."""

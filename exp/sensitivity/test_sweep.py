@@ -71,8 +71,10 @@ class SensitivityTests(unittest.TestCase):
             rates = {}
             for op_id, op in mapped.operators.items():
                 if op.weight_memory and op.weight_memory.flash_bandwidth_bytes_per_second is not None:
-                    expected = original.operators[op_id].weight_memory.flash_bandwidth_bytes_per_second * factor
-                    self.assertEqual(op.weight_memory.flash_bandwidth_bytes_per_second, expected)
+                    base_rate = original.operators[op_id].weight_memory.flash_bandwidth_bytes_per_second
+                    expected = ((base_rate - 8e9) * factor + 8e9 if op_id.endswith("indexer_score")
+                                else base_rate * factor)
+                    self.assertAlmostEqual(op.weight_memory.flash_bandwidth_bytes_per_second / expected, 1.0)
                     rates[op_id] = expected
             self.assertTrue(rates)
             self.assertTrue(any(mapped.operators[key].flash_prefetch_bytes_per_request for key in rates))

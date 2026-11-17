@@ -10,12 +10,13 @@ import math
 from pathlib import Path
 
 from exp.ablation.sweep import case_directory
+from exp.ablation.policy import load_no_kv_bandwidth, KV_LAYOUT_ABLATIONS, MOE_LAYOUT_ABLATIONS
 from exp.big.sweep import write_json
 from srammachine.mapping import HBFBandwidthTable
 
 
 def verify_layer(layer: dict, base: dict, variant: str, manifest: dict,
-                 metrics: dict, table: HBFBandwidthTable, *, dense: bool = False) -> None:
+                 metrics: dict, table: HBFBandwidthTable, *, dense: bool = False, no_kv_table=None) -> None:
     """Check grids, per-op bandwidths and actual port durations independently."""
     base_pu = base["chip"]["logic_die"]["processing_unit"]
     intervals = defaultdict(list)
@@ -39,19 +40,27 @@ def verify_layer(layer: dict, base: dict, variant: str, manifest: dict,
             continue
         rate = base_pu["flash_bandwidth_bytes_per_second"]
         if op_id.endswith("indexer_score") and policy["source"] != "dram":
-            rate = table.lookup(metrics["model"], "dense_indexer", True,
+            rate = table.lookup(metrics["model"], "dense_indexer", metrics["mtp_enabled"],
                                 metrics["global_batch_size"], metrics["input_sequence_length"])
         elif not dense and ((special and not metrics["xfold"])
                             or (metrics["xfold"] and op_id == "moe.moe_fc2")):
             kind = "dense_kv" if metrics["model"] == "deepseek-v3" else "sparse_kv"
-            rate = table.lookup(metrics["model"], kind, True,
+            rate = table.lookup(metrics["model"], kind, metrics["mtp_enabled"],
                                 metrics["global_batch_size"], metrics["input_sequence_length"])
+        if (manifest["ablation_revision"] >= 4 and op_id.endswith("indexer_score")
+                and policy["source"] != "dram" and not flash):
+            rate += base["chip"]["noc"]["link_bandwidth_bytes_per_second"] * 64 * 2 / 2048
         if flash:
             rate *= 2
-        if variant == "NoKVLayout" and op_id.endswith("indexer_score") and policy["source"] != "dram":
+        if manifest["ablation_revision"] < 6 and variant == "NoKVLayout" and op_id.endswith("indexer_score") and policy["source"] != "dram":
             rate *= manifest["kv_factor"]
-        if variant == "NoMoELayout" and op_id.startswith("moe."):
-            if manifest["moe_flash_scope"] == "stage" or (
+        if (no_kv_table is not None and variant in KV_LAYOUT_ABLATIONS and not dense
+                and ((op_id in ("attn.flash_attention", "attn.flash_msa") and policy["source"] != "dram")
+                     or (metrics["xfold"] and op_id == "moe.moe_fc2"))):
+            rate = no_kv_table.lookup(metrics["model"], "sparse_kv", metrics["mtp_enabled"],
+                                      metrics["global_batch_size"], metrics["input_sequence_length"])
+        if variant in MOE_LAYOUT_ABLATIONS and op_id.startswith("moe."):
+            if (variant != "NoHBFLayout" and manifest["moe_flash_scope"] == "stage") or (
                 layer["hardware_mappings"][op_id]["op_kind"] == "BMMOp"
                 and (op_id != "moe.moe_fc2" or not metrics["xfold"])
             ):
@@ -69,6 +78,23 @@ def verify_layer(layer: dict, base: dict, variant: str, manifest: dict,
         if command["command_type"] != "InterChipCmd":
             for resource in params.get("resource_ids", [command["resource_id"]]):
                 intervals[resource].append((command["start_time_ns"], command["end_time_ns"]))
+    if variant == "NoSeparatePath":
+        # End events precede starts at the same timestamp: touching is legal.
+        events = []
+        for command in layer["command_results"]:
+            params = command["parameters"]
+            horizontal = params.get("noc_direction") in ("horizontal", "both")
+            work = (command["category"] == "compute"
+                    or command["command_type"] in ("PUMemoryReadCmd", "DramReadCmd"))
+            if command["end_time_ns"] > command["start_time_ns"] and (horizontal or work):
+                chip = command["resource_id"].split(".")[0]
+                kind = 0 if horizontal else 1
+                events.extend(((command["start_time_ns"], 1, chip, kind),
+                               (command["end_time_ns"], -1, chip, kind)))
+        active = defaultdict(int)
+        for _, delta, chip, kind in sorted(events):
+            active[chip, kind] += delta
+            assert not (active[chip, 0] and active[chip, 1]), "SeparatePath exclusion violated"
     for resource, spans in intervals.items():
         spans.sort()
         assert all(previous[1] <= current[0] for previous, current in zip(spans, spans[1:])), resource
@@ -93,7 +119,7 @@ def verify_trace(root: Path, path: str, commands: list[dict], variant: str,
 def verify(root: Path) -> dict:
     """Require every requested case and audit derived metrics and figures."""
     manifest = json.loads((root / "manifest.json").read_text())
-    assert manifest["ablation_revision"] in (2, 3)
+    assert manifest["ablation_revision"] in (2, 3, 4, 5, 6, 7)
     for filename, key in (("source.zip", "source_zip_sha256"), ("hbf_read_bandwidth.csv", "bandwidth_csv_sha256")):
         assert hashlib.sha256((root / "scripts" / filename).read_bytes()).hexdigest() == manifest[key]
     assert json.loads((root / "scripts/base_hardware.json").read_text()) == manifest["hardware"]
@@ -107,6 +133,13 @@ def verify(root: Path) -> dict:
             assert hashlib.sha256((root / filename).read_bytes()).hexdigest() == digest, filename
         assert sum(name.endswith("/result.json") for name in reuse["file_sha256"]) == reuse["reused_points"]
     table = HBFBandwidthTable.from_csv(root / "scripts/hbf_read_bandwidth.csv")
+    no_kv_table = None
+    if manifest.get("no_kv_bandwidth_csv_sha256"):
+        path = root / "scripts/no_kv_layout_bandwidth.csv"
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == manifest["no_kv_bandwidth_csv_sha256"]
+        no_kv_table = load_no_kv_bandwidth(path)
+    accepted = 2 if manifest["mtp_enabled"] else 1
+    assert manifest["accepted_tokens_per_step"] == accepted
     points, traces = 0, 0
     for model in manifest["models"]:
         with (root / f"{model}.csv").open(encoding="utf-8-sig", newline="") as stream:
@@ -126,9 +159,24 @@ def verify(root: Path) -> dict:
             assert (metrics["model"], metrics["ablation"], metrics["global_batch_size"], metrics["input_sequence_length"]) == (model, variant, batch, sequence)
             assert metrics["status"] == "complete" and not (directory / "error.json").exists()
             assert metrics["xfold"] == (variant != "NoXfold" and model != "deepseek-v3")
-            assert metrics["accepted_tokens_per_step"] == 2 and metrics["simulated_layer_count"] == 4
+            assert metrics["mtp_enabled"] == payload["inference"]["mtp_enabled"] == manifest["mtp_enabled"]
+            assert (row["mtp_enabled"] == "True") == manifest["mtp_enabled"]
+            assert int(row["accepted_tokens_per_step"]) == accepted
+            assert metrics["accepted_tokens_per_step"] == accepted and metrics["simulated_layer_count"] == 4
             assert payload["base_hardware"] == manifest["hardware"]
-            verify_layer(payload, manifest["hardware"], variant, manifest, metrics, table)
+            if variant == "NoSeparatePath" and "SeparatePath" in manifest["ablations"]:
+                paired = json.loads((case_directory(root, model, "SeparatePath", batch, sequence) / "result.json").read_text())
+                for current, reference in [(payload, paired)] + [
+                    (value, paired["auxiliary_results"][key])
+                    for key, value in payload["auxiliary_results"].items()
+                ]:
+                    assert current["partition_chains"] == reference["partition_chains"]
+                    # Identical commands/bytes/FLOPs; only scheduling may change.
+                    def untimed(layer):
+                        return [{k: v for k, v in c.items() if k not in ("start_time_ns", "end_time_ns")}
+                                for c in layer["command_results"]]
+                    assert untimed(current) == untimed(reference)
+            verify_layer(payload, manifest["hardware"], variant, manifest, metrics, table, no_kv_table=no_kv_table)
             commands = payload["command_results"]
             starts = [min(command["start_time_ns"] for command in commands
                           if command["layer_index"] == index and command["cmd_id"].endswith(".core"))
@@ -138,7 +186,7 @@ def verify(root: Path) -> dict:
             components = metrics["model_latency_components"]
             raw_latency = sum(count * duration for _, count, duration in components) if components else interval * metrics["model_layer_count"]
             assert raw_latency == metrics["simulated_model_step_latency_ns"]
-            per_layer = (25_000 if model == "minimax-m3" else 14_000) if variant == "NoKVLayout" else 0
+            per_layer = (25_000 if model == "minimax-m3" else 14_000) if variant == "NoKVLayout" and manifest["ablation_revision"] < 6 else 0
             overhead = per_layer * metrics["model_layer_count"]
             assert metrics["additional_latency_per_layer_ns"] == per_layer
             assert metrics["additional_model_latency_ns"] == overhead
@@ -146,8 +194,8 @@ def verify(root: Path) -> dict:
                 [name, count, duration + per_layer] for name, count, duration in components]
             latency = raw_latency + overhead
             assert latency == metrics["model_step_latency_ns"]
-            assert math.isclose(metrics["tokens_per_second_per_user"], 2e9 / latency)
-            assert math.isclose(metrics["tokens_per_second_per_chip"], 2e9 * batch / latency / metrics["chip_count"])
+            assert math.isclose(metrics["tokens_per_second_per_user"], accepted * 1e9 / latency)
+            assert math.isclose(metrics["tokens_per_second_per_chip"], accepted * 1e9 * batch / latency / metrics["chip_count"])
             for key in ("tokens_per_second_per_user", "tokens_per_second_per_chip", "model_step_latency_ns",
                         "simulated_model_step_latency_ns", "additional_model_latency_ns", "additional_latency_per_layer_ns"):
                 assert math.isclose(float(row[key]), metrics[key], rel_tol=1e-12)
@@ -163,7 +211,7 @@ def verify(root: Path) -> dict:
             verify_trace(root, metrics["trace_path"], commands, variant, adjustment)
             assert len(metrics["auxiliary_trace_paths"]) == len(payload["auxiliary_results"])
             for path, (layer_type, additional) in zip(metrics["auxiliary_trace_paths"], payload["auxiliary_results"].items()):
-                verify_layer(additional, manifest["hardware"], variant, manifest, metrics, table, dense=layer_type == "dense")
+                verify_layer(additional, manifest["hardware"], variant, manifest, metrics, table, dense=layer_type == "dense", no_kv_table=no_kv_table)
                 verify_trace(root, path, additional["command_results"], variant)
                 assert dict((name, duration) for name, _, duration in components)[layer_type] == additional["steady_layer_time_ns"]
             points += 1

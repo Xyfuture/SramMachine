@@ -19,9 +19,10 @@ import traceback
 import zipfile
 
 from exp.ablation.policy import (
-    ABLATIONS, DEFAULT_INDEXER_FACTOR, DEFAULT_MOE_FACTOR, NO_KV_LAYER_DELAY_NS,
+    ABLATIONS, KV_LAYOUT_ABLATIONS, MOE_LAYOUT_ABLATIONS, DEFAULT_MOE_FACTOR, DEFAULT_NO_KV_BANDWIDTH_CSV, load_no_kv_bandwidth,
     apply_ablation, latency_metrics, load_hardware,
 )
+from exp.ablation.separatepath import PATH_VARIANTS, SeparatePathSimulator
 from exp.big.sweep import BATCHES, ROOT, mark_pareto, plain, write_json
 from srammachine.inference import InferenceConfig
 from srammachine.mapping import (
@@ -72,16 +73,25 @@ def simulate_case(task: dict, started: float) -> dict:
     """Map, apply measured-rate ablations, search layouts and simulate four layers."""
     directory, root = Path(task["directory"]), Path(task["root"])
     hardware = load_hardware(Path(task["hardware_json"]))
-    inference = InferenceConfig(task["batch"], task["sequence"], 600, mtp_enabled=True)
+    inference = InferenceConfig(task["batch"], task["sequence"], 600, mtp_enabled=task.get("mtp_enabled", True))
     request = HardwareMappingRequest(task["model"], inference, xfold=task["ablation"] != "NoXfold")
     table = HBFBandwidthTable.from_csv(task["bandwidth_csv"])
     mapped = mapper_for_model(task["model"], hardware).map(request, hbf_bandwidth_table=table)
-    mapped = apply_ablation(mapped, hardware, task["ablation"], kv_factor=task["kv_factor"],
-                            moe_factor=task["moe_factor"], moe_flash_scope=task["moe_flash_scope"])
+    no_kv_table = (load_no_kv_bandwidth(task["no_kv_bandwidth_csv"])
+                   if task["ablation"] in KV_LAYOUT_ABLATIONS else None)
+    mapped = apply_ablation(mapped, hardware, task["ablation"],
+                            moe_factor=task["moe_factor"], moe_flash_scope=task["moe_flash_scope"],
+                            no_kv_table=no_kv_table)
     optimization_start = time.monotonic()
     mapped = optimize_partition_chains(mapped, hardware)
     optimization_seconds = time.monotonic() - optimization_start
-    simulator = Simulator(hardware)
+    pipeline = task["ablation"] in PATH_VARIANTS
+    k_tile = task.get("separatepath_k_tile") or (
+        hardware.chip.logic_die.processing_unit.systolic_array.columns
+        * hardware.chip.logic_die.processing_unit.systolic_array_count)
+    simulator = (SeparatePathSimulator(hardware, k_tile=k_tile,
+                                      separate_path=task["ablation"] == "SeparatePath")
+                 if pipeline else Simulator(hardware))
     graph = TreeParser(hardware).parse(mapped.root_node, mapped.operators, mapped.operator_mappings)
     result = simulator.run(graph, mapping_result=mapped)
 
@@ -92,7 +102,9 @@ def simulate_case(task: dict, started: float) -> dict:
         trace.setdefault("otherData", {}).update(
             ablation=task["ablation"], hardware_by_op=mapping_details(layer_mapping)["hardware_by_op"],
             latency_adjustment=latency_metrics(layer_result, task["model"], task["ablation"]),
-            timing_scope="command timestamps exclude post-simulation additive layer delay")
+            timing_scope="command timestamps exclude post-simulation additive layer delay",
+            gemm_pipeline_k_tile=k_tile if pipeline else 0,
+            noc_compute_memory_exclusive=task["ablation"] == "NoSeparatePath")
         write_json(path, trace)
         return str(path.relative_to(root))
 
@@ -120,15 +132,19 @@ def simulate_case(task: dict, started: float) -> dict:
         "model_layer_count": result.model_layer_count,
         "model_latency_components": plain(result.model_latency_components),
         "steady_pu_metrics": plain(steady_pu_metrics(result.command_results)),
-        "chip_count": hardware.chip_count, "mtp_enabled": True,
+        "chip_count": hardware.chip_count, "mtp_enabled": inference.mtp_enabled,
         "accepted_tokens_per_step": inference.accepted_tokens_per_step,
         "xfold": mapped.request.xfold, "moe_strategy": inference.moe_parallel_strategy.value,
         "kv_cache_dtype": inference.kv_cache_dtype, "output_sequence_length": 600,
         "simulated_layer_count": result.layer_count,
         "optimize_partition_chains": True, "split_tree_search_enabled": False,
-        "kv_layout_factor": task["kv_factor"] if task["ablation"] == "NoKVLayout" else 1.0,
-        "moe_layout_factor": task["moe_factor"] if task["ablation"] == "NoMoELayout" else 1.0,
-        "moe_flash_scope": task["moe_flash_scope"],
+        "kv_layout_factor": 1.0,
+        "no_kv_bandwidth_source": "scripts/no_kv_layout_bandwidth.csv" if no_kv_table else "",
+        "moe_layout_factor": task["moe_factor"] if task["ablation"] in MOE_LAYOUT_ABLATIONS else 1.0,
+        "moe_flash_scope": "weights" if task["ablation"] == "NoHBFLayout" else task["moe_flash_scope"],
+        "gemm_pipeline_k_tile": k_tile if pipeline else 0,
+        "noc_compute_memory_exclusive": task["ablation"] == "NoSeparatePath",
+        "comparison_baseline": "XFold",
         "flash_bandwidth_source": "measured_csv_cache; hardware_default_weights; ablation_scaled",
         "flash_bandwidth_bytes_per_second_by_op": {
             key: op.weight_memory.flash_bandwidth_bytes_per_second
@@ -203,7 +219,7 @@ def write_reports(root: Path, models: list[str]) -> None:
                     ax.annotate(str(row["global_batch_size"]), (row[x], row[y]), xytext=(3, 3),
                                 textcoords="offset points", fontsize=6, color=colors[ablation])
             ax.set(title=f"{model} | context {sequence:,} | {manifest['hardware']['chip_count']} chips\n"
-                         "EP | FP8 KV | ideal MTP1 | labels = global batch",
+                         f"EP | FP8 KV | MTP{int(manifest['mtp_enabled'])} | labels = global batch",
                    xlabel="tokens/s/user", ylabel="tokens/s/chip", xlim=(0, None), ylim=(0, None))
             ax.grid(alpha=0.2)
             ax.legend(fontsize=9)
@@ -275,12 +291,16 @@ def main() -> int:
     parser.add_argument("--models", nargs="+", choices=MODELS, default=["minimax-m3"])
     parser.add_argument("--ablations", nargs="+", choices=ABLATIONS, default=list(ABLATIONS))
     parser.add_argument("--batch-sizes", nargs="+", type=int, default=list(BATCHES))
-    parser.add_argument("--sequence-lengths", nargs="+", type=int, default=[16384, 32768, 65536])
+    parser.add_argument("--sequence-lengths", nargs="+", type=int, default=[32768])
+    parser.add_argument("--mtp", type=int, choices=(0, 1), default=1,
+                        help="0: one token/step; 1: ideal two tokens/step (default)")
+    parser.add_argument("--separatepath-k-tile", type=int, default=0,
+                        help="GEMM K tile; 0 = array columns × array count (64 by default)")
     parser.add_argument("--workers", type=int, choices=range(1, 7), default=6)
     parser.add_argument("--hardware-config", type=Path, help="partial/full nested HardwareConfig JSON")
     parser.add_argument("--bandwidth-csv", type=Path, default=DEFAULT_HBF_BANDWIDTH_CSV)
-    parser.add_argument("--kv-factor", type=float, default=DEFAULT_INDEXER_FACTOR,
-                        help="NoKVLayout Indexer cache bandwidth multiplier (default: 0.87)")
+    parser.add_argument("--no-kv-bandwidth-csv", type=Path, default=DEFAULT_NO_KV_BANDWIDTH_CSV,
+                        help="raw measured NoKVLayout/NoHBFLayout sparse KV HBF bandwidth CSV")
     parser.add_argument("--moe-factor", type=float, default=DEFAULT_MOE_FACTOR)
     parser.add_argument("--moe-flash-scope", choices=("stage", "weights"), default="weights",
                         help="weights: ordinary MoE BMM weights only (default); stage: legacy cache/prefetch scaling")
@@ -294,7 +314,7 @@ def main() -> int:
             parser.error("duplicate sweep values are not allowed")
     if any(value <= 0 for value in args.batch_sizes + args.sequence_lengths):
         parser.error("batches and sequences must be positive")
-    if not all(0 < factor <= 1 for factor in (args.kv_factor, args.moe_factor)):
+    if not all(0 < factor <= 1 for factor in (args.moe_factor,)):
         parser.error("layout factors must be in (0, 1]")
     if Path(args.run_id).name != args.run_id or args.run_id in (".", ".."):
         parser.error("run-id must be a directory name")
@@ -303,25 +323,35 @@ def main() -> int:
     for model, batch, sequence in itertools.product(args.models, args.batch_sizes, args.sequence_lengths):
         kinds = ("dense_kv",) if model == "deepseek-v3" else ("sparse_kv", "dense_indexer")
         for kind in kinds:
-            table.lookup(model, kind, True, batch, sequence)
+            table.lookup(model, kind, bool(args.mtp), batch, sequence)
+    no_kv_enabled = any(name in KV_LAYOUT_ABLATIONS for name in args.ablations)
+    if no_kv_enabled:
+        no_kv_table = load_no_kv_bandwidth(args.no_kv_bandwidth_csv)
+        for model, batch, sequence in itertools.product(args.models, args.batch_sizes, args.sequence_lengths):
+            no_kv_table.lookup(model, "sparse_kv", bool(args.mtp), batch, sequence)
     config = {
         "models": args.models, "ablations": args.ablations, "batch_sizes": args.batch_sizes,
         "sequence_lengths": args.sequence_lengths, "hardware": plain(hardware),
-        "kv_factor": args.kv_factor, "moe_factor": args.moe_factor, "moe_flash_scope": args.moe_flash_scope,
-        "ablation_revision": 3,
+        "kv_factor": 1.0, "moe_factor": args.moe_factor, "moe_flash_scope": args.moe_flash_scope,
+        "ablation_revision": 7,
+        "no_hbf_layout_definition": "measured NoKVLayout sparse KV rate + weights-only NoMoELayout Flash factor; no Indexer scaling or added delay",
+        "no_kv_bandwidth_csv_sha256": hashlib.sha256(args.no_kv_bandwidth_csv.read_bytes()).hexdigest() if no_kv_enabled else None,
+        "separatepath_k_tile": args.separatepath_k_tile,
+        "separatepath_model": "paired K-tiled double-buffer GEMMs; frozen XFold layouts; NoSeparatePath excludes horizontal NoC from compute and all memory reads",
+        "indexer_bandwidth_definition": "base Flash rate + NoC link bandwidth * 64 * 2 / base PU count; NoFlashShare and NoDRAMFLashShare remove the NoC contribution",
         "no_moe_bandwidth_scope": "ordinary MoE BMM weights only; Indexer, CoreAttention and KV prefetch unchanged"
                                   if args.moe_flash_scope == "weights" else "legacy whole MoE stage Flash reads",
-        "no_kv_bandwidth_scope": "CSV-measured IndexerScore Flash cache reads only; DRAM, CoreAttention and KV prefetch unchanged",
-        "no_kv_additional_latency_per_layer_ns": NO_KV_LAYER_DELAY_NS,
-        "mtp_enabled": True, "accepted_tokens_per_step": 2, "output_sequence_length": 600,
+        "no_kv_bandwidth_scope": "measured sparse KV HBF rate: direct KV reads or XFold KV prefetch; Indexer and NoC/HBM bonus unchanged",
+        "no_kv_additional_latency_per_layer_ns": 0,
+        "mtp_enabled": bool(args.mtp), "accepted_tokens_per_step": 1 + args.mtp, "output_sequence_length": 600,
         "moe_strategy": "ep", "kv_cache_dtype": "fp8", "simulated_layer_count": 4,
         "partition_chain_search": True, "split_tree_search": False,
         "bandwidth_csv_sha256": hashlib.sha256(args.bandwidth_csv.read_bytes()).hexdigest(),
-        "throughput_definition": "user = 2e9 / model_step_latency_ns; chip = user * global_batch / chip_count",
-        "latency_definition": "steady core-start interval extrapolated to decoder plus additive NoKVLayout delay per decoder layer; MiniMax = 57 sparse + 3 dense",
+        "throughput_definition": f"user = {1 + args.mtp}e9 / model_step_latency_ns; chip = user * global_batch / chip_count",
+        "latency_definition": "steady core-start interval extrapolated to decoder; no additive latency; MiniMax = 57 sparse + 3 dense",
         "minimax_dense_flash": "no CSV measurement; hardware default with applicable ablation scaling",
-        "prefetch_hardware": "FC2 execution view; NoKVLayout and default NoMoELayout preserve KV prefetch; explicit legacy stage scope scales prefetch",
-        "deepseek_v3_mode": "ordinary path for all variants; no Indexer; NoKVLayout adds layer delay only",
+        "prefetch_hardware": "FC2 execution view; NoKVLayout/NoHBFLayout replace KV prefetch with measured no-layout rate; default NoMoELayout preserves it",
+        "deepseek_v3_mode": "ordinary path; NoKVLayout/NoHBFLayout unavailable without matching sparse KV measurements",
     }
     root = args.output_root.resolve() / f"{args.run_id}-ablation"
     if root.exists():
@@ -337,6 +367,8 @@ def main() -> int:
             parser.error(f"No results: {root}")
         root.mkdir(parents=True)
         archive_hash = snapshot(root / "scripts", args.bandwidth_csv)
+        if no_kv_enabled:
+            shutil.copy2(args.no_kv_bandwidth_csv, root / "scripts/no_kv_layout_bandwidth.csv")
         write_json(root / "scripts/base_hardware.json", hardware)
         write_json(root / "manifest.json", dict(
             config, generated_at=datetime.now().astimezone().isoformat(), command=sys.argv,
@@ -352,8 +384,10 @@ def main() -> int:
                           directory=str(directory), root=str(root),
                           bandwidth_csv=str(root / "scripts/hbf_read_bandwidth.csv"),
                           hardware_json=str(root / "scripts/base_hardware.json"),
-                          kv_factor=args.kv_factor, moe_factor=args.moe_factor,
-                          moe_flash_scope=args.moe_flash_scope))
+                          no_kv_bandwidth_csv=str(root / "scripts/no_kv_layout_bandwidth.csv"),
+                          moe_factor=args.moe_factor,
+                          moe_flash_scope=args.moe_flash_scope, mtp_enabled=bool(args.mtp),
+                          separatepath_k_tile=args.separatepath_k_tile))
     if args.reports_only:
         write_reports(root, args.models)
         return 0

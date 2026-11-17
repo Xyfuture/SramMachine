@@ -38,7 +38,9 @@ class CommandGraph:
         start_edges: Iterable[Tuple[str, str]] = (),
         traces: Optional[Mapping[str, CommandTrace]] = None,
         scheduling_priorities: Optional[Mapping[str, int]] = None,
+        noc_compute_memory_exclusive: bool = False,
     ) -> None:
+        self.noc_compute_memory_exclusive = noc_compute_memory_exclusive
         self.commands = tuple(commands)
         lookup = {}
         for cmd in self.commands:

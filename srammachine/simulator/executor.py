@@ -7,7 +7,8 @@ from typing import Mapping
 from Desim import FIFO, SimModule, SimSession
 from greenlet import GreenletExit
 
-from srammachine.commands import CommandGraph, InterChipCmd, PUMemoryReadCmd
+from srammachine.commands import (CommandGraph, InterChipCmd, PUMemoryReadCmd,
+                                  DramReadCmd, GemmCmd, FlashAttentionCmd, VectorCmd)
 from srammachine.hardware import DEFAULT_HARDWARE_CONFIG, HardwareConfig
 from .records import CommandExecution, CommandState, ExecutionResult
 from .stages import PUMemoryResourceStage, stage_class_for_command
@@ -55,6 +56,7 @@ class GraphExecutor(SimModule):
         self._executions = {}
         self._ready = []
         self._busy_resources = set()
+        self._path_active = {}
         self._completion_fifo = FIFO(max(1, len(graph.commands)))
         self._stage_keys = {
             command.cmd_id: self._stage_key(command)
@@ -153,19 +155,39 @@ class GraphExecutor(SimModule):
                 raise RuntimeError(f"negative start dependency count: {successor}")
             self._try_make_ready(successor)
 
+    def _path_class(self, command):
+        if not self.graph.noc_compute_memory_exclusive:
+            return None
+        chip = command.resource_id.split(".")[0]
+        if any(key.endswith(".noc_horizontal") for key in command.resource_ids):
+            return chip, 0
+        if isinstance(command, (PUMemoryReadCmd, DramReadCmd, GemmCmd, FlashAttentionCmd, VectorCmd)):
+            return chip, 1
+        return None
+
+    def _path_conflict(self, command):
+        key = self._path_class(command)
+        return key is not None and self._path_active.get((key[0], 1-key[1]), 0) > 0
+
+    def _update_path(self, command, delta):
+        key = self._path_class(command)
+        if key is not None:
+            self._path_active[key] = self._path_active.get(key, 0) + delta
+
     def _dispatch_idle_resources(self) -> None:
         blocked = []
         while self._ready:
             priority, rank = heapq.heappop(self._ready)
             command = self.graph.commands[rank]
             resource_keys = self._resource_keys(command)
-            if self._busy_resources.intersection(resource_keys):
+            if self._busy_resources.intersection(resource_keys) or self._path_conflict(command):
                 blocked.append((priority, rank))
                 continue
             if self._states[command.cmd_id] is not CommandState.READY:
                 raise RuntimeError(f"invalid ready state: {command.cmd_id}")
             self._states[command.cmd_id] = CommandState.RUNNING
             self._busy_resources.update(resource_keys)
+            self._update_path(command, 1)
             self._stages[self._stage_keys[command.cmd_id]].submit(command)
             self._release_start_successors(command.cmd_id)
         for item in blocked:
@@ -183,6 +205,7 @@ class GraphExecutor(SimModule):
         self._states[cmd_id] = CommandState.COMPLETED
         self._executions[cmd_id] = execution
         self._busy_resources.difference_update(self._resource_keys(command))
+        self._update_path(command, -1)
 
         for successor in self.graph.successors(cmd_id):
             self._remaining_predecessors[successor] -= 1

@@ -161,6 +161,39 @@ class HBFBandwidthTable:
         return low * (1 - y) + high * y
 
 
+def indexer_noc_bandwidth_per_pu(hardware: "HardwareConfig") -> float:
+    """Equivalent Indexer read bandwidth: 64 bidirectional NoC links per chip."""
+    # Indexer cache 可同时利用 HBF 和 HBM 的带宽；HBM 中的 cache 通过 NoC 共享。
+    # 因此以 NoC 链路带宽 × 64 × 2 估算每卡共享 HBM 提供的额外带宽，
+    # 再均摊到每 PU，与原 HBF 带宽相加；这里不单独模拟 HBM/NoC 传输。
+    return (hardware.chip.noc.link_bandwidth_bytes_per_second * 64 * 2
+            / hardware.chip.processing_unit_count)
+
+
+def apply_indexer_noc_bandwidth(mapping: "HardwareMappingResult",
+                                hardware: "HardwareConfig") -> "HardwareMappingResult":
+    """Add the NoC contribution to Flash-backed Indexer cache reads once.
+
+    This is an effective-bandwidth approximation, not a separate NoC transfer.
+    DRAM-only Indexers, KV reads/prefetch and projection weights are unchanged.
+    """
+    operators = dict(mapping.operators)
+    extra = indexer_noc_bandwidth_per_pu(hardware)
+    for op_id in ("attn.indexer_score", "moe.indexer_score"):
+        if op_id not in operators:
+            continue
+        op = operators[op_id]
+        policy = op.weight_memory
+        if policy is None or policy.source == WeightSource.DRAM:
+            continue
+        rate = (policy.flash_bandwidth_bytes_per_second
+                or hardware.chip.logic_die.processing_unit.flash_bandwidth_bytes_per_second)
+        operators[op_id] = replace(op, weight_memory=replace(
+            policy, flash_bandwidth_bytes_per_second=rate + extra))
+    return replace(mapping, operators=operators,
+                   op_list=[operators[op.op_id] for op in mapping.op_list])
+
+
 def apply_hbf_bandwidths(mapping: "HardwareMappingResult", hardware: "HardwareConfig",
                          table: HBFBandwidthTable) -> "HardwareMappingResult":
     """Apply measured cache rates, including Fold prefetch and legacy MLA reads."""
@@ -212,6 +245,7 @@ def apply_hbf_bandwidths(mapping: "HardwareMappingResult", hardware: "HardwareCo
             )
     additional = tuple(apply_hbf_bandwidths(item, hardware, table)
                        for item in mapping.additional_layer_mappings)
-    return replace(mapping, operators=operators, operator_mappings=policies,
-                   op_list=[operators[op.op_id] for op in mapping.op_list],
-                   additional_layer_mappings=additional)
+    result = replace(mapping, operators=operators, operator_mappings=policies,
+                     op_list=[operators[op.op_id] for op in mapping.op_list],
+                     additional_layer_mappings=additional)
+    return apply_indexer_noc_bandwidth(result, hardware)

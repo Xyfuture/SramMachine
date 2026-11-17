@@ -1,14 +1,26 @@
 # 单参数敏感性实验
 
+Indexer 历史缓存的有效读取带宽现为每卡原 Flash 带宽加
+`hardware.chip.noc.link_bandwidth_bytes_per_second * 64 * 2`，再除以该卡 PU 数。
+默认增加 16.384 TB/s/卡（2048 PU 时为 8 GB/s/PU）。此为等效带宽放大，
+不增加独立 NoC 传输或额外 NoC 争用。仅作用于 Flash-backed IndexerScore，
+DRAM-only Indexer、KV/预取和投影权重保持原口径；禁用 CSV 时使用硬件 Flash 基准。
+NoC sensitivity 缩放新增项，HBF sensitivity 只缩放原 Flash 项。
+NoFlashShare 和 NoDRAMFLashShare 去掉新增项，再按旧口径缩放半网格带宽。
+NoKVLayout 使用项目根目录 `32k no kvlayout bandwidth.csv` 的 sparse KV 实测 HBF 带宽；
+Indexer 及其 NoC/HBM 增量不变，无固定附加延迟。缺失测量配置直接报错。
+旧实验数据不自动更新，新旧结果应分开保存。
+
+
 从仓库根目录运行，使用本地 `.venv`。绘图需要 matplotlib（见 requirements.txt）：
 
 ```bash
 .venv/bin/python -m exp.sensitivity.sweep --run-id 2026-11-16 --workers 6
 ```
 
-默认 DeepSeek V3.2，context length = 16384（16k），global batch 为
+默认 MiniMax M3，context length = 32768（32k），global batch 为
 16、32、64、128、256、512、1024、2048、4096。固定 8 chip、XFold、EP、FP8 KV、
-理想 MTP1（每步接受 2 token）、output length 600、4 个代表层，与 `exp/big` 一致。
+默认 MTP0（每步 1 token，`--mtp 1` 可切换）、output length 600、4 个代表层，与 `exp/big` 一致。
 4 个参数 × 5 个倍率 × 9 个 batch = **180 个实验点**。
 
 每次从全新的 `HardwareConfig()` 默认值出发，仅缩放一种资源；倍率为
@@ -36,7 +48,7 @@ Pareto 小工具，备份中包含这些依赖。
 流程后的性能上限；由于最优 PartitionChain 可以变化，曲线不是固定映射下的纯时延缩放。
 延迟按稳态相邻代表层 core 开始间隔外推到完整 decoder，统计 decode 单步：
 
-- tokens/s/user = 2e9 / model_step_latency_ns。
+- tokens/s/user = (1 + MTP) × 1e9 / model_step_latency_ns。
 - tokens/s/chip = tokens/s/user × global_batch / 8。
 - 每个 model、参数、倍率分别筛 Pareto；两轴都越大越好，均为线性坐标。
 - 每张图叠加 5 个倍率的 Pareto 曲线，浅色点保留全部 batch，前沿点标注 batch。
@@ -86,3 +98,6 @@ Pareto 标记和 trace 路径；嵌套字段以 JSON 保存。结果原子落盘
 
 `--output-root` 可更换结果根目录，`--bandwidth-csv` 可指定同格式测量表。
 默认日期时间可避免同一天多次实验覆盖；已存在的目录必须显式指定续跑或重画。
+
+支持 `--models minimax-m3 deepseek-v3.2`。M3 按 57 层 sparse + 3 层 dense 加权，
+每个实验点同时保存 sparse 与 dense 的完整 trace 和原始命令数据。

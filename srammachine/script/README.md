@@ -1,5 +1,17 @@
 # SramMachine 实验脚本使用指南
 
+Indexer 历史缓存的有效读取带宽现为每卡原 Flash 带宽加
+`hardware.chip.noc.link_bandwidth_bytes_per_second * 64 * 2`，再除以该卡 PU 数。
+默认增加 16.384 TB/s/卡（2048 PU 时为 8 GB/s/PU）。此为等效带宽放大，
+不增加独立 NoC 传输或额外 NoC 争用。仅作用于 Flash-backed IndexerScore，
+DRAM-only Indexer、KV/预取和投影权重保持原口径；禁用 CSV 时使用硬件 Flash 基准。
+NoC sensitivity 缩放新增项，HBF sensitivity 只缩放原 Flash 项。
+NoFlashShare 和 NoDRAMFLashShare 去掉新增项，再按旧口径缩放半网格带宽。
+NoKVLayout 使用项目根目录 `32k no kvlayout bandwidth.csv` 的 sparse KV 实测 HBF 带宽；
+Indexer 及其 NoC/HBM 增量不变，无固定附加延迟。缺失测量配置直接报错。
+旧实验数据不自动更新，新旧结果应分开保存。
+
+
 **当前禁用 SplitTree 搜索。** `run_sa` 保留历史入口名称，默认只执行
 PartitionChain 枚举、顺序仿真和 trace 导出，无需提供任何 SA 轮数。
 Python 设置 `SimulatedAnnealingConfig(enabled=True)`、CLI 指定

@@ -310,6 +310,7 @@ def main() -> int:
             "accepted_tokens_per_step": 2, "moe_strategy": "ep", "kv_cache_dtype": "fp8",
             "xfold_models": [model for model in args.models if model != "deepseek-v3"],
             "partition_chain_search": True, "split_tree_search": False,
+            "indexer_bandwidth_definition": "base Flash rate + NoC link bandwidth * 64 * 2 / PU count",
             "simulated_layer_count": 4, "workers": args.workers,
             "bandwidth_csv_sha256": hashlib.sha256(args.bandwidth_csv.read_bytes()).hexdigest(),
             "throughput_definition": "user = 2e9 / model_step_latency_ns; chip = user * global_batch / 8",

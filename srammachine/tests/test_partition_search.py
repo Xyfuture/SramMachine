@@ -63,8 +63,8 @@ class PartitionSearchTests(unittest.TestCase):
 
     def test_improves_known_decode_case_without_changing_policies_or_tree(self):
         before, after = self.simulate(self.original), self.simulate(self.selected)
-        self.assertEqual(before.latency_ns, 21643288)
-        self.assertEqual(after.latency_ns, 7926950)
+        self.assertEqual(before.latency_ns, 20479103)
+        self.assertEqual(after.latency_ns, 6762765)
         self.assertGreater(after.throughput_tokens_per_second, before.throughput_tokens_per_second)
         self.assertEqual(self.original.root_node, self.selected.root_node)
         self.assertEqual(self.original.expert_ownership, self.selected.expert_ownership)
@@ -137,14 +137,14 @@ class PartitionSearchTests(unittest.TestCase):
             optimizer = SplitTreeOptimizer(hbf_bandwidth_csv=DEFAULT_HBF_BANDWIDTH_CSV)
             enabled = optimizer.run(self.request, config=SimulatedAnnealingConfig(write_result=False))
             self.assertIs(optimizer._mapping(256, True), self.selected)
-            self.assertEqual(enabled.initial_evaluation.latency_ns, 7926950)
+            self.assertEqual(enabled.initial_evaluation.latency_ns, 6762765)
             self.assertEqual(enumerate_layouts.call_count, 1)
         disabled = SplitTreeOptimizer(hbf_bandwidth_csv=DEFAULT_HBF_BANDWIDTH_CSV).run(
             self.request, config=SimulatedAnnealingConfig(
                 write_result=False, optimize_partition_chains=False,
             ),
         )
-        self.assertEqual(disabled.initial_evaluation.latency_ns, 21643288)
+        self.assertEqual(disabled.initial_evaluation.latency_ns, 20479103)
 
     def test_split_tree_search_is_rejected_before_work_starts(self):
         with self.assertRaisesRegex(NotImplementedError, "SplitTree search is disabled"):

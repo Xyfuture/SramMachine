@@ -7,7 +7,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from exp.ablation.policy import ABLATIONS, apply_ablation, half_grid_hardware, latency_metrics, load_hardware
+from exp.ablation.policy import ABLATIONS, apply_ablation, half_grid_hardware, latency_metrics, load_hardware, load_no_kv_bandwidth
 from exp.big.sweep import mark_pareto
 from srammachine.commands import CommandGraph, PUMemoryReadCmd
 from srammachine.frontend.modules import BMMOp, WeightMemory, WeightSource
@@ -24,9 +24,10 @@ class AblationTests(unittest.TestCase):
     def setUpClass(cls):
         cls.hardware = HardwareConfig()
         cls.table = HBFBandwidthTable.from_csv(DEFAULT_HBF_BANDWIDTH_CSV)
+        cls.no_kv_table = load_no_kv_bandwidth()
         cls.mapper = MiniMaxM3Mapper(cls.hardware)
         cls.request = HardwareMappingRequest("minimax-m3", InferenceConfig(
-            1024, 16384, 600, mtp_enabled=True), xfold=True)
+            1024, 32768, 600, mtp_enabled=True), xfold=True)
         cls.original = cls.mapper.map(cls.request, hbf_bandwidth_table=cls.table)
 
     def test_all_variants_assign_grid_ports_and_preserve_base(self):
@@ -52,10 +53,12 @@ class AblationTests(unittest.TestCase):
                             continue
                         op.partition_chain.validate_grid(hw.chip.noc.mesh_rows, hw.chip.noc.mesh_columns)
                         rate = before.operators[key].weight_memory.flash_bandwidth_bytes_per_second or 4e9
+                        if flash and key.endswith("indexer_score") and op.weight_memory.source != WeightSource.DRAM:
+                            rate -= 8e9
                         factor = 2 if flash else 1
-                        if name == "NoKVLayout" and key.endswith("indexer_score"):
-                            factor *= 0.87
-                        if (name == "NoMoELayout" and key.startswith("moe.")
+                        if name in ("NoKVLayout", "NoHBFLayout") and layer.layer_type != "dense" and op.flash_prefetch_bytes_per_request:
+                            rate = self.no_kv_table.lookup("minimax-m3", "sparse_kv", True, 1024, 32768)
+                        if (name in ("NoMoELayout", "NoHBFLayout") and key.startswith("moe.")
                                 and type(op) is BMMOp and not op.flash_prefetch_bytes_per_request):
                             factor *= 1 / 6
                         self.assertAlmostEqual(op.weight_memory.flash_bandwidth_bytes_per_second, rate * factor)
@@ -65,29 +68,30 @@ class AblationTests(unittest.TestCase):
         self.assertEqual(self.original.operators["moe.moe_fc2"].partition_chain.grid_shape, (32, 64))
 
     def test_measured_flash_and_kv_prefetch_are_scaled_not_replaced_by_default(self):
-        score_rate = self.table.lookup("minimax-m3", "dense_indexer", True, 1024, 16384)
-        kv_rate = self.table.lookup("minimax-m3", "sparse_kv", True, 1024, 16384)
+        score_rate = self.table.lookup("minimax-m3", "dense_indexer", True, 1024, 32768)
+        kv_rate = self.table.lookup("minimax-m3", "sparse_kv", True, 1024, 32768)
         flash = apply_ablation(self.original, self.hardware, "NoFlashShare")
-        self.assertAlmostEqual(flash.operators["moe.indexer_score"].weight_memory.flash_bandwidth_bytes_per_second,
-                               2 * score_rate)
+        self.assertTrue(math.isclose(
+            flash.operators["moe.indexer_score"].weight_memory.flash_bandwidth_bytes_per_second,
+            2 * score_rate, rel_tol=1e-12))
         self.assertAlmostEqual(flash.operators["moe.moe_fc2"].weight_memory.flash_bandwidth_bytes_per_second,
                                kv_rate)
         kv = apply_ablation(self.original, self.hardware, "NoKVLayout")
         graph = TreeParser(self.hardware).parse(kv.root_node, kv.operators, kv.operator_mappings)
         reads = [c for c in graph.commands if isinstance(c, PUMemoryReadCmd) and c.data_kind == "next_layer_kv"]
         self.assertEqual(len(reads), 4)
-        self.assertTrue(all(c.bandwidth_bytes_per_second == kv_rate for c in reads))
+        self.assertTrue(all(c.bandwidth_bytes_per_second == self.no_kv_table.lookup("minimax-m3", "sparse_kv", True, 1024, 32768) for c in reads))
         scores = [c for c in graph.commands if isinstance(c, PUMemoryReadCmd) and c.data_kind == "indexer_cache"]
         self.assertEqual(len(scores), 4)
-        self.assertTrue(all(c.bandwidth_bytes_per_second == 0.87 * score_rate for c in scores))
+        self.assertTrue(all(c.bandwidth_bytes_per_second == score_rate + 8e9 for c in scores))
         stage = apply_ablation(self.original, self.hardware, "NoMoELayout", moe_flash_scope="stage")
         self.assertTrue(math.isclose(stage.operators["moe.indexer_score"].weight_memory.flash_bandwidth_bytes_per_second,
-                                     score_rate / 6))
+                                     (score_rate + 8e9) / 6))
         self.assertTrue(math.isclose(stage.operators["moe.moe_fc2"].weight_memory.flash_bandwidth_bytes_per_second,
                                      kv_rate / 6))
         weights_only = apply_ablation(self.original, self.hardware, "NoMoELayout", moe_flash_scope="weights")
         self.assertEqual(weights_only.operators["moe.indexer_score"].weight_memory.flash_bandwidth_bytes_per_second,
-                         score_rate)
+                         score_rate + 8e9)
         self.assertEqual(weights_only.operators["moe.moe_fc2"].weight_memory.flash_bandwidth_bytes_per_second, kv_rate)
 
     def test_no_moe_layout_defaults_to_bmm_weights_and_preserves_all_cache_reads(self):
@@ -139,43 +143,64 @@ class AblationTests(unittest.TestCase):
                             dual_port_ops += 1
                 self.assertGreater(dual_port_ops, 0)
 
-    def test_no_kv_layout_changes_only_indexer_and_adds_delay_for_every_model_layer(self):
-        for model in ("deepseek-v3", "deepseek-v3.2", "glm-5.1", "minimax-m3"):
-            with self.subTest(model=model):
-                original = mapper_for_model(model, self.hardware).map(
-                    replace(self.request, model_name=model), hbf_bandwidth_table=self.table)
-                mapped = apply_ablation(original, self.hardware, "NoKVLayout")
-                for layer, before in zip((mapped, *mapped.additional_layer_mappings),
-                                         (original, *original.additional_layer_mappings)):
-                    for key, op in layer.operators.items():
-                        self.assertEqual(layer.operator_mappings[key].hardware_config, self.hardware)
-                        if op.weight_memory is None:
-                            continue
-                        self.assertEqual(op.partition_chain, before.operators[key].partition_chain)
-                        base_rate = before.operators[key].weight_memory.flash_bandwidth_bytes_per_second or 4e9
-                        measured_score = key.endswith("indexer_score") and op.weight_memory.source != WeightSource.DRAM
-                        self.assertAlmostEqual(op.weight_memory.flash_bandwidth_bytes_per_second,
-                                               base_rate * (0.87 if measured_score else 1))
-                graph = TreeParser(self.hardware).parse(mapped.root_node, mapped.operators, mapped.operator_mappings)
-                result = Simulator(self.hardware).run(graph, mapping_result=mapped)
-                raw = result.latency_ns
-                timing = latency_metrics(result, model, "NoKVLayout")
-                per_layer = 25_000 if model == "minimax-m3" else 14_000
-                self.assertEqual(timing["additional_model_latency_ns"], per_layer * original.model_config.num_hidden_layers)
-                self.assertEqual(timing["model_step_latency_ns"], raw + per_layer * original.model_config.num_hidden_layers)
-                self.assertEqual(latency_metrics(result, model, "NoKVLayout"), timing)  # No accumulation on repeated reporting.
-                self.assertEqual(result.latency_ns, raw)
-                self.assertEqual(latency_metrics(result, model, "XFold")["model_step_latency_ns"], raw)
-                self.assertEqual(latency_metrics(result, model, "NoMoELayout")["additional_model_latency_ns"], 0)
-                if model == "minimax-m3":
-                    self.assertEqual(timing["additional_model_latency_ns"], 1_500_000)
-                    self.assertEqual(sum(count * duration for _, count, duration in timing["adjusted_model_latency_components"]),
-                                     timing["model_step_latency_ns"])
+    def test_no_kv_layout_uses_measured_kv_preserves_indexer_and_adds_no_delay(self):
+        for model in ("deepseek-v3.2", "glm-5.1", "minimax-m3"):
+            for mtp in (False, True):
+                for xfold in (False, True):
+                    with self.subTest(model=model, mtp=mtp, xfold=xfold):
+                        request = replace(self.request, model_name=model, xfold=xfold,
+                                          inference_config=replace(self.request.inference_config, mtp_enabled=mtp))
+                        original = mapper_for_model(model, self.hardware).map(request, hbf_bandwidth_table=self.table)
+                        mapped = apply_ablation(original, self.hardware, "NoKVLayout")
+                        measured = self.no_kv_table.lookup(model, "sparse_kv", mtp, 1024, 32768)
+                        for layer, before in zip((mapped, *mapped.additional_layer_mappings),
+                                                 (original, *original.additional_layer_mappings)):
+                            for key, op in layer.operators.items():
+                                if op.weight_memory is None:
+                                    continue
+                                base_rate = before.operators[key].weight_memory.flash_bandwidth_bytes_per_second or 4e9
+                                changes = layer.layer_type != "dense" and (op.flash_prefetch_bytes_per_request or
+                                    (key in ("attn.flash_attention", "attn.flash_msa") and op.weight_memory.source != WeightSource.DRAM))
+                                self.assertAlmostEqual(op.weight_memory.flash_bandwidth_bytes_per_second,
+                                                       measured if changes else base_rate)
+                        graph = TreeParser(self.hardware).parse(mapped.root_node, mapped.operators, mapped.operator_mappings)
+                        result = Simulator(self.hardware).run(graph, mapping_result=mapped)
+                        timing = latency_metrics(result, model, "NoKVLayout")
+                        self.assertEqual(timing["additional_model_latency_ns"], 0)
+                        self.assertEqual(timing["additional_latency_per_layer_ns"], 0)
+                        self.assertEqual(timing["model_step_latency_ns"], result.latency_ns)
 
-    def test_no_kv_layout_requires_measured_indexer_bandwidth(self):
-        unmapped_rates = self.mapper.map(self.request)
-        with self.assertRaisesRegex(ValueError, "CSV Indexer bandwidth"):
-            apply_ablation(unmapped_rates, self.hardware, "NoKVLayout")
+    def test_no_hbf_layout_equals_measured_kv_plus_weight_layout(self):
+        for mtp in (False, True):
+            request = replace(self.request, inference_config=replace(self.request.inference_config, mtp_enabled=mtp))
+            original = self.mapper.map(request, hbf_bandwidth_table=self.table)
+            expected = apply_ablation(apply_ablation(original, self.hardware, "NoKVLayout"),
+                                      self.hardware, "NoMoELayout")
+            actual = apply_ablation(original, self.hardware, "NoHBFLayout")
+            legacy_argument = apply_ablation(original, self.hardware, "NoHBFLayout", moe_flash_scope="stage")
+            for layer, reference, legacy in zip((actual, *actual.additional_layer_mappings),
+                                                (expected, *expected.additional_layer_mappings),
+                                                (legacy_argument, *legacy_argument.additional_layer_mappings)):
+                self.assertEqual(layer.operators, reference.operators)
+                self.assertEqual(layer.operators, legacy.operators)
+                self.assertEqual(layer.operator_mappings, reference.operator_mappings)
+            self.assertEqual(actual.operators["moe.indexer_score"].weight_memory,
+                             original.operators["moe.indexer_score"].weight_memory)
+
+    def test_no_kv_missing_measurements_raise_without_fallback(self):
+        for model, sequence in (("deepseek-v3", 32768), ("minimax-m3", 16384)):
+            request = replace(self.request, model_name=model,
+                              inference_config=InferenceConfig(1024, sequence, 600, mtp_enabled=True))
+            original = mapper_for_model(model, self.hardware).map(request, hbf_bandwidth_table=self.table)
+            for name in ("NoKVLayout", "NoHBFLayout"):
+                with self.assertRaises(ValueError):
+                    apply_ablation(original, self.hardware, name)
+
+    def test_no_kv_layout_preserves_fallback_indexer_plus_noc_bandwidth(self):
+        fallback = self.mapper.map(self.request)
+        mapped = apply_ablation(fallback, self.hardware, "NoKVLayout")
+        self.assertEqual(mapped.operators["moe.indexer_score"].weight_memory.flash_bandwidth_bytes_per_second,
+                         4e9 + 8e9)
 
     def test_lowering_balances_dual_ports_using_operator_dram_bandwidth(self):
         op = BMMOp("op", 1, 1, 100, 100, input_source="none", output_destination="none",
@@ -247,7 +272,7 @@ class AblationTests(unittest.TestCase):
                 load_hardware(path)
         for factor in (0, -1, float("nan"), float("inf"), 1.1):
             with self.subTest(factor=factor), self.assertRaises(ValueError):
-                apply_ablation(self.original, self.hardware, "NoKVLayout", kv_factor=factor)
+                apply_ablation(self.original, self.hardware, "NoMoELayout", moe_factor=factor)
 
     def test_pareto_keeps_equal_points_and_excludes_strictly_dominated(self):
         rows = [dict(tokens_per_second_per_user=x, tokens_per_second_per_chip=y)

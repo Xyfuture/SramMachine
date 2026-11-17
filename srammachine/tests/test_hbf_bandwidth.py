@@ -151,7 +151,7 @@ class HBFMappingTests(unittest.TestCase):
         indexer = self.table.lookup("deepseek-v3.2", "dense_indexer", True, 256, 20000)
         sparse = self.table.lookup("deepseek-v3.2", "sparse_kv", True, 256, 20000)
         self.assertNotIn("attn.indexer_score", ops)
-        self.assertEqual(ops["moe.indexer_score"].weight_memory.flash_bandwidth_bytes_per_second, indexer)
+        self.assertEqual(ops["moe.indexer_score"].weight_memory.flash_bandwidth_bytes_per_second, indexer + 8e9)
         self.assertIsNone(ops["attn.indexer_k"].weight_memory.flash_bandwidth_bytes_per_second)
         self.assertEqual(ops["moe.moe_fc2"].weight_memory.source, WeightSource.DRAM)
         graph = TreeParser(mapper.hardware_config).parse(
@@ -183,7 +183,7 @@ class HBFMappingTests(unittest.TestCase):
                 index = next(c for c in reads if c.op_id == "moe.indexer_score")
                 prefetch = next(c for c in reads if c.data_kind == "next_layer_kv")
                 self.assertEqual(index.bandwidth_bytes_per_second,
-                                 self.table.lookup("minimax-m3", "dense_indexer", mtp, 256, 20000))
+                                 self.table.lookup("minimax-m3", "dense_indexer", mtp, 256, 20000) + 8e9)
                 self.assertEqual(prefetch.bandwidth_bytes_per_second,
                                  self.table.lookup("minimax-m3", "sparse_kv", mtp, 256, 20000))
                 self.assertEqual((index.port, prefetch.port), ("flash", "flash"))

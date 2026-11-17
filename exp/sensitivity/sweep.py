@@ -116,7 +116,7 @@ def run_case(task: dict) -> dict:
         try:
             with _without_desim_priority_queue_validation():
                 hardware = scaled_hardware(task["parameter"], task["factor"], task["logic_scope"])
-                inference = InferenceConfig(task["batch"], task["sequence"], 600, mtp_enabled=True)
+                inference = InferenceConfig(task["batch"], task["sequence"], 600, mtp_enabled=task.get("mtp_enabled", True))
                 hbf_factor = task["factor"] if task["parameter"] == "hbf" else 1.0
                 table = bandwidth_table(Path(task["bandwidth_csv"]), hbf_factor)
                 request = HardwareMappingRequest(task["model"], inference, xfold=True)
@@ -124,7 +124,8 @@ def run_case(task: dict) -> dict:
                 mapped = optimize_partition_chains(mapped, hardware)
                 graph = TreeParser(hardware).parse(mapped.root_node, mapped.operators,
                                                   mapped.operator_mappings, layer_count=4)
-                result = Simulator(hardware).run(graph, mapping_result=mapped)
+                simulator = Simulator(hardware)
+                result = simulator.run(graph, mapping_result=mapped)
                 latency = result.latency_ns
                 total = result.throughput_tokens_per_second
                 if latency is None or latency <= 0 or total is None or total <= 0:
@@ -135,13 +136,30 @@ def run_case(task: dict) -> dict:
                 trace.replace(trace_path)
                 result_path = directory / f"{stem}.result.json"
                 root = directory.parent.parent
+                auxiliary_results, auxiliary_paths = {}, []
+                for additional in mapped.additional_layer_mappings:
+                    aux_graph = TreeParser(hardware).parse(additional.root_node, additional.operators,
+                                                          additional.operator_mappings, layer_count=4)
+                    aux_result = simulator.run(aux_graph, mapping_result=additional)
+                    aux_trace = export_perfetto_trace(aux_result, trace_label=f"{stem}-{additional.layer_type}",
+                        output_dir=directory, mapping_result=additional)
+                    aux_path = directory / f"{stem}.{additional.layer_type}.perfetto.json"
+                    aux_trace.replace(aux_path)
+                    auxiliary_paths.append(str(aux_path.relative_to(root)))
+                    auxiliary_results[additional.layer_type] = dict(
+                        partition_chains=partition_chains_to_dict(additional),
+                        steady_layer_time_ns=aux_result.pipeline_layer_time_ns,
+                        command_results=plain(aux_result.command_results),
+                        layer_results=plain(aux_result.layer_results),
+                        weight_memory_by_op={key: plain(op.weight_memory) for key, op in additional.operators.items()},
+                        prefetch_op_ids=[key for key, op in additional.operators.items() if op.flash_prefetch_bytes_per_request])
                 row = dict(identity, status="complete", input_sequence_length=task["sequence"],
                     tokens_per_second_per_user=total / task["batch"],
                     tokens_per_second_per_chip=total / hardware.chip_count,
                     total_tokens_per_second=total, model_step_latency_ns=latency,
                     steady_layer_time_ns=result.pipeline_layer_time_ns,
                     trace_total_time_ns=result.total_time_ns, model_layer_count=result.model_layer_count,
-                    chip_count=hardware.chip_count, mtp_enabled=True,
+                    chip_count=hardware.chip_count, mtp_enabled=inference.mtp_enabled,
                     accepted_tokens_per_step=inference.accepted_tokens_per_step,
                     xfold=True, moe_strategy=inference.moe_parallel_strategy.value,
                     kv_cache_dtype=inference.kv_cache_dtype, output_sequence_length=600,
@@ -154,12 +172,17 @@ def run_case(task: dict) -> dict:
                         if op.weight_memory is not None
                         and op.weight_memory.flash_bandwidth_bytes_per_second is not None},
                     hardware=plain(hardware), trace_path=str(trace_path.relative_to(root)),
+                    auxiliary_trace_paths=auxiliary_paths,
+                    model_latency_components=plain(result.model_latency_components),
                     raw_result_path=str(result_path.relative_to(root)),
                     wall_seconds=time.monotonic() - started)
                 write_json(result_path, {"metrics": row, "task": task, "hardware": hardware,
                     "inference": inference, "partition_chains": partition_chains_to_dict(mapped),
                     "split_tree": split_tree_to_dict(mapped.root_node),
-                    "command_results": result.command_results, "layer_results": result.layer_results})
+                    "command_results": result.command_results, "layer_results": result.layer_results,
+                    "weight_memory_by_op": {key: plain(op.weight_memory) for key, op in mapped.operators.items()},
+                    "prefetch_op_ids": [key for key, op in mapped.operators.items() if op.flash_prefetch_bytes_per_request],
+                    "auxiliary_results": auxiliary_results})
                 (directory / f"{stem}.error.json").unlink(missing_ok=True)
                 return row
         except Exception:
@@ -176,7 +199,9 @@ def completed_row(task: dict) -> dict | None:
         payload = json.loads(path.read_text())
         row = payload["metrics"]
         trace = Path(task["directory"]).parent.parent / row["trace_path"]
-        if payload["task"] == task and row["status"] == "complete" and trace.stat().st_size:
+        if (payload["task"] == task and row["status"] == "complete" and trace.stat().st_size
+                and all((Path(task["directory"]).parent.parent / path).is_file()
+                        for path in row.get("auxiliary_trace_paths", []))):
             return row
     except (OSError, ValueError, KeyError, TypeError):
         pass
@@ -221,7 +246,7 @@ def write_reports(directory: Path, config: dict, tasks: list[dict]) -> int:
                                 xytext=(4, 4), textcoords="offset points", fontsize=7, color=color)
             scope = f" ({config['logic_scope']})" if parameter == "logic" else ""
             ax.set(title=f"{model} | {config['input_sequence_length']} tokens | {LABELS[parameter]}{scope}\n"
-                   "XFold | 8 chips | EP | FP8 KV | ideal MTP1 | PartitionChain optimized",
+                   f"XFold | 8 chips | EP | FP8 KV | MTP{int(config['mtp_enabled'])} | PartitionChain optimized",
                    xlabel="tokens/s/user", ylabel="tokens/s/chip", xlim=(0, None), ylim=(0, None))
             ax.set_xscale("linear")
             ax.set_yscale("linear")
@@ -281,10 +306,11 @@ def snapshot(directory: Path, csv_path: Path) -> str:
 def main() -> int:
     """Validate, snapshot, run isolated cases and persist resumable reports."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--models", nargs="+", choices=["deepseek-v3.2"], default=["deepseek-v3.2"])
+    parser.add_argument("--models", nargs="+", choices=["deepseek-v3.2", "minimax-m3"], default=["minimax-m3"])
     parser.add_argument("--batch-sizes", nargs="+", type=int, default=list(BATCHES))
     parser.add_argument("--factors", nargs="+", type=float, choices=FACTORS, default=list(FACTORS))
-    parser.add_argument("--sequence-length", type=int, default=16384)
+    parser.add_argument("--sequence-length", type=int, default=32768)
+    parser.add_argument("--mtp", type=int, choices=(0, 1), default=0)
     parser.add_argument("--logic-scope", choices=["both", "vector", "pu"], default="both")
     parser.add_argument("--workers", type=int, choices=range(1, 7), default=6)
     parser.add_argument("--bandwidth-csv", type=Path, default=DEFAULT_HBF_BANDWIDTH_CSV)
@@ -305,21 +331,24 @@ def main() -> int:
     for model in args.models:
         for batch in args.batch_sizes:
             for kind in ("sparse_kv", "dense_indexer"):
-                table.lookup(model, kind, True, batch, args.sequence_length)
+                table.lookup(model, kind, bool(args.mtp), batch, args.sequence_length)
     config = {
         "models": args.models, "parameters": list(PARAMETERS), "factors": args.factors,
         "batch_sizes": args.batch_sizes, "input_sequence_length": args.sequence_length,
         "logic_scope": args.logic_scope, "baseline_hardware": plain(HardwareConfig()),
-        "xfold": True, "mtp_enabled": True, "output_sequence_length": 600,
+        "sensitivity_revision": 2, "xfold": True, "mtp_enabled": bool(args.mtp),
+        "accepted_tokens_per_step": 1 + args.mtp, "output_sequence_length": 600,
         "moe_strategy": "ep", "kv_cache_dtype": "fp8", "simulated_layer_count": 4,
         "partition_chain_search": True, "split_tree_search": False,
         "bandwidth_csv_sha256": hashlib.sha256(args.bandwidth_csv.read_bytes()).hexdigest(),
         "source_digest": source_digest(),
-        "throughput_definition": "user = 2e9 / model_step_latency_ns; chip = user * global_batch / 8",
-        "latency_definition": "steady representative-layer core-start interval extrapolated to full decoder; decode only",
+        "throughput_definition": f"user = {1 + args.mtp}e9 / model_step_latency_ns; chip = user * global_batch / 8",
+        "latency_definition": "weighted representative-layer core-start intervals; M3 = 57 sparse + 3 dense; decode only",
         "hbf_definition": "CSV per-op rates and hardware fallback Flash bandwidth multiplied together",
         "hbm_definition": "PU DRAM ports and logic-die DRAM bandwidth multiplied together",
-        "noc_definition": "intra-chip horizontal/vertical links (also used by IO transfers); inter-chip fabric fixed",
+        "noc_definition": "intra-chip horizontal/vertical links and added Indexer bandwidth; inter-chip fabric fixed",
+        "indexer_noc_bandwidth": True,
+        "indexer_bandwidth_definition": "HBF-scaled CSV rate + current NoC link bandwidth * 64 * 2 / PU count",
     }
     directory = args.output_root.resolve() / f"{args.run_id}-sensitivity"
     if directory.exists():
@@ -342,7 +371,7 @@ def main() -> int:
         write_json(directory / "manifest.json", dict(config, source_zip_sha256=source_hash,
             generated_at=datetime.now().astimezone().isoformat(), command=sys.argv, python=sys.version))
     tasks = [{"model": model, "parameter": parameter, "factor": factor, "batch": batch,
-              "sequence": args.sequence_length, "logic_scope": args.logic_scope,
+              "sequence": args.sequence_length, "logic_scope": args.logic_scope, "mtp_enabled": bool(args.mtp),
               "directory": str(directory / model / parameter),
               "bandwidth_csv": str(directory / "scripts/hbf_read_bandwidth.csv")}
              for model in args.models for parameter in PARAMETERS
