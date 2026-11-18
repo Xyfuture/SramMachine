@@ -77,6 +77,70 @@ def scaled_hardware(parameter: str, factor: float, logic_scope: str = "both") ->
     return replace(hardware, chip=replace(chip, logic_die=replace(die, processing_unit=pu)))
 
 
+def cap_remote_supply(mapping, hardware, factor):
+    """Calibrated pooled-PU model; half local/half remote, no new link events.
+
+    At 1x return the original mapping exactly. Prefetched KV is fully remote.
+    Indexer's added HBM contribution is remote and saturates at its 1x rate.
+    """
+    if factor == 1.0:
+        return mapping
+    remote = min(1.0, factor)
+    pooled = (1.0 + remote) / 2.0
+    operators = dict(mapping.operators)
+    policies = dict(mapping.operator_mappings)
+    for key, op in operators.items():
+        if op.weight_memory is None:
+            continue
+        policy = policies[key]
+        hw = policy.hardware_config or hardware
+        die = hw.chip.logic_die
+        pu = die.processing_unit
+        # These are equivalent per-PU rates over symmetric HBF/HBM sides;
+        # the local half is unchanged, only the remote half is throttled.
+        capped_pu = replace(pu,
+            dram_bandwidth_bytes_per_second=pu.dram_bandwidth_bytes_per_second * pooled,
+            flash_bandwidth_bytes_per_second=pu.flash_bandwidth_bytes_per_second * pooled)
+        policies[key] = replace(policy, hardware_config=replace(hw, chip=replace(
+            hw.chip, logic_die=replace(die, processing_unit=capped_pu))))
+        weight = op.weight_memory
+        rate = weight.flash_bandwidth_bytes_per_second or pu.flash_bandwidth_bytes_per_second
+        if key in ("attn.indexer_score", "moe.indexer_score") and weight.source.value != "dram":
+            # Mapping has already added the old linearly-scaled NoC term.
+            old_extra = hardware.chip.noc.link_bandwidth_bytes_per_second * 128 / hardware.chip.processing_unit_count
+            base_extra = old_extra / factor
+            rate = (rate - old_extra) * pooled + base_extra * remote
+        elif op.flash_prefetch_bytes_per_request:
+            rate *= remote
+        else:
+            rate *= pooled
+        operators[key] = replace(op, weight_memory=replace(weight,
+            flash_bandwidth_bytes_per_second=rate))
+    return replace(mapping, operators=operators, op_list=[operators[op.op_id] for op in mapping.op_list],
+        operator_mappings=policies, additional_layer_mappings=tuple(
+            cap_remote_supply(item, hardware, factor) for item in mapping.additional_layer_mappings))
+
+
+def apply_attention_efficiency(mapping, hardware, efficiency):
+    """Only core attention's roofline compute peak changes; memory is unchanged."""
+    if efficiency == 1:
+        return mapping
+    policies = dict(mapping.operator_mappings)
+    for key in ("attn.flash_attention", "attn.flash_msa"):
+        if key not in policies:
+            continue
+        policy = policies[key]
+        hw = policy.hardware_config or hardware
+        die = hw.chip.logic_die
+        pu = die.processing_unit
+        array = replace(pu.systolic_array,
+                        frequency_hz=round(pu.systolic_array.frequency_hz * efficiency))
+        policies[key] = replace(policy, hardware_config=replace(hw, chip=replace(hw.chip,
+            logic_die=replace(die, processing_unit=replace(pu, systolic_array=array)))))
+    return replace(mapping, operator_mappings=policies, additional_layer_mappings=tuple(
+        apply_attention_efficiency(item, hardware, efficiency) for item in mapping.additional_layer_mappings))
+
+
 class ScaledHBFBandwidthTable(HBFBandwidthTable):
     """Multiply actual CSV lookups, including XFold prefetch, without editing CSV."""
 
@@ -121,7 +185,10 @@ def run_case(task: dict) -> dict:
                 table = bandwidth_table(Path(task["bandwidth_csv"]), hbf_factor)
                 request = HardwareMappingRequest(task["model"], inference, xfold=True)
                 mapped = mapper_for_model(task["model"], hardware).map(request, hbf_bandwidth_table=table)
+                if task["parameter"] == "noc":
+                    mapped = cap_remote_supply(mapped, hardware, task["factor"])
                 mapped = optimize_partition_chains(mapped, hardware)
+                mapped = apply_attention_efficiency(mapped, hardware, task.get("attention_efficiency", 1.0))
                 graph = TreeParser(hardware).parse(mapped.root_node, mapped.operators,
                                                   mapped.operator_mappings, layer_count=4)
                 simulator = Simulator(hardware)
@@ -153,7 +220,7 @@ def run_case(task: dict) -> dict:
                         layer_results=plain(aux_result.layer_results),
                         weight_memory_by_op={key: plain(op.weight_memory) for key, op in additional.operators.items()},
                         prefetch_op_ids=[key for key, op in additional.operators.items() if op.flash_prefetch_bytes_per_request])
-                row = dict(identity, status="complete", input_sequence_length=task["sequence"],
+                row = dict(identity, attention_efficiency=task.get("attention_efficiency", 1.0), status="complete", input_sequence_length=task["sequence"],
                     tokens_per_second_per_user=total / task["batch"],
                     tokens_per_second_per_chip=total / hardware.chip_count,
                     total_tokens_per_second=total, model_step_latency_ns=latency,
@@ -215,7 +282,7 @@ def write_reports(directory: Path, config: dict, tasks: list[dict]) -> int:
     import matplotlib.pyplot as plt
 
     all_rows = [row for task in tasks if (row := completed_row(task)) is not None]
-    for parameter in PARAMETERS:
+    for parameter in config["parameters"]:
         rows = []
         for model in config["models"]:
             for factor in config["factors"]:
@@ -306,10 +373,12 @@ def snapshot(directory: Path, csv_path: Path) -> str:
 def main() -> int:
     """Validate, snapshot, run isolated cases and persist resumable reports."""
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--parameters", nargs="+", choices=PARAMETERS, default=list(PARAMETERS))
     parser.add_argument("--models", nargs="+", choices=["deepseek-v3.2", "minimax-m3"], default=["minimax-m3"])
     parser.add_argument("--batch-sizes", nargs="+", type=int, default=list(BATCHES))
     parser.add_argument("--factors", nargs="+", type=float, choices=FACTORS, default=list(FACTORS))
     parser.add_argument("--sequence-length", type=int, default=32768)
+    parser.add_argument("--attention-efficiency", type=float, default=1.0)
     parser.add_argument("--mtp", type=int, choices=(0, 1), default=0)
     parser.add_argument("--logic-scope", choices=["both", "vector", "pu"], default="both")
     parser.add_argument("--workers", type=int, choices=range(1, 7), default=6)
@@ -333,10 +402,11 @@ def main() -> int:
             for kind in ("sparse_kv", "dense_indexer"):
                 table.lookup(model, kind, bool(args.mtp), batch, args.sequence_length)
     config = {
-        "models": args.models, "parameters": list(PARAMETERS), "factors": args.factors,
+        "models": args.models, "parameters": args.parameters, "factors": args.factors,
         "batch_sizes": args.batch_sizes, "input_sequence_length": args.sequence_length,
         "logic_scope": args.logic_scope, "baseline_hardware": plain(HardwareConfig()),
-        "sensitivity_revision": 2, "xfold": True, "mtp_enabled": bool(args.mtp),
+        "attention_efficiency": args.attention_efficiency,
+        "sensitivity_revision": 3, "xfold": True, "mtp_enabled": bool(args.mtp),
         "accepted_tokens_per_step": 1 + args.mtp, "output_sequence_length": 600,
         "moe_strategy": "ep", "kv_cache_dtype": "fp8", "simulated_layer_count": 4,
         "partition_chain_search": True, "split_tree_search": False,
@@ -346,9 +416,10 @@ def main() -> int:
         "latency_definition": "weighted representative-layer core-start intervals; M3 = 57 sparse + 3 dense; decode only",
         "hbf_definition": "CSV per-op rates and hardware fallback Flash bandwidth multiplied together",
         "hbm_definition": "PU DRAM ports and logic-die DRAM bandwidth multiplied together",
-        "noc_definition": "intra-chip horizontal/vertical links and added Indexer bandwidth; inter-chip fabric fixed",
+        "noc_definition": "NoC links scale normally; pooled supply = local half + remote half * min(1,factor); KV prefetch fully remote; inter-chip fabric fixed",
         "indexer_noc_bandwidth": True,
-        "indexer_bandwidth_definition": "HBF-scaled CSV rate + current NoC link bandwidth * 64 * 2 / PU count",
+        "remote_supply_cap": "pooled-half-local-v1",
+        "indexer_bandwidth_definition": "HBF pooled rate + 1x Indexer HBM contribution * min(1,NoC factor)",
     }
     directory = args.output_root.resolve() / f"{args.run_id}-sensitivity"
     if directory.exists():
@@ -371,10 +442,11 @@ def main() -> int:
         write_json(directory / "manifest.json", dict(config, source_zip_sha256=source_hash,
             generated_at=datetime.now().astimezone().isoformat(), command=sys.argv, python=sys.version))
     tasks = [{"model": model, "parameter": parameter, "factor": factor, "batch": batch,
+              "attention_efficiency": args.attention_efficiency,
               "sequence": args.sequence_length, "logic_scope": args.logic_scope, "mtp_enabled": bool(args.mtp),
               "directory": str(directory / model / parameter),
               "bandwidth_csv": str(directory / "scripts/hbf_read_bandwidth.csv")}
-             for model in args.models for parameter in PARAMETERS
+             for model in args.models for parameter in args.parameters
              for factor in args.factors for batch in args.batch_sizes]
     if args.reports_only:
         completed = write_reports(directory, config, tasks)

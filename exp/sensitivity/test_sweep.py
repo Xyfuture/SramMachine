@@ -92,3 +92,60 @@ class SensitivityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RemoteSupplyTests(unittest.TestCase):
+    def test_supply_caps_and_read_commands(self):
+        from exp.sensitivity.sweep import cap_remote_supply
+        from srammachine.pipetree import TreeParser
+        from srammachine.commands import PUMemoryReadCmd
+        table = HBFBandwidthTable.from_csv(DEFAULT_HBF_BANDWIDTH_CSV)
+        request = HardwareMappingRequest("deepseek-v3.2", InferenceConfig(16, 32768, 600, mtp_enabled=False), xfold=True)
+        baseline_hw = scaled_hardware("noc", 1)
+        base = mapper_for_model(request.model_name, baseline_hw).map(request, hbf_bandwidth_table=table)
+        self.assertIs(cap_remote_supply(base, baseline_hw, 1), base)
+        for factor in (0.5, 0.75, 1.25, 1.5):
+            hw = scaled_hardware("noc", factor)
+            mapped = mapper_for_model(request.model_name, hw).map(request, hbf_bandwidth_table=table)
+            capped = cap_remote_supply(mapped, hw, factor)
+            remote, pooled = min(1, factor), (1 + min(1, factor)) / 2
+            self.assertEqual(hw.chip.logic_die.processing_unit.dram_bandwidth_bytes_per_second, 16e9)
+            for key, op in capped.operators.items():
+                if op.weight_memory is None:
+                    continue
+                actual_hw = capped.operator_mappings[key].hardware_config
+                self.assertEqual(actual_hw.chip.logic_die.processing_unit.dram_bandwidth_bytes_per_second, 16e9 * pooled)
+                rate = base.operators[key].weight_memory.flash_bandwidth_bytes_per_second or 4e9
+                expected = ((rate - 8e9) * pooled + 8e9 * remote if key.endswith("indexer_score")
+                            else rate * (remote if op.flash_prefetch_bytes_per_request else pooled))
+                self.assertAlmostEqual(op.weight_memory.flash_bandwidth_bytes_per_second, expected, delta=1e-5)
+            graph = TreeParser(hw).parse(capped.root_node, capped.operators, capped.operator_mappings, layer_count=1)
+            reads = [c for c in graph.commands if isinstance(c, PUMemoryReadCmd)]
+            self.assertTrue(any(c.port == "dram" for c in reads))
+            for cmd in reads:
+                if cmd.port == "dram":
+                    self.assertEqual(cmd.bandwidth_bytes_per_second, 16e9 * pooled)
+
+
+class AttentionEfficiencyTests(unittest.TestCase):
+    def test_only_attention_compute_peak_changes(self):
+        from exp.sensitivity.sweep import apply_attention_efficiency, cap_remote_supply
+        table = HBFBandwidthTable.from_csv(DEFAULT_HBF_BANDWIDTH_CSV)
+        request = HardwareMappingRequest("deepseek-v3.2", InferenceConfig(16,32768,600,mtp_enabled=False), xfold=True)
+        for factor in (.5,1,1.5):
+            hw = scaled_hardware("noc", factor)
+            mapped = mapper_for_model(request.model_name, hw).map(request, hbf_bandwidth_table=table)
+            mapped = cap_remote_supply(mapped, hw, factor)
+            result = apply_attention_efficiency(mapped, hw, .423)
+            self.assertEqual(result.operators, mapped.operators)
+            for key, policy in result.operator_mappings.items():
+                before = mapped.operator_mappings[key]
+                if key == "attn.flash_attention":
+                    old = before.hardware_config or hw
+                    new = policy.hardware_config
+                    self.assertAlmostEqual(new.chip.logic_die.processing_unit.peak_flops / old.chip.logic_die.processing_unit.peak_flops, .423)
+                    self.assertEqual(new.chip.logic_die.memory, old.chip.logic_die.memory)
+                    self.assertEqual(new.chip.noc, old.chip.noc)
+                    self.assertEqual(new.chip.logic_die.processing_unit.dram_bandwidth_bytes_per_second,old.chip.logic_die.processing_unit.dram_bandwidth_bytes_per_second)
+                else:
+                    self.assertEqual(policy, before)

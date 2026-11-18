@@ -24,7 +24,7 @@ def verify(directory: Path) -> dict:
     count = 0
     trace_count = 0
     accepted = 2 if config["mtp_enabled"] else 1
-    for parameter in PARAMETERS:
+    for parameter in config["parameters"]:
         with (directory / f"{parameter}.csv").open(encoding="utf-8-sig", newline="") as stream:
             rows = list(csv.DictReader(stream))
         expected = {(model, factor, batch) for model in config["models"]
@@ -89,6 +89,16 @@ def verify(directory: Path) -> dict:
                                             and (not policy or policy["source"] != "dram"))):
                         expected_rate = table.lookup(row["model"], "sparse_kv", config["mtp_enabled"], batch,
                                                     config["input_sequence_length"]) * multiplier
+                    if parameter == "noc" and config.get("remote_supply_cap") and factor != 1:
+                        remote = min(1, factor)
+                        pooled = (1 + remote) / 2
+                        if "indexer_score" in op_id and (not policy or policy["source"] != "dram"):
+                            extra = hardware.chip.noc.link_bandwidth_bytes_per_second * 128 / hardware.chip.processing_unit_count
+                            expected_rate = (expected_rate - extra) * pooled + extra / factor * remote
+                        elif op_id in layer.get("prefetch_op_ids", ["moe.moe_fc2"]):
+                            expected_rate *= remote
+                        else:
+                            expected_rate *= pooled
                     assert math.isclose(rate, expected_rate), (op_id, rate, expected_rate)
                 trace = json.loads((directory / trace_path).read_text())
                 context = trace["otherData"]
@@ -104,6 +114,8 @@ def verify(directory: Path) -> dict:
                     if command["command_type"] == "PUMemoryReadCmd":
                         params = command["parameters"]
                         rate = pu.dram_bandwidth_bytes_per_second if params["port"] == "dram" else layer_rates.get(command["op_id"], pu.flash_bandwidth_bytes_per_second)
+                        if params["port"] == "dram" and parameter == "noc" and config.get("remote_supply_cap"):
+                            rate *= (1 + min(1, factor)) / 2
                         assert math.isclose(params["bandwidth_bytes_per_second"], rate)
                         assert command["end_time_ns"] - command["start_time_ns"] == math.ceil(params["size_bytes"] * 1e9 / rate)
                 trace_count += 1
